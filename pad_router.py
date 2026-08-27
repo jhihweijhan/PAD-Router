@@ -689,9 +689,9 @@ def evaluate_manual_route(
     hazard_types = {_match_type(match) for match in all_matches if _match_type(match) in HAZARDS}
     required_hazard_types = {
         hazard for hazard in hazard_types
-        if any(_condition_requires_hazard(condition, {hazard})
-               for group in profile.condition_groups if group.enabled
-               for condition in group.conditions)
+        if any(result.satisfied and _condition_requires_hazard(result.condition, {hazard})
+               for group_result in group_results
+               for result in group_result.condition_results)
     }
     if not hazard_types:
         hazard_outcome = "none"
@@ -706,8 +706,9 @@ def evaluate_manual_route(
         failed: list[str] = []
         for group_result in group_results:
             if not group_result.satisfied:
-                failed.extend(result.identifier for result in group_result.condition_results if not result.satisfied)
-        failed.extend(result.identifier for result in condition_results
+                failed.extend(f"{result.identifier}: {result.message}" for result in group_result.condition_results
+                              if not result.satisfied)
+        failed.extend(f"{result.identifier}: {result.message}" for result in condition_results
                       if result.identifier.startswith("external:") and not result.satisfied)
         if hazard_outcome == "blocked":
             failed.append("hazard_policy")

@@ -20,6 +20,7 @@ from typing import Callable, Iterable
 from pad_router import (
     COLS,
     ConditionGroup,
+    ExternalCondition,
     HAZARDS,
     NAMES,
     ROWS,
@@ -485,6 +486,7 @@ class BoardInspectionApp:
         self._profile_name = tk.StringVar(value="manual")
         self._hazard_policy = tk.StringVar(value="avoid")
         self._condition_groups = tk.StringVar(value="[]")
+        self._external_conditions = tk.StringVar(value="[]")
         self._search_attempts = tk.StringVar(value="100")
         self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="No Rule Profile")
@@ -544,6 +546,9 @@ class BoardInspectionApp:
         ttk.Label(profile_frame, text="Kinds: combo_minimum, attribute, simultaneous_attributes, match_count, "
                   "connected_orb_count, enhanced_orb, shape, required_orbs, forbidden_orbs.",
                   wraplength=340).pack(anchor="w")
+        ttk.Label(profile_frame, text="External conditions JSON (name/confirmed/required; [] means none):").pack(
+            anchor="w")
+        ttk.Entry(profile_frame, textvariable=self._external_conditions, width=42).pack(fill="x")
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
         ttk.Label(search_controls, text="Attempts:").pack(side="left")
@@ -580,7 +585,7 @@ class BoardInspectionApp:
             for item in result.group_results
         ) or "none"
         conditions = ", ".join(
-            f"{item.identifier}={'pass' if item.satisfied else 'fail'}"
+            f"{item.identifier}={'pass' if item.satisfied else 'fail'} ({item.message})"
             for item in result.condition_results
         ) or "none"
         return (f"Matches: {matches} | Cascades: {result.cascades} | Combos: {result.combo_count}\n"
@@ -597,6 +602,9 @@ class BoardInspectionApp:
             self._hazard_policy.set(state.rule_profile.hazard_policy)
             self._condition_groups.set(json.dumps(
                 [group.to_dict() for group in state.rule_profile.condition_groups],
+                sort_keys=True, separators=(",", ":")))
+            self._external_conditions.set(json.dumps(
+                [condition.to_dict() for condition in state.rule_profile.external_conditions],
                 sort_keys=True, separators=(",", ":")))
             self._profile_label.set(f"Current: {state.rule_profile.name}")
         if state.search_options is not None:
@@ -757,8 +765,12 @@ class BoardInspectionApp:
             if not isinstance(raw_groups, list):
                 raise ValueError("Condition groups JSON must be a list")
             groups = tuple(ConditionGroup.from_dict(item) for item in raw_groups)
+            raw_external = json.loads(self._external_conditions.get() or "[]")
+            if not isinstance(raw_external, list):
+                raise ValueError("External conditions JSON must be a list")
+            external = tuple(ExternalCondition.from_dict(item) for item in raw_external)
             self._profile = RuleProfile(self._profile_name.get(), condition_groups=groups,
-                                        hazard_policy=self._hazard_policy.get())
+                                        external_conditions=external, hazard_policy=self._hazard_policy.get())
             self._profile_label.set(f"Created: {self._profile.name}")
         except (ValueError, TypeError) as exc:
             self._show_error(str(exc))

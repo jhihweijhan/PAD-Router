@@ -168,6 +168,23 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIn("hazard_policy", result.failed_conditions)
         self.assertFalse(result.qualifying)
 
+    def test_failed_any_of_hazard_requirement_does_not_allow_hazard(self):
+        jammer = Orb("jammer")
+        board = ((jammer, jammer, jammer, 1, 2, 3),) + ((1, 2, 3, 4, 5, 6),) * (ROWS - 1)
+        profile = RuleProfile(
+            "alternate leader",
+            condition_groups=(ConditionGroup.any_of((
+                LeaderCondition.required_orbs(("jammer", "poison")),
+                LeaderCondition.combo_minimum(1),
+            )),),
+        )
+
+        result = evaluate_manual_route(board, ((0, 0),), profile, confirmed=True)
+
+        self.assertFalse(result.qualifying)
+        self.assertEqual(result.hazard_outcome, "blocked")
+        self.assertIn("hazard_policy", result.failed_conditions)
+
     def test_search_preserves_default_hazard_exclusion_and_required_hazard_exception(self):
         jammer = Orb("jammer")
         board = ((jammer, jammer, jammer, 1, 2, 3),) + ((1, 2, 3, 4, 5, 6),) * (ROWS - 1)
@@ -223,6 +240,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIsNone(result.qualifying_candidate)
         self.assertEqual(result.diagnostic_candidate.failed_conditions, ("combo_minimum",))
         self.assertIn("combo_minimum", result.diagnostic)
+        self.assertIn("0 combos; need at least 1", result.diagnostic)
         self.assertFalse(result.diagnostic_candidate.execution_eligible)
 
     def test_controller_applies_profile_and_keeps_execution_locked_until_confirmation(self):
