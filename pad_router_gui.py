@@ -681,6 +681,7 @@ class BoardInspectionApp:
         self._apply(lambda: self.controller.capture_device(self._serial.get()))
 
     def apply_calibration(self):
+        self._manual_route.clear()
         self._apply(lambda: self.controller.set_calibration(BoardCalibration(
             int(self._left.get()), int(self._top.get()), int(self._cell.get()))))
 
@@ -766,6 +767,7 @@ class BoardInspectionApp:
         if self._profile is None:
             self._show_error("Create or load a Rule Profile first")
             return
+        self._manual_route.clear()
         self._apply(lambda: self.controller.set_rule_profile(self._profile))
 
     def search_route(self):
@@ -794,6 +796,7 @@ class BoardInspectionApp:
         if not path:
             return
         try:
+            self._manual_route.clear()
             self._display(self.controller.load_rule_profile(path))
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self._show_error(str(exc))

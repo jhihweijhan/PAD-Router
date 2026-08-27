@@ -138,6 +138,20 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertTrue(required.qualifying)
         self.assertEqual(required.hazard_outcome, "required")
 
+    def test_required_hazard_does_not_allow_another_hazard_match(self):
+        board = ((Orb("jammer"), Orb("jammer"), Orb("jammer"),
+                  Orb("poison"), Orb("poison"), Orb("poison")),) + ((1, 2, 3, 4, 5, 6),) * (ROWS - 1)
+        profile = RuleProfile(
+            "jammer leader",
+            condition_groups=(ConditionGroup.all_of((LeaderCondition.required_orbs(("jammer",)),)),),
+        )
+
+        result = evaluate_manual_route(board, ((0, 0),), profile, confirmed=True)
+
+        self.assertEqual(result.hazard_outcome, "blocked")
+        self.assertIn("hazard_policy", result.failed_conditions)
+        self.assertFalse(result.qualifying)
+
     def test_search_preserves_default_hazard_exclusion_and_required_hazard_exception(self):
         jammer = Orb("jammer")
         board = ((jammer, jammer, jammer, 1, 2, 3),) + ((1, 2, 3, 4, 5, 6),) * (ROWS - 1)

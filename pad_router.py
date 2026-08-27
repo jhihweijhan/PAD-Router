@@ -687,15 +687,18 @@ def evaluate_manual_route(
     )
     all_matches = tuple(match for item in rounds for match in item.matches)
     hazard_types = {_match_type(match) for match in all_matches if _match_type(match) in HAZARDS}
-    requires_hazard = any(_condition_requires_hazard(condition, hazard_types)
-                          for group in profile.condition_groups if group.enabled
-                          for condition in group.conditions)
+    required_hazard_types = {
+        hazard for hazard in hazard_types
+        if any(_condition_requires_hazard(condition, {hazard})
+               for group in profile.condition_groups if group.enabled
+               for condition in group.conditions)
+    }
     if not hazard_types:
         hazard_outcome = "none"
-    elif requires_hazard:
-        hazard_outcome = "required"
     elif profile.hazard_policy == "allow":
         hazard_outcome = "allowed"
+    elif hazard_types <= required_hazard_types:
+        hazard_outcome = "required"
     else:
         hazard_outcome = "blocked"
     qualifies = team_satisfied and hazard_outcome != "blocked"
