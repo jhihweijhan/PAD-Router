@@ -1,0 +1,97 @@
+import os
+import struct
+import tempfile
+import unittest
+import zlib
+from pathlib import Path
+
+from pad_router import COLS, ROWS, Orb
+from pad_router_gui import BoardCalibration, BoardInspectionController, decode_png
+
+
+def png_bytes(width=12, height=10):
+    rows = []
+    for _ in range(height):
+        rows.append(b"\x00" + bytes((20, 40, 60, 255)) * width)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b"")
+
+
+class BoardInspectionControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
+        self.board = ((Orb("unknown", visual_class="unknown"),) + self.board[0][1:],) + self.board[1:]
+        self.detected = []
+
+        def detect(width, height, pixels, grid):
+            self.detected.append((width, height, grid))
+            return self.board
+
+        self.controller = BoardInspectionController(detector=detect)
+        handle, path = tempfile.mkstemp(suffix=".png")
+        Path(path).write_bytes(png_bytes())
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+        self.addCleanup(lambda: os.close(handle))
+        self.path = path
+
+    def test_png_loader_returns_bgra_pixels(self):
+        width, height, pixels = decode_png(self.path)
+        self.assertEqual((width, height), (12, 10))
+        self.assertEqual(pixels[:4], bytes((60, 40, 20, 255)))
+
+    def test_load_exposes_calibration_overlay_and_uncertainty(self):
+        state = self.controller.load_png(self.path)
+        self.assertEqual((state.width, state.height), (12, 10))
+        self.assertEqual(state.uncertain_cells, ((0, 0),))
+        self.assertFalse(state.confirmed)
+        marker = state.overlay[0]
+        self.assertEqual(marker["cell"], (0, 0))
+        self.assertTrue(marker["uncertain"])
+        self.assertEqual(len(self.detected), 1)
+
+    def test_cell_correction_obtains_confirmed_board(self):
+        self.controller.load_png(self.path)
+        with self.assertRaises(ValueError):
+            self.controller.confirm_board()
+        state = self.controller.correct_cell(0, 0, "fire+")
+        self.assertFalse(state.uncertain_cells)
+        self.assertTrue(state.overlay[0]["uncertain"])
+        confirmed = self.controller.confirm_board()
+        self.assertEqual(confirmed[0][0], Orb("normal", 1, enhanced=True))
+        self.assertTrue(self.controller.state.confirmed)
+
+    def test_calibration_requires_in_bounds_board_and_resets_corrections(self):
+        self.controller.load_png(self.path)
+        self.controller.correct_cell(0, 0, 1)
+        with self.assertRaises(ValueError):
+            self.controller.set_calibration(BoardCalibration(left=7, top=0, cell=2))
+        state = self.controller.set_calibration(BoardCalibration(left=0, top=0, cell=2))
+        self.assertFalse(state.confirmed)
+        self.assertEqual(state.uncertain_cells, ((0, 0),))
+        self.assertEqual(self.detected[-1][2].left, 0)
+
+    def test_capture_uses_replaceable_screenshot_adapter(self):
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        controller = BoardInspectionController(detector=lambda *args: self.board, capture=lambda serial: source)
+        state = controller.capture_device("test-device")
+        self.assertEqual(state.source_name, "test-device")
+        self.assertEqual((state.width, state.height), (12, 10))
+        self.assertFalse(state.confirmed)
+
+
+class BoardCalibrationTests(unittest.TestCase):
+    def test_standard_board_must_fit_image(self):
+        BoardCalibration(0, 0, 1).validate(6, 5)
+        with self.assertRaises(ValueError):
+            BoardCalibration(1, 0, 1).validate(6, 5)
+        with self.assertRaises(ValueError):
+            BoardCalibration(0, 0, 0).validate(6, 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

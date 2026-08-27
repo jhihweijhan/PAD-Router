@@ -32,19 +32,20 @@ ORB_PROTOTYPES = {
     6: (0.77, 0.57, 0.90, 0.27),  # heart
 }
 NAMES = {1: "fire", 2: "water", 3: "wood", 4: "light", 5: "dark", 6: "heart"}
-HAZARDS = {"jammer", "poison", "bomb"}
+HAZARDS = {"jammer", "poison", "mortal_poison", "bomb"}
 NORMAL_MIN_MARGIN = 0.035
 PLUS_MARKER_MIN = 0.5
 
 
 @dataclass(frozen=True)
 class Orb:
-    """A detected orb; enhancement is metadata, never a new match colour."""
+    """A detected orb; enhancement and lock are metadata, not match colours."""
 
     kind: str
     color: int | None = None
     enhanced: bool = False
     visual_class: str | None = None
+    locked: bool = False
 
 
 def orb_match_key(orb: object) -> int | str | None:
@@ -64,8 +65,8 @@ def orb_display(orb: object) -> str:
     key = orb_match_key(orb)
     if isinstance(orb, Orb):
         if orb.kind == "normal" and orb.color in NAMES:
-            return "火水木光暗心"[orb.color - 1] + ("+" if orb.enhanced else "")
-        return {"jammer": "J", "poison": "P", "bomb": "B"}.get(orb.kind, "?")
+            return "火水木光暗心"[orb.color - 1] + ("+" if orb.enhanced else "") + ("L" if orb.locked else "")
+        return {"jammer": "J", "poison": "P", "mortal_poison": "M", "bomb": "B"}.get(orb.kind, "?")
     return "火水木光暗心"[key - 1] if isinstance(key, int) else "?"
 
 
@@ -767,8 +768,13 @@ def main() -> None:
                         help="Seconds to wait for revealed cells before recognition")
     parser.add_argument("--round-limit", type=int, default=0, help="Stop after this many rounds; 0 means unlimited")
     parser.add_argument("--play", action="store_true", help="Actually send the gesture; default only prints it")
+    parser.add_argument("--gui", action="store_true", help="Open the native Board inspection GUI")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
+    if args.gui:
+        from pad_router_gui import main as gui_main
+        gui_main()
+        return
     if args.self_check:
         self_check()
         print("self-check passed")
