@@ -12,20 +12,28 @@ import base64
 import binascii
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from pad_router import (
     COLS,
+    ConditionGroup,
+    ExternalCondition,
     HAZARDS,
+    LeaderCondition,
     NAMES,
     ROWS,
     Grid,
     Orb,
+    RouteEvaluation,
+    RuleProfile,
     detect_board_pixels,
+    evaluate_manual_route,
+    load_rule_profile as read_rule_profile,
     orb_display,
     orb_match_key,
+    save_rule_profile as write_rule_profile,
     screenshot,
 )
 
@@ -244,6 +252,9 @@ class BoardInspectionState:
     uncertain_cells: tuple[tuple[int, int], ...] = ()
     overlay: tuple[dict[str, object], ...] = ()
     status: str = "No source loaded"
+    rule_profile: RuleProfile | None = None
+    route_evaluation: RouteEvaluation | None = None
+    route_approved: bool = False
 
     @property
     def source_path(self) -> str | None:
@@ -252,6 +263,14 @@ class BoardInspectionState:
     @property
     def editable_board(self) -> Board | None:
         return self.board
+
+    @property
+    def profile(self) -> RuleProfile | None:
+        return self.rule_profile
+
+    @property
+    def candidate_route(self) -> RouteEvaluation | None:
+        return self.route_evaluation
 
 
 class BoardInspectionController:
@@ -278,6 +297,8 @@ class BoardInspectionController:
                   if uncertain else f"Loaded {source_name}; review and confirm the Board")
         state = BoardInspectionState(source_name, source[0], source[1], source[2], calibration,
                                      detected, detected, None, False, uncertain, (), status)
+        if self.state.rule_profile is not None:
+            state = replace(state, rule_profile=self.state.rule_profile)
         self.state = self._with_overlay(state)
         return self.state
 
@@ -289,11 +310,8 @@ class BoardInspectionController:
         overlay = tuple({"cell": (row, col), "x": grid.point(row, col)[0],
                          "y": grid.point(row, col)[1], "label": orb_display(source_board[row][col]),
                          "uncertain": orb_match_key(source_board[row][col]) is None}
-                        for row in range(ROWS) for col in range(COLS))
-        return BoardInspectionState(state.source_name, state.width, state.height, state.pixels,
-                                    state.calibration, state.detected_board, state.board,
-                                    state.confirmed_board, state.confirmed, state.uncertain_cells,
-                                    overlay, state.status)
+                         for row in range(ROWS) for col in range(COLS))
+        return replace(state, overlay=overlay)
 
     def load_png(self, path: str | Path) -> BoardInspectionState:
         if Path(path).suffix.lower() != ".png":
@@ -342,11 +360,10 @@ class BoardInspectionController:
             raise ValueError("Cell must be inside the 5x6 Standard Board")
         board = [list(items) for items in self.state.board]
         board[row][col] = _coerce_orb(value)
-        updated = BoardInspectionState(self.state.source_name, self.state.width, self.state.height,
-                                       self.state.pixels, self.state.calibration,
-                                       self.state.detected_board, tuple(map(tuple, board)), None,
-                                       False, _uncertain_cells(tuple(map(tuple, board))), (),
-                                       "Cell corrected; review and confirm the Board")
+        updated = replace(self.state, board=tuple(map(tuple, board)), confirmed_board=None,
+                          confirmed=False, uncertain_cells=_uncertain_cells(tuple(map(tuple, board))),
+                          overlay=(), route_evaluation=None, route_approved=False,
+                          status="Cell corrected; review and confirm the Board")
         self.state = self._with_overlay(updated)
         return self.state
 
@@ -358,13 +375,62 @@ class BoardInspectionController:
             raise ValueError("No Board is loaded")
         if self.state.uncertain_cells:
             raise ValueError("Uncertain cells require manual correction before confirmation")
-        self.state = BoardInspectionState(self.state.source_name, self.state.width, self.state.height,
-                                          self.state.pixels, self.state.calibration,
-                                          self.state.detected_board, self.state.board, self.state.board,
-                                          True, (), self.state.overlay, "Board confirmed")
+        self.state = replace(self.state, confirmed_board=self.state.board, confirmed=True,
+                             uncertain_cells=(), route_evaluation=None, route_approved=False,
+                             status="Board confirmed")
         return self.state.board
 
     confirm = confirm_board
+
+    def set_rule_profile(self, profile: RuleProfile) -> BoardInspectionState:
+        if not isinstance(profile, RuleProfile):
+            raise TypeError("profile must be a RuleProfile")
+        self.state = replace(self.state, rule_profile=profile, route_evaluation=None,
+                             route_approved=False, status=f"Rule Profile applied: {profile.name}")
+        return self.state
+
+    apply_rule_profile = set_rule_profile
+    apply_profile = set_rule_profile
+
+    def save_rule_profile(self, path: str | Path, profile: RuleProfile | None = None) -> None:
+        profile = profile or self.state.rule_profile
+        if profile is None:
+            raise ValueError("No Rule Profile is applied")
+        write_rule_profile(profile, path)
+
+    save_profile = save_rule_profile
+
+    def load_rule_profile(self, path: str | Path) -> BoardInspectionState:
+        return self.set_rule_profile(read_rule_profile(path))
+
+    load_profile = load_rule_profile
+
+    def evaluate_manual_route(self, path: Iterable[tuple[int, int]],
+                               profile: RuleProfile | None = None) -> RouteEvaluation:
+        board = self.state.confirmed_board or self.state.board
+        if board is None:
+            raise ValueError("Load and confirm a Board before evaluating a Route")
+        profile = profile or self.state.rule_profile
+        if profile is None:
+            raise ValueError("Apply a Rule Profile before evaluating a Route")
+        result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed)
+        self.state = replace(self.state, route_evaluation=result, route_approved=False,
+                             status=result.diagnostic)
+        return result
+
+    evaluate_route = evaluate_manual_route
+    evaluate = evaluate_manual_route
+
+    def approve_route(self, explicit_confirmation: bool = False) -> RouteEvaluation:
+        result = self.state.route_evaluation
+        if result is None or not result.execution_eligible:
+            raise ValueError("Only a qualifying Route on a confirmed Board can be approved")
+        if not explicit_confirmation:
+            raise ValueError("Explicit Route confirmation is required")
+        self.state = replace(self.state, route_approved=True, status="Route approved")
+        return result
+
+    confirm_route = approve_route
 
 
 def _photo_from_screenshot(screenshot_data: Screenshot, tk_module):

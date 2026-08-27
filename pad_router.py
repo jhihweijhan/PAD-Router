@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import colorsys
 import heapq
+import json
 import math
+from pathlib import Path
 import shlex
 import struct
 import statistics
@@ -97,48 +99,8 @@ def board_report(board: tuple[tuple[object, ...], ...]) -> str:
 
 def settle(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple[int, tuple[tuple[object, ...], ...]]:
     """Return combos after gravity; set cascade=False to count only the direct clear."""
-    b = [list(row) for row in board]
-    # score() calls settle thousands of times during beam search. Cache the
-    # semantic keys once per cell instead of re-decoding Orb metadata in every
-    # horizontal/vertical/neighbour comparison.
-    keys = [[orb_match_key(value) for value in row] for row in b]
-    combos = 0
-    while True:
-        matched = [[False] * COLS for _ in range(ROWS)]
-        for r in range(ROWS):
-            for c in range(COLS - 2):
-                if (keys[r][c] is not None
-                        and keys[r][c] == keys[r][c + 1] == keys[r][c + 2]):
-                    matched[r][c] = matched[r][c + 1] = matched[r][c + 2] = True
-        for r in range(ROWS - 2):
-            for c in range(COLS):
-                if (keys[r][c] is not None
-                        and keys[r][c] == keys[r + 1][c] == keys[r + 2][c]):
-                    matched[r][c] = matched[r + 1][c] = matched[r + 2][c] = True
-        if not any(map(any, matched)):
-            return combos, tuple(map(tuple, b))
-
-        seen = [[False] * COLS for _ in range(ROWS)]
-        for r in range(ROWS):
-            for c in range(COLS):
-                if matched[r][c] and not seen[r][c]:
-                    combos += 1
-                    color, q = keys[r][c], deque([(r, c)])
-                    seen[r][c] = True
-                    while q:
-                        cr, cc = q.popleft()
-                        for dr, dc in DIRECTIONS:
-                            nr, nc = cr + dr, cc + dc
-                            if (0 <= nr < ROWS and 0 <= nc < COLS and matched[nr][nc]
-                                    and not seen[nr][nc] and keys[nr][nc] == color):
-                                seen[nr][nc] = True
-                                q.append((nr, nc))
-        for c in range(COLS):
-            kept = [(b[r][c], keys[r][c]) for r in range(ROWS) if not matched[r][c]]
-            for r, (value, key) in enumerate([(0, None)] * (ROWS - len(kept)) + kept):
-                b[r][c], keys[r][c] = value, key
-        if not cascade:
-            return combos, tuple(map(tuple, b))
+    rounds, remaining = _resolve_rounds(board, cascade)
+    return sum(item.combo_count for item in rounds), remaining
 
 
 def score(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple[float, int]:
@@ -185,6 +147,745 @@ def expected_board_after_path(
     for a, b in zip(points, points[1:]):
         result = moved(result, a, b)
     return result
+
+
+@dataclass(frozen=True, init=False)
+class LeaderCondition:
+    """One board predicate in a Rule Profile.
+
+    ``value`` is intentionally small and JSON-friendly: it is a number for
+    thresholds, an orb name for an attribute, or a sequence for a set of
+    attributes/orbs.  ``include_cascades`` makes the resolution timing part of
+    the saved rule instead of an accidental property of the evaluator.
+    """
+
+    kind: str
+    value: object = None
+    minimum: int | None = None
+    exact: bool = False
+    include_cascades: bool = True
+    phase: str | None = None
+
+    def __init__(self, kind: str, value: object = None, minimum: int | None = None,
+                 exact: bool = False, include_cascades: bool = True, phase: str | None = None,
+                 **options: object) -> None:
+        # Accept the vocabulary used by the profile editor as well as the
+        # compact ``value`` form used by the pure interface.
+        if value is None:
+            for key in ("orb_type", "orb_types", "attribute", "attributes", "shape"):
+                if key in options:
+                    value = options.pop(key)
+                    break
+        if minimum is None:
+            for key in ("count", "min", "at_least"):
+                if key in options:
+                    minimum = options.pop(key)  # type: ignore[assignment]
+                    break
+        if "cascades" in options:
+            include_cascades = bool(options.pop("cascades"))
+        if "resolution" in options and phase is None:
+            phase = str(options.pop("resolution"))
+        if options:
+            raise TypeError(f"Unknown Leader Condition options: {', '.join(sorted(options))}")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "exact", exact)
+        object.__setattr__(self, "include_cascades", include_cascades)
+        object.__setattr__(self, "phase", phase)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        kind = str(self.kind).strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "combo": "combo_minimum",
+            "combos": "combo_minimum",
+            "attribute": "attribute",
+            "attributes": "simultaneous_attributes",
+            "simultaneous_attribute": "simultaneous_attributes",
+            "matches": "match_count",
+            "attribute_match_count": "match_count",
+            "connected": "connected_orb_count",
+            "enhanced": "enhanced_orb",
+            "enhanced_orbs": "enhanced_orb",
+            "required_orb": "required_orbs",
+            "forbidden_orb": "forbidden_orbs",
+        }
+        object.__setattr__(self, "kind", aliases.get(kind, kind))
+        if self.minimum is not None and (not isinstance(self.minimum, int) or isinstance(self.minimum, bool)):
+            raise ValueError("Condition minimum must be an integer")
+        if self.minimum is not None and self.minimum < 0:
+            raise ValueError("Condition minimum must be non-negative")
+        if self.kind in {"simultaneous_attributes", "required_orbs", "forbidden_orbs"}:
+            if isinstance(self.value, (list, tuple, set, frozenset)):
+                object.__setattr__(self, "value", tuple(self.value))
+        if self.phase is not None:
+            phase = str(self.phase).strip().lower().replace("-", "_")
+            if phase not in {"direct", "all", "cascade", "cascades"}:
+                raise ValueError("Condition phase must be direct or all")
+            object.__setattr__(self, "phase", "direct" if phase == "direct" else "all")
+
+    @property
+    def orb_type(self) -> object:
+        return self.value
+
+    @classmethod
+    def combo_minimum(cls, minimum: int, include_cascades: bool = True) -> "LeaderCondition":
+        return cls("combo_minimum", minimum=minimum, include_cascades=include_cascades)
+
+    @classmethod
+    def attribute(cls, orb_type: str | int, include_cascades: bool = True) -> "LeaderCondition":
+        return cls("attribute", value=orb_type, include_cascades=include_cascades)
+
+    @classmethod
+    def simultaneous_attributes(cls, orb_types: Iterable[str | int], include_cascades: bool = True) -> "LeaderCondition":
+        return cls("simultaneous_attributes", value=tuple(orb_types), include_cascades=include_cascades)
+
+    @classmethod
+    def match_count(cls, orb_type: str | int, minimum: int = 1, exact: bool = False,
+                    include_cascades: bool = True) -> "LeaderCondition":
+        return cls("match_count", value=orb_type, minimum=minimum, exact=exact,
+                   include_cascades=include_cascades)
+
+    @classmethod
+    def connected_orb_count(cls, minimum: int, orb_type: str | int | None = None,
+                            exact: bool = False, include_cascades: bool = True) -> "LeaderCondition":
+        return cls("connected_orb_count", value=orb_type, minimum=minimum, exact=exact,
+                   include_cascades=include_cascades)
+
+    @classmethod
+    def enhanced_orb(cls, minimum: int = 1, orb_type: str | int | None = None,
+                     exact: bool = False, include_cascades: bool = True) -> "LeaderCondition":
+        return cls("enhanced_orb", value=orb_type, minimum=minimum, exact=exact,
+                   include_cascades=include_cascades)
+
+    @classmethod
+    def shape(cls, shape: str, include_cascades: bool = True) -> "LeaderCondition":
+        return cls("shape", value=shape, include_cascades=include_cascades)
+
+    @classmethod
+    def required_orbs(cls, orb_types: Iterable[str | int], include_cascades: bool = True) -> "LeaderCondition":
+        return cls("required_orbs", value=tuple(orb_types), include_cascades=include_cascades)
+
+    @classmethod
+    def forbidden_orbs(cls, orb_types: Iterable[str | int], include_cascades: bool = True) -> "LeaderCondition":
+        return cls("forbidden_orbs", value=tuple(orb_types), include_cascades=include_cascades)
+
+    def to_dict(self) -> dict[str, object]:
+        value = list(self.value) if isinstance(self.value, tuple) else self.value
+        return {"kind": self.kind, "value": value, "minimum": self.minimum,
+                "exact": self.exact, "include_cascades": self.include_cascades,
+                "phase": self.phase}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "LeaderCondition":
+        if not isinstance(value, dict) or not ("kind" in value or "type" in value or "predicate" in value):
+            raise ValueError("A Leader Condition needs a kind")
+        raw = value.get("value")
+        kind = str(value.get("kind", value.get("type", value.get("predicate")))).strip().lower().replace("-", "_").replace(" ", "_")
+        if kind in {"simultaneous_attributes", "attributes", "required_orbs", "forbidden_orbs"} and isinstance(raw, list):
+            raw = tuple(raw)
+        return cls(kind, raw, value.get("minimum"), bool(value.get("exact", False)),
+                   bool(value.get("include_cascades", True)), value.get("phase"))
+
+
+Condition = LeaderCondition
+
+
+@dataclass(frozen=True, init=False)
+class ConditionGroup:
+    """A named all-of or any-of group of enabled Leader Conditions."""
+
+    conditions: tuple[LeaderCondition, ...] = ()
+    operator: str = "all"
+    enabled: bool = True
+    name: str = ""
+
+    def __init__(self, conditions: Iterable[LeaderCondition] = (), operator: str = "all",
+                 enabled: bool = True, name: str = "") -> None:
+        # ``ConditionGroup("all", conditions)`` is convenient at the call
+        # site; keyword construction remains the canonical form.
+        if isinstance(conditions, str) and not isinstance(operator, str):
+            conditions, operator = operator, conditions
+        object.__setattr__(self, "conditions", conditions)
+        object.__setattr__(self, "operator", operator)
+        object.__setattr__(self, "enabled", enabled)
+        object.__setattr__(self, "name", name)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        conditions = tuple(_coerce_condition(condition) for condition in self.conditions)
+        operator = str(self.operator).strip().lower().replace("-", "_").replace(" ", "_")
+        if operator.endswith("_of"):
+            operator = operator[:-3]
+        if operator not in {"all", "any"}:
+            raise ValueError("Condition group operator must be all or any")
+        object.__setattr__(self, "conditions", conditions)
+        object.__setattr__(self, "operator", operator)
+
+    @classmethod
+    def all_of(cls, conditions: Iterable[LeaderCondition], name: str = "") -> "ConditionGroup":
+        return cls(tuple(conditions), "all", name=name)
+
+    @classmethod
+    def any_of(cls, conditions: Iterable[LeaderCondition], name: str = "") -> "ConditionGroup":
+        return cls(tuple(conditions), "any", name=name)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"conditions": [condition.to_dict() for condition in self.conditions],
+                "operator": self.operator, "enabled": self.enabled, "name": self.name}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "ConditionGroup":
+        if not isinstance(value, dict):
+            raise ValueError("A Condition Group must be an object")
+        raw_conditions = value.get("conditions", value.get("leader_conditions", value.get("rules", ())))
+        conditions = tuple(LeaderCondition.from_dict(item) for item in raw_conditions)
+        return cls(conditions, str(value.get("operator", "all")), bool(value.get("enabled", True)),
+                   str(value.get("name", "")))
+
+
+@dataclass(frozen=True)
+class ExternalCondition:
+    """A non-board prerequisite explicitly confirmed by the player."""
+
+    name: str
+    confirmed: bool = False
+    required: bool = True
+
+    def __post_init__(self) -> None:
+        if not str(self.name).strip():
+            raise ValueError("External Condition needs a name")
+
+    def to_dict(self) -> dict[str, object]:
+        return {"name": self.name, "confirmed": self.confirmed, "required": self.required}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object] | str) -> "ExternalCondition":
+        if isinstance(value, str):
+            return cls(value)
+        if not isinstance(value, dict) or "name" not in value:
+            raise ValueError("An External Condition needs a name")
+        return cls(str(value["name"]), bool(value.get("confirmed", False)), bool(value.get("required", True)))
+
+
+def _coerce_condition(condition: LeaderCondition | dict[str, object]) -> LeaderCondition:
+    if isinstance(condition, LeaderCondition):
+        return condition
+    if isinstance(condition, dict):
+        return LeaderCondition.from_dict(condition)
+    raise TypeError("Conditions must be LeaderCondition objects")
+
+
+@dataclass(frozen=True, init=False)
+class RuleProfile:
+    """A local, JSON-serializable set of team and external route rules."""
+
+    name: str
+    condition_groups: tuple[ConditionGroup, ...]
+    external_conditions: tuple[ExternalCondition, ...]
+    hazard_policy: str
+
+    def __init__(self, name: str, condition_groups: Iterable[ConditionGroup] = (),
+                 external_conditions: Iterable[ExternalCondition] = (), hazard_policy: str = "avoid",
+                 *, groups: Iterable[ConditionGroup] | None = None,
+                 team_conditions: Iterable[ConditionGroup] | None = None,
+                 team_condition: ConditionGroup | None = None) -> None:
+        if groups is not None:
+            condition_groups = groups
+        if team_conditions is not None:
+            condition_groups = team_conditions
+        if team_condition is not None:
+            condition_groups = (team_condition,)
+        if not str(name).strip():
+            raise ValueError("Rule Profile needs a name")
+        policy = "allow" if hazard_policy is True else "avoid" if hazard_policy is False else str(hazard_policy).strip().lower()
+        policy = {"allowed": "allow", "allow_hazards": "allow", "allow_hazard": "allow",
+                  "exclude": "avoid", "avoid_hazards": "avoid", "forbid": "avoid",
+                  "blocked": "avoid"}.get(policy, policy)
+        if policy not in {"avoid", "allow"}:
+            raise ValueError("Hazard Policy must be avoid or allow")
+        object.__setattr__(self, "name", str(name).strip())
+        object.__setattr__(self, "condition_groups", tuple(
+            item if isinstance(item, ConditionGroup) else ConditionGroup.from_dict(item)
+            for item in condition_groups
+        ))
+        if isinstance(external_conditions, dict):
+            external_conditions = tuple(ExternalCondition(name, bool(confirmed))
+                                        for name, confirmed in external_conditions.items())
+        object.__setattr__(self, "external_conditions", tuple(
+            item if isinstance(item, ExternalCondition) else ExternalCondition.from_dict(item)
+            for item in external_conditions
+        ))
+        object.__setattr__(self, "hazard_policy", policy)
+
+    @property
+    def groups(self) -> tuple[ConditionGroup, ...]:
+        return self.condition_groups
+
+    @property
+    def team_conditions(self) -> tuple[ConditionGroup, ...]:
+        return self.condition_groups
+
+    def to_dict(self) -> dict[str, object]:
+        return {"schema_version": 1, "name": self.name,
+                "condition_groups": [group.to_dict() for group in self.condition_groups],
+                "external_conditions": [condition.to_dict() for condition in self.external_conditions],
+                "hazard_policy": self.hazard_policy}
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "RuleProfile":
+        if not isinstance(value, dict):
+            raise ValueError("Rule Profile JSON must contain an object")
+        groups = value.get("condition_groups", value.get("groups"))
+        if groups is None:
+            team = value.get("team_condition")
+            groups = (team,) if isinstance(team, dict) else ()
+        elif isinstance(groups, dict):
+            groups = (groups,)
+        return cls(str(value.get("name", "")),
+                   tuple(ConditionGroup.from_dict(item) for item in groups),
+                   tuple(ExternalCondition.from_dict(item) for item in value.get("external_conditions", ())),
+                   value.get("hazard_policy", "avoid"))
+
+    @classmethod
+    def from_json(cls, text: str) -> "RuleProfile":
+        try:
+            value = json.loads(text)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid Rule Profile JSON") from exc
+        return cls.from_dict(value)
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(self.to_json(), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RuleProfile":
+        try:
+            return cls.from_json(Path(path).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"Could not read Rule Profile: {path}") from exc
+
+
+def save_rule_profile(profile: RuleProfile | str | Path, path: str | Path | RuleProfile) -> None:
+    if not isinstance(profile, RuleProfile) and isinstance(path, RuleProfile):
+        profile, path = path, profile
+    if not isinstance(profile, RuleProfile):
+        raise TypeError("profile must be a RuleProfile")
+    profile.save(path)
+
+
+def load_rule_profile(path: str | Path) -> RuleProfile:
+    return RuleProfile.load(path)
+
+
+save_profile = save_rule_profile
+load_profile = load_rule_profile
+
+
+@dataclass(frozen=True)
+class ResolvedMatch:
+    key: int | str
+    cells: tuple[tuple[int, int], ...]
+    round: int
+    enhanced_count: int = 0
+
+    @property
+    def orb_type(self) -> str:
+        return NAMES.get(self.key, self.key) if isinstance(self.key, (int, str)) else str(self.key)
+
+    @property
+    def count(self) -> int:
+        return len(self.cells)
+
+    @property
+    def size(self) -> int:
+        return len(self.cells)
+
+
+@dataclass(frozen=True)
+class MatchRound:
+    number: int
+    matches: tuple[ResolvedMatch, ...]
+    board_after: tuple[tuple[object, ...], ...]
+
+    @property
+    def combo_count(self) -> int:
+        return len(self.matches)
+
+    @property
+    def round_number(self) -> int:
+        return self.number
+
+
+@dataclass(frozen=True)
+class ConditionResult:
+    identifier: str
+    condition: object
+    satisfied: bool
+    observed: object = None
+    message: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.identifier
+
+    @property
+    def passed(self) -> bool:
+        return self.satisfied
+
+    @property
+    def reason(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True)
+class ConditionGroupResult:
+    index: int
+    group: ConditionGroup
+    condition_results: tuple[ConditionResult, ...]
+    satisfied: bool
+
+
+@dataclass(frozen=True)
+class RouteEvaluation:
+    route: tuple[tuple[int, int], ...]
+    expected_board: tuple[tuple[object, ...], ...]
+    rounds: tuple[MatchRound, ...]
+    condition_results: tuple[ConditionResult, ...]
+    group_results: tuple[ConditionGroupResult, ...]
+    combo_count: int
+    hazard_outcome: str
+    qualifying: bool
+    confirmed: bool
+    execution_eligible: bool
+    diagnostic_status: str
+    diagnostic: str
+
+    @property
+    def path(self) -> tuple[tuple[int, int], ...]:
+        return self.route
+
+    @property
+    def match_rounds(self) -> tuple[MatchRound, ...]:
+        return self.rounds
+
+    @property
+    def resolved_matches(self) -> tuple[ResolvedMatch, ...]:
+        return tuple(match for item in self.rounds for match in item.matches)
+
+    @property
+    def cascades(self) -> int:
+        return max(0, len(self.rounds) - 1)
+
+    @property
+    def team_condition_satisfied(self) -> bool:
+        return all(group.satisfied for group in self.group_results) and all(
+            result.satisfied for result in self.condition_results if result.identifier.startswith("external:")
+        )
+
+    @property
+    def failed_conditions(self) -> tuple[str, ...]:
+        failed: list[str] = []
+        for group in self.group_results:
+            if not group.satisfied:
+                failed.extend(result.identifier for result in group.condition_results if not result.satisfied)
+        failed.extend(result.identifier for result in self.condition_results
+                      if result.identifier.startswith("external:") and not result.satisfied)
+        if self.hazard_outcome == "blocked":
+            failed.append("hazard_policy")
+        return tuple(failed)
+
+    @property
+    def status(self) -> str:
+        return self.diagnostic_status
+
+    @property
+    def eligible(self) -> bool:
+        return self.execution_eligible
+
+    @property
+    def hazard_treatment(self) -> str:
+        return self.hazard_outcome
+
+    @property
+    def is_qualifying(self) -> bool:
+        return self.qualifying
+
+    @property
+    def execution_allowed(self) -> bool:
+        return self.execution_eligible
+
+    @property
+    def can_execute(self) -> bool:
+        return self.execution_eligible
+
+
+PlanningResult = RouteEvaluation
+ManualRouteResult = RouteEvaluation
+Match = ResolvedMatch
+
+
+def _validate_board(board: tuple[tuple[object, ...], ...]) -> None:
+    if len(board) != ROWS or any(len(row) != COLS for row in board):
+        raise ValueError("Expected a 5x6 board")
+
+
+def _normalise_orb_type(value: object) -> int | str | None:
+    key = orb_match_key(value)
+    if key is not None:
+        return NAMES.get(key, key) if isinstance(key, int) else key
+    if isinstance(value, str):
+        text = value.strip().lower().replace(" ", "_").replace("-", "_")
+        return text if text in set(NAMES.values()) | HAZARDS else None
+    if isinstance(value, int) and value in NAMES:
+        return NAMES[value]
+    return None
+
+
+def _orb_types(value: object) -> tuple[int | str, ...]:
+    values = value if isinstance(value, (list, tuple, set, frozenset)) else (value,)
+    return tuple(item for item in (_normalise_orb_type(value) for value in values) if item is not None)
+
+
+def _match_type(match: ResolvedMatch) -> str:
+    return NAMES.get(match.key, match.key) if isinstance(match.key, int) else match.key
+
+
+def _find_resolved_matches(board: tuple[tuple[object, ...], ...], round_number: int) -> tuple[ResolvedMatch, ...]:
+    keys = [[orb_match_key(value) for value in row] for row in board]
+    matched = [[False] * COLS for _ in range(ROWS)]
+    for row in range(ROWS):
+        for col in range(COLS - 2):
+            if keys[row][col] is not None and keys[row][col] == keys[row][col + 1] == keys[row][col + 2]:
+                matched[row][col] = matched[row][col + 1] = matched[row][col + 2] = True
+    for row in range(ROWS - 2):
+        for col in range(COLS):
+            if keys[row][col] is not None and keys[row][col] == keys[row + 1][col] == keys[row + 2][col]:
+                matched[row][col] = matched[row + 1][col] = matched[row + 2][col] = True
+    seen = [[False] * COLS for _ in range(ROWS)]
+    matches: list[ResolvedMatch] = []
+    for row in range(ROWS):
+        for col in range(COLS):
+            if not matched[row][col] or seen[row][col]:
+                continue
+            key = keys[row][col]
+            queue = deque([(row, col)])
+            seen[row][col] = True
+            cells: list[tuple[int, int]] = []
+            while queue:
+                current_row, current_col = queue.popleft()
+                cells.append((current_row, current_col))
+                for dr, dc in DIRECTIONS:
+                    next_row, next_col = current_row + dr, current_col + dc
+                    if (0 <= next_row < ROWS and 0 <= next_col < COLS and matched[next_row][next_col]
+                            and not seen[next_row][next_col] and keys[next_row][next_col] == key):
+                        seen[next_row][next_col] = True
+                        queue.append((next_row, next_col))
+            cells.sort()
+            enhanced = sum(bool(getattr(board[r][c], "enhanced", False)) for r, c in cells)
+            matches.append(ResolvedMatch(key, tuple(cells), round_number, enhanced))
+    return tuple(matches)
+
+
+def _resolve_rounds(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple[tuple[MatchRound, ...], tuple[tuple[object, ...], ...]]:
+    _validate_board(board)
+    working = board
+    rounds: list[MatchRound] = []
+    for round_number in range(1, ROWS * COLS + 1):
+        matches = _find_resolved_matches(working, round_number)
+        if not matches:
+            break
+        marked = {cell for match in matches for cell in match.cells}
+        columns = []
+        for col in range(COLS):
+            kept = [working[row][col] for row in range(ROWS) if (row, col) not in marked]
+            columns.append([0] * (ROWS - len(kept)) + kept)
+        working = tuple(tuple(columns[col][row] for col in range(COLS)) for row in range(ROWS))
+        rounds.append(MatchRound(round_number, matches, working))
+        if not cascade:
+            break
+    return tuple(rounds), working
+
+
+def resolve_matches(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple[MatchRound, ...]:
+    """Return direct and cascade Match rounds for a known Board."""
+    return _resolve_rounds(board, cascade)[0]
+
+
+def _shape_matches(cells: tuple[tuple[int, int], ...], shape: str) -> bool:
+    shape = str(shape).strip().lower().replace("-", "_").replace(" ", "_")
+    points = set(cells)
+    if not points:
+        return False
+    rows = {row for row, _ in points}
+    cols = {col for _, col in points}
+    if shape in {"row", "horizontal"}:
+        return len(rows) == 1 and len(points) >= 3 and len({col for _, col in points}) == max(cols) - min(cols) + 1
+    if shape in {"column", "vertical"}:
+        return len(cols) == 1 and len(points) >= 3 and len(rows) == max(rows) - min(rows) + 1
+    if shape in {"box", "box_3x3", "3x3", "three_by_three"}:
+        return len(points) >= 9 and any({(row, col) for row in range(top, top + 3) for col in range(left, left + 3)} <= points
+                                        for top in range(ROWS - 2) for left in range(COLS - 2))
+    if shape == "cross":
+        for center_row, center_col in points:
+            arms = {(center_row, center_col), (center_row - 1, center_col), (center_row + 1, center_col),
+                    (center_row, center_col - 1), (center_row, center_col + 1)}
+            if arms <= points:
+                return True
+        return False
+    if shape in {"l", "l_shape"}:
+        return any(sum(point[0] == row for point in points) >= 3 and
+                   sum(point[1] == col for point in points) >= 3 and
+                   (row, col) in points for row in rows for col in cols)
+    return False
+
+
+def _threshold(condition: LeaderCondition, default: int = 1) -> int:
+    if condition.minimum is not None:
+        return condition.minimum
+    if isinstance(condition.value, int):
+        return condition.value
+    return default
+
+
+def _condition_matches(condition: LeaderCondition, rounds: tuple[MatchRound, ...]) -> ConditionResult:
+    selected_rounds = tuple(rounds if condition.include_cascades and condition.phase != "direct" else rounds[:1])
+    matches = tuple(match for item in selected_rounds for match in item.matches)
+    kind = condition.kind
+    observed: object = None
+    satisfied = False
+    if kind == "combo_minimum":
+        observed = len(matches)
+        satisfied = observed >= _threshold(condition)
+        message = f"{observed} combos; need at least {_threshold(condition)}"
+    elif kind == "attribute":
+        target = _normalise_orb_type(condition.value)
+        observed = any(_match_type(match) == target for match in matches)
+        satisfied = bool(observed)
+        message = f"attribute {condition.value}: {'present' if satisfied else 'missing'}"
+    elif kind == "simultaneous_attributes":
+        targets = set(_orb_types(condition.value))
+        observed = tuple(sorted({_match_type(match) for match in matches}))
+        satisfied = bool(targets) and any(targets <= {_match_type(match) for match in item.matches} for item in selected_rounds)
+        message = f"simultaneous attributes {sorted(targets)}: {'present' if satisfied else 'missing'}"
+    elif kind in {"match_count", "connected_orb_count"}:
+        target = _normalise_orb_type(condition.value) if kind == "match_count" else _normalise_orb_type(condition.value)
+        candidates = [match for match in matches if target is None or _match_type(match) == target]
+        observed = max((match.count for match in candidates), default=0) if kind == "connected_orb_count" else len(candidates)
+        expected = _threshold(condition)
+        satisfied = observed == expected if condition.exact else observed >= expected
+        comparator = "exactly" if condition.exact else "at least"
+        message = f"{observed}; need {comparator} {expected}"
+    elif kind == "enhanced_orb":
+        target = _normalise_orb_type(condition.value)
+        observed = sum(match.enhanced_count for match in matches if target is None or _match_type(match) == target)
+        expected = _threshold(condition)
+        satisfied = observed == expected if condition.exact else observed >= expected
+        comparator = "exactly" if condition.exact else "at least"
+        message = f"{observed} enhanced Orbs; need {comparator} {expected}"
+    elif kind == "shape":
+        observed = tuple(_match_type(match) for match in matches if _shape_matches(match.cells, str(condition.value)))
+        satisfied = bool(observed)
+        message = f"shape {condition.value}: {'present' if satisfied else 'missing'}"
+    elif kind in {"required_orbs", "forbidden_orbs"}:
+        targets = set(_orb_types(condition.value))
+        observed = tuple(sorted({_match_type(match) for match in matches}))
+        present = set(observed)
+        satisfied = targets <= present if kind == "required_orbs" else not (targets & present)
+        message = f"orb types {sorted(targets)}: {'satisfied' if satisfied else 'not satisfied'}"
+    else:
+        message = f"unsupported condition kind: {kind}"
+    return ConditionResult(kind, condition, bool(satisfied), observed, message)
+
+
+def _condition_requires_hazard(condition: LeaderCondition, hazard_types: set[str]) -> bool:
+    if condition.kind not in {"attribute", "match_count", "connected_orb_count", "enhanced_orb", "required_orbs", "simultaneous_attributes"}:
+        return False
+    return bool(hazard_types & set(_orb_types(condition.value)))
+
+
+def evaluate_manual_route(
+    board: tuple[tuple[object, ...], ...], path: Iterable[tuple[int, int]], profile: RuleProfile,
+    confirmed: bool = False, cascade: bool = True, *, board_confirmed: bool | None = None,
+    confirmed_board: bool | None = None,
+) -> RouteEvaluation:
+    """Evaluate a manually dragged Route without performing device I/O."""
+    if not isinstance(profile, RuleProfile):
+        raise TypeError("profile must be a RuleProfile")
+    if board_confirmed is not None:
+        confirmed = board_confirmed
+    if confirmed_board is not None:
+        confirmed = confirmed_board
+    _validate_board(board)
+    route = tuple(tuple(point) for point in path)
+    if not route:
+        raise ValueError("Route must contain at least one Board cell")
+    if any(len(point) != 2 or not all(isinstance(value, int) for value in point)
+           or not (0 <= point[0] < ROWS and 0 <= point[1] < COLS) for point in route):
+        raise ValueError("Route points must be inside the 5x6 Standard Board")
+    if any(abs(first[0] - second[0]) + abs(first[1] - second[1]) != 1 for first, second in zip(route, route[1:])):
+        raise ValueError("Route points must be adjacent Board cells")
+    expected = expected_board_after_path(board, route)
+    rounds, _remaining = _resolve_rounds(expected, cascade)
+    group_results: list[ConditionGroupResult] = []
+    condition_results: list[ConditionResult] = []
+    for index, group in enumerate(profile.condition_groups, 1):
+        if not group.enabled:
+            continue
+        results = tuple(_condition_matches(condition, rounds) for condition in group.conditions)
+        condition_results.extend(results)
+        satisfied = all(result.satisfied for result in results) if group.operator == "all" else any(result.satisfied for result in results)
+        group_results.append(ConditionGroupResult(index, group, results, satisfied))
+    for condition in profile.external_conditions:
+        if condition.required:
+            condition_results.append(ConditionResult(f"external:{condition.name}", condition,
+                                                     condition.confirmed, condition.confirmed,
+                                                     "confirmed" if condition.confirmed else "not confirmed"))
+    team_satisfied = all(item.satisfied for item in group_results) and all(
+        result.satisfied for result in condition_results if result.identifier.startswith("external:")
+    )
+    all_matches = tuple(match for item in rounds for match in item.matches)
+    hazard_types = {_match_type(match) for match in all_matches if _match_type(match) in HAZARDS}
+    requires_hazard = any(_condition_requires_hazard(condition, hazard_types)
+                          for group in profile.condition_groups if group.enabled
+                          for condition in group.conditions)
+    if not hazard_types:
+        hazard_outcome = "none"
+    elif requires_hazard:
+        hazard_outcome = "required"
+    elif profile.hazard_policy == "allow":
+        hazard_outcome = "allowed"
+    else:
+        hazard_outcome = "blocked"
+    qualifies = team_satisfied and hazard_outcome != "blocked"
+    if not qualifies:
+        failed: list[str] = []
+        for group_result in group_results:
+            if not group_result.satisfied:
+                failed.extend(result.identifier for result in group_result.condition_results if not result.satisfied)
+        failed.extend(result.identifier for result in condition_results
+                      if result.identifier.startswith("external:") and not result.satisfied)
+        if hazard_outcome == "blocked":
+            failed.append("hazard_policy")
+        diagnostic = "Failed conditions: " + (", ".join(failed) if failed else "hazard policy")
+        status = "failed_conditions"
+    elif not confirmed:
+        diagnostic = "Team Condition passed; Board is not confirmed for execution"
+        status = "unconfirmed_board"
+    else:
+        diagnostic = "Team Condition passed; Route is eligible for confirmation"
+        status = "qualifying"
+    return RouteEvaluation(route, expected, rounds, tuple(condition_results), tuple(group_results),
+                           sum(item.combo_count for item in rounds), hazard_outcome, qualifies,
+                           bool(confirmed), bool(confirmed and qualifies), status, diagnostic)
+
+
+evaluate_route = evaluate_manual_route
+plan_route = evaluate_manual_route
 
 
 def _board_cell_key(value: object) -> object:
