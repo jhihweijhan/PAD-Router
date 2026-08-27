@@ -56,6 +56,22 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIsNotNone(first.qualifying_candidate)
         self.assertTrue(first.qualifying_candidate.execution_eligible)
 
+    def test_search_ranks_qualifying_candidates_by_combos_steps_then_route_order(self):
+        board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
+                 (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
+                 (6, 3, 4, 5, 6, 3))
+        profile = RuleProfile("ranked", condition_groups=(ConditionGroup.all_of((
+            LeaderCondition.combo_minimum(2),
+        )),))
+
+        result = search_qualifying_route(
+            board, profile, RouteSearchOptions(attempts=20, seed=0, min_steps=0, max_steps=4), confirmed=True
+        )
+
+        self.assertIsNotNone(result.qualifying_candidate)
+        self.assertEqual(result.qualifying_candidate.route, ((2, 4),))
+        self.assertEqual(result.qualifying_candidate.combo_count, 2)
+
     def test_condition_groups_and_external_conditions_are_table_driven(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
