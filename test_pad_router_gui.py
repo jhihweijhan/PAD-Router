@@ -7,7 +7,8 @@ from pathlib import Path
 
 from pad_router import (COLS, ROWS, ConditionGroup, LeaderCondition, Orb, PlayVerification,
                         RouteSearchOptions, RuleProfile, expected_board_after_path)
-from pad_router_gui import BoardCalibration, BoardInspectionController, decode_png
+from pad_router_gui import (NO_CONDITION, BoardCalibration, BoardInspectionController, decode_png,
+                            rule_profile_from_selections)
 
 
 def png_bytes(width=12, height=10):
@@ -235,6 +236,19 @@ class BoardCalibrationTests(unittest.TestCase):
             BoardCalibration(1, 0, 1).validate(6, 5)
         with self.assertRaises(ValueError):
             BoardCalibration(0, 0, 0).validate(6, 5)
+
+
+class RuleProfileSelectionTests(unittest.TestCase):
+    def test_fixed_choices_build_combined_conditions_without_json_input(self):
+        profile = rule_profile_from_selections(
+            ("至少 5 Combo", "消除火珠", NO_CONDITION), "全部符合", "避免危害珠", "HP 條件已確認"
+        )
+
+        self.assertEqual(profile.hazard_policy, "avoid")
+        self.assertEqual([item.kind for item in profile.condition_groups[0].conditions],
+                         ["combo_minimum", "attribute"])
+        self.assertEqual(profile.external_conditions[0].name, "HP 條件")
+        self.assertTrue(profile.external_conditions[0].confirmed)
 
 
 if __name__ == "__main__":

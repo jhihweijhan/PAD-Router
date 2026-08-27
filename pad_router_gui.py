@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-import json
+import subprocess
 import struct
 import zlib
 from dataclasses import dataclass, replace
@@ -22,6 +22,7 @@ from pad_router import (
     ConditionGroup,
     ExternalCondition,
     HAZARDS,
+    LeaderCondition,
     NAMES,
     ROWS,
     Grid,
@@ -56,6 +57,47 @@ ORB_LABELS = {
     "jammer": "干擾", "poison": "毒", "mortal_poison": "猛毒", "bomb": "炸彈",
 }
 ORB_KINDS = {label: kind for kind, label in ORB_LABELS.items()}
+
+CONDITION_PRESETS = {
+    "不限（以最大 Combo 為主）": (),
+    "至少 3 Combo": (LeaderCondition.combo_minimum(3),),
+    "至少 5 Combo": (LeaderCondition.combo_minimum(5),),
+    "至少 7 Combo": (LeaderCondition.combo_minimum(7),),
+    "消除火珠": (LeaderCondition.attribute("fire"),),
+    "消除水珠": (LeaderCondition.attribute("water"),),
+    "消除木珠": (LeaderCondition.attribute("wood"),),
+    "消除光珠": (LeaderCondition.attribute("light"),),
+    "消除暗珠": (LeaderCondition.attribute("dark"),),
+    "消除心珠": (LeaderCondition.attribute("heart"),),
+    "同時消除火、水、木": (LeaderCondition.simultaneous_attributes(("fire", "water", "wood")),),
+    "同時消除火、水、木、光、暗": (LeaderCondition.simultaneous_attributes(("fire", "water", "wood", "light", "dark")),),
+    "同色連 5 顆以上": (LeaderCondition.connected_orb_count(5),),
+    "強化珠至少消除 1 顆": (LeaderCondition.enhanced_orb(1),),
+    **{f"{ORB_LABELS[name]}珠至少消除 2 組": (LeaderCondition.match_count(name, 2),)
+       for name in NAMES.values()},
+}
+NO_CONDITION = "不限（以最大 Combo 為主）"
+GROUP_OPERATORS = {"全部符合": "all", "任一符合": "any"}
+HAZARD_POLICIES = {"避免危害珠": "avoid", "允許危害珠": "allow"}
+EXTERNAL_CONDITIONS = {
+    "無": (),
+    "HP 條件已確認": (ExternalCondition("HP 條件", confirmed=True),),
+    "HP 條件未確認": (ExternalCondition("HP 條件", confirmed=False),),
+    "技能條件已確認": (ExternalCondition("技能條件", confirmed=True),),
+    "技能條件未確認": (ExternalCondition("技能條件", confirmed=False),),
+}
+
+
+def rule_profile_from_selections(condition_labels: Iterable[str], operator_label: str,
+                                 hazard_label: str, external_label: str) -> RuleProfile:
+    """Build a profile solely from the GUI's fixed choices."""
+
+    labels = tuple(dict.fromkeys(label for label in condition_labels if label != NO_CONDITION))
+    conditions = tuple(condition for label in labels for condition in CONDITION_PRESETS[label])
+    groups = (ConditionGroup(conditions, GROUP_OPERATORS[operator_label]),) if conditions else ()
+    return RuleProfile("、".join(labels) or "最大 Combo", condition_groups=groups,
+                       external_conditions=EXTERNAL_CONDITIONS[external_label],
+                       hazard_policy=HAZARD_POLICIES[hazard_label])
 
 
 @dataclass(frozen=True)
@@ -340,7 +382,7 @@ class BoardInspectionController:
     def capture_device(self, serial: str) -> BoardInspectionState:
         serial = serial.strip()
         if not serial:
-            raise ValueError("請輸入裝置序號")
+            raise ValueError("請選擇裝置")
         return self._with_source(self._capture(serial), serial)
 
     def set_calibration(self, calibration: BoardCalibration) -> BoardInspectionState:
@@ -472,7 +514,7 @@ class BoardInspectionController:
             raise ValueError("必須明確確認路徑")
         serial = serial.strip()
         if not serial:
-            raise ValueError("請輸入裝置序號")
+            raise ValueError("請選擇裝置")
         calibration = self.state.calibration
         if calibration is None:
             raise ValueError("執行前必須先校正盤面")
@@ -557,14 +599,11 @@ class BoardInspectionApp:
         self._enhanced = tk.BooleanVar()
         self._locked = tk.BooleanVar()
         self._serial = tk.StringVar()
-        self._left = tk.StringVar()
-        self._top = tk.StringVar()
-        self._cell = tk.StringVar()
         self._selected_label = tk.StringVar(value="尚未選取珠子")
-        self._profile_name = tk.StringVar(value="manual")
-        self._hazard_policy = tk.StringVar(value="avoid")
-        self._condition_groups = tk.StringVar(value="[]")
-        self._external_conditions = tk.StringVar(value="[]")
+        self._condition_choices = [tk.StringVar(value=NO_CONDITION) for _ in range(3)]
+        self._condition_operator = tk.StringVar(value="全部符合")
+        self._hazard_policy = tk.StringVar(value="避免危害珠")
+        self._external_condition = tk.StringVar(value="無")
         self._search_attempts = tk.StringVar(value="100")
         self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="尚未建立規則設定")
@@ -579,12 +618,11 @@ class BoardInspectionApp:
         controls.pack(fill="x")
         ttk.Button(controls, text="開啟 PNG", command=self.open_png).pack(side="left")
         ttk.Label(controls, text="裝置序號：").pack(side="left", padx=(12, 2))
-        ttk.Entry(controls, width=18, textvariable=self._serial).pack(side="left")
+        self._serial_box = ttk.Combobox(controls, width=18, textvariable=self._serial, state="readonly")
+        self._serial_box.pack(side="left")
+        ttk.Button(controls, text="更新裝置", command=self.refresh_devices).pack(side="left", padx=4)
         ttk.Button(controls, text="擷取畫面", command=self.capture_device).pack(side="left", padx=4)
-        ttk.Label(controls, text="校正 左/上/格寬：").pack(side="left", padx=(12, 2))
-        for variable, width in ((self._left, 5), (self._top, 6), (self._cell, 5)):
-            ttk.Entry(controls, width=width, textvariable=variable).pack(side="left", padx=1)
-        ttk.Button(controls, text="套用", command=self.apply_calibration).pack(side="left", padx=4)
+        ttk.Button(controls, text="重新自動校正", command=self.auto_calibration).pack(side="left", padx=(12, 4))
 
         body = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         body.pack(fill="both", expand=True)
@@ -617,26 +655,27 @@ class BoardInspectionApp:
         self._execute_button.pack(fill="x", pady=(4, 0))
         profile_frame = ttk.LabelFrame(board_frame, text="規則設定", padding=6)
         profile_frame.pack(fill="x", pady=(10, 0))
-        ttk.Label(profile_frame, text="名稱：").pack(anchor="w")
-        ttk.Entry(profile_frame, textvariable=self._profile_name).pack(fill="x")
-        ttk.Label(profile_frame, text="危害珠策略（avoid=避免，allow=允許）：").pack(anchor="w", pady=(4, 0))
-        ttk.Combobox(profile_frame, textvariable=self._hazard_policy, values=("avoid", "allow"),
+        ttk.Label(profile_frame, text="消珠條件（可選最多 3 項）：").pack(anchor="w")
+        for variable in self._condition_choices:
+            ttk.Combobox(profile_frame, textvariable=variable, values=tuple(CONDITION_PRESETS),
+                         state="readonly", width=34).pack(fill="x", pady=(2, 0))
+        ttk.Label(profile_frame, text="條件關係：").pack(anchor="w", pady=(4, 0))
+        ttk.Combobox(profile_frame, textvariable=self._condition_operator, values=tuple(GROUP_OPERATORS),
                      state="readonly", width=12).pack(fill="x")
-        ttk.Label(profile_frame, text="條件群組 JSON（條件與 operator 的清單；[] 表示無）：").pack(
-            anchor="w", pady=(4, 0))
-        ttk.Entry(profile_frame, textvariable=self._condition_groups, width=42).pack(fill="x")
-        ttk.Label(profile_frame, text="可用 kind：combo_minimum、attribute、simultaneous_attributes、match_count、"
-                  "connected_orb_count、enhanced_orb、shape、required_orbs、forbidden_orbs。",
-                  wraplength=340).pack(anchor="w")
-        ttk.Label(profile_frame, text="外部條件 JSON（name/confirmed/required；[] 表示無）：").pack(
-            anchor="w")
-        ttk.Entry(profile_frame, textvariable=self._external_conditions, width=42).pack(fill="x")
+        ttk.Label(profile_frame, text="危害珠策略：").pack(anchor="w", pady=(4, 0))
+        ttk.Combobox(profile_frame, textvariable=self._hazard_policy, values=tuple(HAZARD_POLICIES),
+                     state="readonly", width=12).pack(fill="x")
+        ttk.Label(profile_frame, text="外部條件：").pack(anchor="w", pady=(4, 0))
+        ttk.Combobox(profile_frame, textvariable=self._external_condition, values=tuple(EXTERNAL_CONDITIONS),
+                     state="readonly", width=18).pack(fill="x")
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
         ttk.Label(search_controls, text="嘗試次數：").pack(side="left")
-        ttk.Entry(search_controls, textvariable=self._search_attempts, width=7).pack(side="left", padx=(2, 6))
+        ttk.Combobox(search_controls, textvariable=self._search_attempts, values=("50", "100", "300", "1000"),
+                     state="readonly", width=7).pack(side="left", padx=(2, 6))
         ttk.Label(search_controls, text="隨機種子：").pack(side="left")
-        ttk.Entry(search_controls, textvariable=self._search_seed, width=7).pack(side="left", padx=2)
+        ttk.Combobox(search_controls, textvariable=self._search_seed, values=("0", "1", "42", "2026"),
+                     state="readonly", width=7).pack(side="left", padx=2)
         self._search_attempts.trace_add("write", self._search_settings_changed)
         self._search_seed.trace_add("write", self._search_settings_changed)
         ttk.Button(search_controls, text="搜尋", command=self.search_route).pack(side="right")
@@ -699,14 +738,8 @@ class BoardInspectionApp:
         self._status.set(state.status)
         if state.rule_profile is not None:
             self._profile = state.rule_profile
-            self._profile_name.set(state.rule_profile.name)
-            self._hazard_policy.set(state.rule_profile.hazard_policy)
-            self._condition_groups.set(json.dumps(
-                [group.to_dict() for group in state.rule_profile.condition_groups],
-                sort_keys=True, separators=(",", ":")))
-            self._external_conditions.set(json.dumps(
-                [condition.to_dict() for condition in state.rule_profile.external_conditions],
-                sort_keys=True, separators=(",", ":")))
+            self._hazard_policy.set(next(
+                label for label, policy in HAZARD_POLICIES.items() if policy == state.rule_profile.hazard_policy))
             self._profile_label.set(f"目前設定：{state.rule_profile.name}")
         if state.search_options is not None:
             self._search_attempts.set(str(state.search_options.attempts))
@@ -717,10 +750,6 @@ class BoardInspectionApp:
         self._execute_button.configure(
             state="normal" if result is not None and result.execution_eligible else "disabled"
         )
-        if state.calibration:
-            self._left.set(str(state.calibration.left))
-            self._top.set(str(state.calibration.top))
-            self._cell.set(str(state.calibration.cell))
         self.source.delete("all")
         if state.width and state.height and state.pixels:
             self._photo = _photo_from_screenshot((state.width, state.height, state.pixels), self.tk)
@@ -793,10 +822,22 @@ class BoardInspectionApp:
         self._manual_route.clear()
         self._apply(lambda: self.controller.capture_device(self._serial.get()))
 
-    def apply_calibration(self):
+    def refresh_devices(self):
+        try:
+            output = subprocess.check_output(["adb", "devices"], text=True)
+        except (OSError, subprocess.CalledProcessError):
+            self._show_error("無法取得 Android 裝置；請確認 adb 已安裝且可執行")
+            return
+        serials = tuple(line.split()[0] for line in output.splitlines()[1:]
+                        if len(line.split()) == 2 and line.split()[1] == "device")
+        self._serial_box.configure(values=serials)
+        self._serial.set(serials[0] if serials else "")
+
+    def auto_calibration(self):
         self._manual_route.clear()
-        self._apply(lambda: self.controller.set_calibration(BoardCalibration(
-            int(self._left.get()), int(self._top.get()), int(self._cell.get()))))
+        state = self.controller.state
+        self._apply(lambda: self.controller.set_calibration(infer_calibration(
+            state.width or 0, state.height or 0)))
 
     def _cell_at(self, event) -> tuple[int, int] | None:
         cell = (event.y // 60, event.x // 60)
@@ -871,7 +912,7 @@ class BoardInspectionApp:
             self._show_error("僅能執行已確認盤面上、符合條件的路徑")
             return
         if not self._serial.get().strip():
-            self._show_error("請輸入裝置序號")
+            self._show_error("請先按「更新裝置」並選擇裝置")
             return
         if not messagebox.askyesno(
                 "確認執行路徑",
@@ -887,20 +928,10 @@ class BoardInspectionApp:
         self._apply(execute)
 
     def create_profile(self):
-        try:
-            raw_groups = json.loads(self._condition_groups.get() or "[]")
-            if not isinstance(raw_groups, list):
-                raise ValueError("條件群組 JSON 必須是清單")
-            groups = tuple(ConditionGroup.from_dict(item) for item in raw_groups)
-            raw_external = json.loads(self._external_conditions.get() or "[]")
-            if not isinstance(raw_external, list):
-                raise ValueError("外部條件 JSON 必須是清單")
-            external = tuple(ExternalCondition.from_dict(item) for item in raw_external)
-            self._profile = RuleProfile(self._profile_name.get(), condition_groups=groups,
-                                        external_conditions=external, hazard_policy=self._hazard_policy.get())
-            self._profile_label.set(f"已建立：{self._profile.name}")
-        except (ValueError, TypeError) as exc:
-            self._show_error(str(exc))
+        self._profile = rule_profile_from_selections(
+            (variable.get() for variable in self._condition_choices), self._condition_operator.get(),
+            self._hazard_policy.get(), self._external_condition.get())
+        self._profile_label.set(f"已建立：{self._profile.name}")
 
     def apply_profile(self):
         if self._profile is None:
