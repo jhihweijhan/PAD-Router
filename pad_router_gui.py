@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import struct
 import zlib
 from dataclasses import dataclass, replace
@@ -18,6 +19,7 @@ from typing import Callable, Iterable
 
 from pad_router import (
     COLS,
+    ConditionGroup,
     HAZARDS,
     NAMES,
     ROWS,
@@ -257,6 +259,7 @@ class BoardInspectionState:
     route_approved: bool = False
     route_search: RouteSearchResult | None = None
     route_overlay: tuple[dict[str, object], ...] = ()
+    search_options: RouteSearchOptions | None = None
 
     @property
     def source_path(self) -> str | None:
@@ -360,7 +363,7 @@ class BoardInspectionController:
         updated = replace(self.state, board=tuple(map(tuple, board)), confirmed_board=None,
                           confirmed=False, uncertain_cells=_uncertain_cells(tuple(map(tuple, board))),
                           overlay=(), route_evaluation=None, route_approved=False,
-                          route_search=None, route_overlay=(),
+                          route_search=None, route_overlay=(), search_options=None,
                           status="Cell corrected; review and confirm the Board")
         self.state = self._with_overlay(updated)
         return self.state
@@ -372,7 +375,7 @@ class BoardInspectionController:
             raise ValueError("Uncertain cells require manual correction before confirmation")
         self.state = replace(self.state, confirmed_board=self.state.board, confirmed=True,
                              uncertain_cells=(), route_evaluation=None, route_approved=False,
-                             route_search=None, route_overlay=(),
+                             route_search=None, route_overlay=(), search_options=None,
                              status="Board confirmed")
         return self.state.board
 
@@ -380,7 +383,7 @@ class BoardInspectionController:
         if not isinstance(profile, RuleProfile):
             raise TypeError("profile must be a RuleProfile")
         self.state = replace(self.state, rule_profile=profile, route_evaluation=None,
-                             route_approved=False, route_search=None, route_overlay=(),
+                             route_approved=False, route_search=None, route_overlay=(), search_options=None,
                              status=f"Rule Profile applied: {profile.name}")
         return self.state
 
@@ -403,7 +406,7 @@ class BoardInspectionController:
             raise ValueError("Apply a Rule Profile before evaluating a Route")
         result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed)
         self.state = replace(self.state, route_evaluation=result, route_approved=False,
-                             route_search=None, route_overlay=self._route_overlay(result),
+                             route_search=None, route_overlay=self._route_overlay(result), search_options=None,
                              status=result.diagnostic)
         return result
 
@@ -414,15 +417,22 @@ class BoardInspectionController:
         profile = self.state.rule_profile
         if profile is None:
             raise ValueError("Apply a Rule Profile before searching for a Route")
+        options = options if options is not None else RouteSearchOptions()
         result = search_qualifying_route(board, profile, options, confirmed=self.state.confirmed)
         candidate = result.candidate
         self.state = replace(self.state, route_search=result, route_evaluation=candidate,
                              route_approved=False, route_overlay=self._route_overlay(candidate),
-                             status=result.diagnostic)
+                             search_options=options, status=result.diagnostic)
         return result
 
     def search_route(self, options: RouteSearchOptions | None = None) -> RouteSearchResult:
         return self.search_qualifying_route(options)
+
+    def invalidate_route(self, status: str = "Route invalidated; review inputs before searching again") -> BoardInspectionState:
+        self.state = replace(self.state, route_search=None, route_evaluation=None,
+                             route_approved=False, route_overlay=(), search_options=None,
+                             status=status)
+        return self.state
 
     def approve_route(self, explicit_confirmation: bool = False) -> RouteEvaluation:
         result = self.state.route_evaluation
@@ -474,6 +484,7 @@ class BoardInspectionApp:
         self._selected_label = tk.StringVar(value="No cell selected")
         self._profile_name = tk.StringVar(value="manual")
         self._hazard_policy = tk.StringVar(value="avoid")
+        self._condition_groups = tk.StringVar(value="[]")
         self._search_attempts = tk.StringVar(value="100")
         self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="No Rule Profile")
@@ -527,12 +538,20 @@ class BoardInspectionApp:
         ttk.Label(profile_frame, text="Hazard policy:").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._hazard_policy, values=("avoid", "allow"),
                      state="readonly", width=12).pack(fill="x")
+        ttk.Label(profile_frame, text="Condition groups JSON (list of conditions/operator; [] means none):").pack(
+            anchor="w", pady=(4, 0))
+        ttk.Entry(profile_frame, textvariable=self._condition_groups, width=42).pack(fill="x")
+        ttk.Label(profile_frame, text="Kinds: combo_minimum, attribute, simultaneous_attributes, match_count, "
+                  "connected_orb_count, enhanced_orb, shape, required_orbs, forbidden_orbs.",
+                  wraplength=340).pack(anchor="w")
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
         ttk.Label(search_controls, text="Attempts:").pack(side="left")
         ttk.Entry(search_controls, textvariable=self._search_attempts, width=7).pack(side="left", padx=(2, 6))
         ttk.Label(search_controls, text="Seed:").pack(side="left")
         ttk.Entry(search_controls, textvariable=self._search_seed, width=7).pack(side="left", padx=2)
+        self._search_attempts.trace_add("write", self._search_settings_changed)
+        self._search_seed.trace_add("write", self._search_settings_changed)
         ttk.Button(search_controls, text="Search", command=self.search_route).pack(side="right")
         ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
         profile_buttons = ttk.Frame(profile_frame)
@@ -576,7 +595,13 @@ class BoardInspectionApp:
             self._profile = state.rule_profile
             self._profile_name.set(state.rule_profile.name)
             self._hazard_policy.set(state.rule_profile.hazard_policy)
+            self._condition_groups.set(json.dumps(
+                [group.to_dict() for group in state.rule_profile.condition_groups],
+                sort_keys=True, separators=(",", ":")))
             self._profile_label.set(f"Current: {state.rule_profile.name}")
+        if state.search_options is not None:
+            self._search_attempts.set(str(state.search_options.attempts))
+            self._search_seed.set(str(state.search_options.seed))
         result = state.route_evaluation
         self._evaluation.set(self._format_evaluation(result))
         if state.calibration:
@@ -727,7 +752,12 @@ class BoardInspectionApp:
 
     def create_profile(self):
         try:
-            self._profile = RuleProfile(self._profile_name.get(), hazard_policy=self._hazard_policy.get())
+            raw_groups = json.loads(self._condition_groups.get() or "[]")
+            if not isinstance(raw_groups, list):
+                raise ValueError("Condition groups JSON must be a list")
+            groups = tuple(ConditionGroup.from_dict(item) for item in raw_groups)
+            self._profile = RuleProfile(self._profile_name.get(), condition_groups=groups,
+                                        hazard_policy=self._hazard_policy.get())
             self._profile_label.set(f"Created: {self._profile.name}")
         except (ValueError, TypeError) as exc:
             self._show_error(str(exc))
@@ -743,6 +773,19 @@ class BoardInspectionApp:
         self._apply(lambda: self.controller.search_qualifying_route(
             RouteSearchOptions(attempts=int(self._search_attempts.get()), seed=int(self._search_seed.get()))
         ))
+
+    def _search_settings_changed(self, *_):
+        state = self.controller.state
+        if state.search_options is None:
+            return
+        try:
+            options = RouteSearchOptions(attempts=int(self._search_attempts.get()),
+                                         seed=int(self._search_seed.get()))
+        except (TypeError, ValueError):
+            options = None
+        if options != state.search_options:
+            self._manual_route.clear()
+            self._display(self.controller.invalidate_route("Search settings changed; Route invalidated"))
 
     def load_profile(self):
         from tkinter import filedialog

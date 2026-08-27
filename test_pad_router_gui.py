@@ -130,6 +130,22 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertIsNone(self.controller.state.route_evaluation)
         self.assertEqual(self.controller.state.route_overlay, ())
 
+    def test_search_tracks_options_and_explicit_invalidation_clears_candidate(self):
+        self.controller.load_png(self.path)
+        self.controller.correct_cell(0, 0, 1)
+        self.controller.confirm_board()
+        self.controller.set_rule_profile(RuleProfile("search"))
+        options = RouteSearchOptions(attempts=1, seed=4, min_steps=0, max_steps=0)
+
+        self.controller.search_qualifying_route(options)
+        self.assertEqual(self.controller.state.search_options, options)
+        state = self.controller.invalidate_route("Search settings changed; Route invalidated")
+        self.assertEqual(state.status, "Search settings changed; Route invalidated")
+        self.assertIsNone(state.route_search)
+        self.assertIsNone(state.route_evaluation)
+        self.assertFalse(state.route_approved)
+        self.assertEqual(state.route_overlay, ())
+
 
 class BoardCalibrationTests(unittest.TestCase):
     def test_standard_board_must_fit_image(self):

@@ -740,8 +740,6 @@ class RouteSearchOptions:
             raise ValueError("Minimum search steps must be a non-negative integer")
         if isinstance(self.max_steps, bool) or not isinstance(self.max_steps, int) or self.max_steps < self.min_steps:
             raise ValueError("Maximum search steps must be at least the minimum")
-        if self.max_steps >= ROWS * COLS:
-            raise ValueError("Search routes cannot visit more than one Board cell each")
 
 
 @dataclass(frozen=True)
@@ -785,14 +783,13 @@ def search_qualifying_route(
         target_steps = generator.randint(options.min_steps, options.max_steps)
         route = [(generator.randrange(ROWS), generator.randrange(COLS))]
         for _step in range(target_steps):
+            previous = route[-2] if len(route) > 1 else None
             choices = [(route[-1][0] + dr, route[-1][1] + dc) for dr, dc in DIRECTIONS
                        if 0 <= route[-1][0] + dr < ROWS and 0 <= route[-1][1] + dc < COLS
-                       and (route[-1][0] + dr, route[-1][1] + dc) not in route]
+                       and (route[-1][0] + dr, route[-1][1] + dc) != previous]
             if not choices:
                 break
             route.append(generator.choice(choices))
-        if len(route) - 1 < target_steps:
-            continue
         result = evaluate_manual_route(board, route, profile, confirmed=confirmed, cascade=options.cascade)
         (qualifying if result.qualifying else diagnostic).append(result)
 
