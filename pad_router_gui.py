@@ -50,6 +50,14 @@ Capture = Callable[[str], Screenshot]
 Executor = Callable[..., bool | PlayVerification]
 
 
+# 介面顯示名稱；規則檔與核心運算仍使用英文代號。
+ORB_LABELS = {
+    "fire": "火", "water": "水", "wood": "木", "light": "光", "dark": "暗", "heart": "心",
+    "jammer": "干擾", "poison": "毒", "mortal_poison": "猛毒", "bomb": "炸彈",
+}
+ORB_KINDS = {label: kind for kind, label in ORB_LABELS.items()}
+
+
 @dataclass(frozen=True)
 class BoardCalibration:
     """Top-left pixel and cell size for a Standard Board."""
@@ -60,11 +68,11 @@ class BoardCalibration:
 
     def validate(self, width: int, height: int) -> None:
         if width <= 0 or height <= 0:
-            raise ValueError("Screenshot dimensions must be positive")
+            raise ValueError("截圖尺寸必須為正數")
         if self.left < 0 or self.top < 0 or self.cell <= 0:
-            raise ValueError("Calibration coordinates must be non-negative and cell must be positive")
+            raise ValueError("校正座標不可為負數，格寬必須為正數")
         if self.left + COLS * self.cell > width or self.top + ROWS * self.cell > height:
-            raise ValueError("Calibration must keep the Standard Board inside the screenshot")
+            raise ValueError("校正範圍必須讓 6×5 標準盤面完整位於截圖內")
 
     def to_grid(self) -> Grid:
         return Grid(self.left, self.top, self.cell)
@@ -79,7 +87,7 @@ def infer_calibration(width: int, height: int) -> BoardCalibration:
     except ValueError:
         cell = min(width // COLS, height // ROWS)
         if cell <= 0:
-            raise ValueError("Screenshot is too small for a Standard Board")
+            raise ValueError("截圖太小，無法容納 6×5 標準盤面")
         legacy = BoardCalibration((width - COLS * cell) // 2,
                                   (height - ROWS * cell) // 2, cell)
         legacy.validate(width, height)
@@ -101,7 +109,7 @@ def _paeth(left: int, above: int, upper_left: int) -> int:
 def _unfilter_png(raw: bytes, width: int, height: int, row_bytes: int, bytes_per_pixel: int) -> bytes:
     expected = height * (row_bytes + 1)
     if len(raw) != expected:
-        raise ValueError("PNG pixel data has an unexpected size")
+        raise ValueError("PNG 像素資料大小不正確")
     rows: list[bytes] = []
     offset = 0
     for _ in range(height):
@@ -125,7 +133,7 @@ def _unfilter_png(raw: bytes, width: int, height: int, row_bytes: int, bytes_per
                 left = current[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
                 current[index] = (current[index] + _paeth(left, previous[index], previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0)) & 255
         elif filter_type != 0:
-            raise ValueError(f"Unsupported PNG filter {filter_type}")
+            raise ValueError(f"不支援的 PNG 濾鏡：{filter_type}")
         rows.append(bytes(current))
     return b"".join(rows)
 
@@ -136,7 +144,7 @@ def decode_png(path: str | Path) -> Screenshot:
     data = Path(path).read_bytes()
     signature = b"\x89PNG\r\n\x1a\n"
     if not data.startswith(signature):
-        raise ValueError("Expected a PNG image")
+        raise ValueError("請選擇 PNG 圖片")
     width = height = bit_depth = color_type = interlace = None
     palette: bytes | None = None
     transparency: bytes | None = None
@@ -148,14 +156,14 @@ def decode_png(path: str | Path) -> Screenshot:
         payload_start = offset + 8
         payload_end = payload_start + length
         if payload_end + 4 > len(data):
-            raise ValueError("Truncated PNG chunk")
+            raise ValueError("PNG 區塊資料不完整")
         payload = data[payload_start:payload_end]
         checksum = struct.unpack_from(">I", data, payload_end)[0]
         if binascii.crc32(kind + payload) & 0xFFFFFFFF != checksum:
-            raise ValueError("PNG chunk checksum mismatch")
+            raise ValueError("PNG 區塊檢查碼不符")
         if kind == b"IHDR":
             if length != 13:
-                raise ValueError("Invalid PNG header")
+                raise ValueError("PNG 標頭無效")
             width, height, bit_depth, color_type, _compression, _filter, interlace = struct.unpack(
                 ">IIBBBBB", payload
             )
@@ -169,12 +177,12 @@ def decode_png(path: str | Path) -> Screenshot:
             break
         offset = payload_end + 4
     if width is None or height is None or bit_depth != 8 or interlace != 0:
-        raise ValueError("Only 8-bit, non-interlaced PNG images are supported")
+        raise ValueError("僅支援 8 位元、非交錯式 PNG 圖片")
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
     if channels is None:
-        raise ValueError("Unsupported PNG colour type")
+        raise ValueError("不支援的 PNG 色彩格式")
     if color_type == 3 and (palette is None or len(palette) % 3):
-        raise ValueError("Indexed PNG is missing a valid palette")
+        raise ValueError("索引式 PNG 缺少有效調色盤")
     raw = zlib.decompress(bytes(compressed))
     row_bytes = width * channels
     pixels = _unfilter_png(raw, width, height, row_bytes, channels)
@@ -199,7 +207,7 @@ def decode_png(path: str | Path) -> Screenshot:
             palette_index = pixels[source]
             palette_offset = palette_index * 3
             if palette_offset + 3 > len(palette or b""):
-                raise ValueError("PNG palette index is out of range")
+                raise ValueError("PNG 調色盤索引超出範圍")
             red, green, blue = (palette or b"")[palette_offset:palette_offset + 3]
             alpha = transparency[palette_index] if transparency and palette_index < len(transparency) else 255
         result[index * 4:index * 4 + 4] = bytes((blue, green, red, alpha))
@@ -208,7 +216,7 @@ def decode_png(path: str | Path) -> Screenshot:
 
 def _board_shape(board: Board) -> None:
     if len(board) != ROWS or any(len(row) != COLS for row in board):
-        raise ValueError("Recognizer must return a 5x6 board")
+        raise ValueError("辨識器必須回傳 5×6 盤面")
 
 
 def _uncertain_cells(board: Board) -> tuple[tuple[int, int], ...]:
@@ -219,16 +227,16 @@ def _uncertain_cells(board: Board) -> tuple[tuple[int, int], ...]:
 def _coerce_orb(value: object) -> Orb:
     if isinstance(value, Orb):
         if value.kind == "normal" and value.color not in NAMES:
-            raise ValueError("Normal Orbs need a colour from 1 through 6")
+            raise ValueError("普通珠的顏色必須介於 1 到 6")
         if value.kind not in HAZARDS and value.kind != "normal":
-            raise ValueError(f"Unsupported Orb type: {value.kind}")
+            raise ValueError(f"不支援的珠子類型：{value.kind}")
         return value
     if isinstance(value, int):
         if value not in NAMES:
-            raise ValueError("Orb colour must be an integer from 1 through 6")
+            raise ValueError("珠子顏色必須是介於 1 到 6 的整數")
         return Orb("normal", value)
     if not isinstance(value, str):
-        raise ValueError("Cell correction must be an Orb, colour number, or Orb name")
+        raise ValueError("珠子修正值必須是珠子、顏色數字或珠子名稱")
     text = value.strip().lower().replace(" ", "_")
     enhanced = text.endswith("+")
     if enhanced:
@@ -241,7 +249,7 @@ def _coerce_orb(value: object) -> Orb:
         return Orb("normal", names[text], enhanced=enhanced, locked=locked)
     if text in HAZARDS:
         return Orb(text, visual_class=text)
-    raise ValueError(f"Unsupported Orb type: {value}")
+    raise ValueError(f"不支援的珠子類型：{value}")
 
 
 @dataclass(frozen=True)
@@ -257,7 +265,7 @@ class BoardInspectionState:
     confirmed: bool = False
     uncertain_cells: tuple[tuple[int, int], ...] = ()
     overlay: tuple[dict[str, object], ...] = ()
-    status: str = "No source loaded"
+    status: str = "尚未載入來源"
     rule_profile: RuleProfile | None = None
     route_evaluation: RouteEvaluation | None = None
     route_approved: bool = False
@@ -288,7 +296,7 @@ class BoardInspectionController:
     def _with_source(self, source: Screenshot, source_name: str) -> BoardInspectionState:
         width, height, pixels = source
         if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
-            raise ValueError("Screenshot must contain width*height BGRA pixels")
+            raise ValueError("截圖必須包含 width×height 個 BGRA 像素")
         calibration = infer_calibration(width, height)
         detected = self._detector(width, height, pixels, calibration.to_grid())
         _board_shape(detected)
@@ -297,8 +305,8 @@ class BoardInspectionController:
     def _replace_source(self, source_name: str, source: Screenshot,
                         calibration: BoardCalibration, detected: Board) -> BoardInspectionState:
         uncertain = _uncertain_cells(detected)
-        status = (f"Loaded {source_name}; manual correction required for {len(uncertain)} cell(s)"
-                  if uncertain else f"Loaded {source_name}; review and confirm the Board")
+        status = (f"已載入 {source_name}；有 {len(uncertain)} 格需要手動修正"
+                  if uncertain else f"已載入 {source_name}；請確認盤面")
         state = BoardInspectionState(source_name, source[0], source[1], source[2], calibration,
                                      detected, detected, None, False, uncertain, (), status)
         if self.state.rule_profile is not None:
@@ -326,20 +334,20 @@ class BoardInspectionController:
 
     def load_png(self, path: str | Path) -> BoardInspectionState:
         if Path(path).suffix.lower() != ".png":
-            raise ValueError("Only PNG images are supported")
+            raise ValueError("僅支援 PNG 圖片")
         return self._with_source(decode_png(path), str(path))
 
     def capture_device(self, serial: str) -> BoardInspectionState:
         serial = serial.strip()
         if not serial:
-            raise ValueError("A device serial is required")
+            raise ValueError("請輸入裝置序號")
         return self._with_source(self._capture(serial), serial)
 
     def set_calibration(self, calibration: BoardCalibration) -> BoardInspectionState:
         if self.state.pixels is None or self.state.width is None or self.state.height is None:
-            raise ValueError("Load an image or capture a device before calibrating")
+            raise ValueError("請先載入圖片或擷取裝置畫面，再校正盤面")
         if not isinstance(calibration, BoardCalibration):
-            raise TypeError("calibration must be a BoardCalibration")
+            raise TypeError("calibration 必須是 BoardCalibration")
         calibration.validate(self.state.width, self.state.height)
         detected = self._detector(self.state.width, self.state.height, self.state.pixels,
                                   calibration.to_grid())
@@ -352,52 +360,52 @@ class BoardInspectionController:
                   cell: int | None = None) -> BoardInspectionState:
         if isinstance(left, BoardCalibration):
             if top is not None or cell is not None:
-                raise TypeError("Do not combine a BoardCalibration with coordinate arguments")
+                raise TypeError("不可同時提供 BoardCalibration 與座標參數")
             calibration = left
         elif top is not None and cell is not None:
             calibration = BoardCalibration(left, top, cell)
         else:
-            raise TypeError("calibrate needs a BoardCalibration or left, top, and cell")
+            raise TypeError("calibrate 需要 BoardCalibration，或 left、top、cell 三個座標參數")
         return self.set_calibration(calibration)
 
     def correct_cell(self, row: int, col: int, value: object) -> BoardInspectionState:
         if self.state.board is None:
-            raise ValueError("Load an image or capture a device before correcting a cell")
+            raise ValueError("請先載入圖片或擷取裝置畫面，再修正珠子")
         if not (0 <= row < ROWS and 0 <= col < COLS):
-            raise ValueError("Cell must be inside the 5x6 Standard Board")
+            raise ValueError("珠子必須位於 6×5 標準盤面內")
         board = [list(items) for items in self.state.board]
         board[row][col] = _coerce_orb(value)
         updated = replace(self.state, board=tuple(map(tuple, board)), confirmed_board=None,
                           confirmed=False, uncertain_cells=_uncertain_cells(tuple(map(tuple, board))),
                           overlay=(), route_evaluation=None, route_approved=False, verification=None,
                           route_search=None, route_overlay=(), search_options=None,
-                          status="Cell corrected; review and confirm the Board")
+                          status="珠子已修正；請確認盤面")
         self.state = self._with_overlay(updated)
         return self.state
 
     def confirm_board(self) -> Board:
         if self.state.board is None:
-            raise ValueError("No Board is loaded")
+            raise ValueError("尚未載入盤面")
         if self.state.uncertain_cells:
-            raise ValueError("Uncertain cells require manual correction before confirmation")
+            raise ValueError("請先手動修正無法辨識的珠子，才能確認盤面")
         self.state = replace(self.state, confirmed_board=self.state.board, confirmed=True,
                              uncertain_cells=(), route_evaluation=None, route_approved=False, verification=None,
                              route_search=None, route_overlay=(), search_options=None,
-                             status="Board confirmed")
+                             status="盤面已確認")
         return self.state.board
 
     def set_rule_profile(self, profile: RuleProfile) -> BoardInspectionState:
         if not isinstance(profile, RuleProfile):
-            raise TypeError("profile must be a RuleProfile")
+            raise TypeError("profile 必須是 RuleProfile")
         self.state = replace(self.state, rule_profile=profile, route_evaluation=None,
                              route_approved=False, verification=None, route_search=None, route_overlay=(), search_options=None,
-                             status=f"Rule Profile applied: {profile.name}")
+                             status=f"已套用規則設定：{profile.name}")
         return self.state
 
     def save_rule_profile(self, path: str | Path, profile: RuleProfile | None = None) -> None:
         profile = profile or self.state.rule_profile
         if profile is None:
-            raise ValueError("No Rule Profile is applied")
+            raise ValueError("尚未套用規則設定")
         save_rule_profile(profile, path)
 
     def load_rule_profile(self, path: str | Path) -> BoardInspectionState:
@@ -407,36 +415,38 @@ class BoardInspectionController:
                                profile: RuleProfile | None = None) -> RouteEvaluation:
         board = self.state.confirmed_board or self.state.board
         if board is None:
-            raise ValueError("Load and confirm a Board before evaluating a Route")
+            raise ValueError("請先載入並確認盤面，再評估路徑")
         profile = profile or self.state.rule_profile
         if profile is None:
-            raise ValueError("Apply a Rule Profile before evaluating a Route")
+            raise ValueError("請先套用規則設定，再評估路徑")
         result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed)
         self.state = replace(self.state, route_evaluation=result, route_approved=False,
                              verification=None,
                              route_search=None, route_overlay=self._route_overlay(result), search_options=None,
-                             status=result.diagnostic)
+                             status=f"路徑已評估：{'符合' if result.qualifying else '不符合'}條件")
         return result
 
     def search_qualifying_route(self, options: RouteSearchOptions | None = None) -> RouteSearchResult:
         board = self.state.confirmed_board or self.state.board
         if board is None:
-            raise ValueError("Load and confirm a Board before searching for a Route")
+            raise ValueError("請先載入並確認盤面，再搜尋路徑")
         profile = self.state.rule_profile
         if profile is None:
-            raise ValueError("Apply a Rule Profile before searching for a Route")
+            raise ValueError("請先套用規則設定，再搜尋路徑")
         options = options if options is not None else RouteSearchOptions()
         result = search_qualifying_route(board, profile, options, confirmed=self.state.confirmed)
         candidate = result.candidate
         self.state = replace(self.state, route_search=result, route_evaluation=candidate,
                              route_approved=False, verification=None, route_overlay=self._route_overlay(candidate),
-                             search_options=options, status=result.diagnostic)
+                             search_options=options,
+                             status=("搜尋完成：找到符合條件的路徑" if candidate and candidate.qualifying
+                                     else "搜尋完成：沒有符合條件的路徑"))
         return result
 
     def search_route(self, options: RouteSearchOptions | None = None) -> RouteSearchResult:
         return self.search_qualifying_route(options)
 
-    def invalidate_route(self, status: str = "Route invalidated; review inputs before searching again") -> BoardInspectionState:
+    def invalidate_route(self, status: str = "路徑已失效；請確認設定後重新搜尋") -> BoardInspectionState:
         self.state = replace(self.state, route_search=None, route_evaluation=None,
                              route_approved=False, verification=None, route_overlay=(), search_options=None,
                              status=status)
@@ -445,10 +455,10 @@ class BoardInspectionController:
     def approve_route(self, explicit_confirmation: bool = False) -> RouteEvaluation:
         result = self.state.route_evaluation
         if result is None or not result.execution_eligible:
-            raise ValueError("Only a qualifying Route on a confirmed Board can be approved")
+            raise ValueError("僅能核准已確認盤面上、符合條件的路徑")
         if not explicit_confirmation:
-            raise ValueError("Explicit Route confirmation is required")
-        self.state = replace(self.state, route_approved=True, status="Route approved")
+            raise ValueError("必須明確確認路徑")
+        self.state = replace(self.state, route_approved=True, status="路徑已核准")
         return result
 
     def execute_route(self, serial: str, explicit_confirmation: bool = False,
@@ -457,19 +467,19 @@ class BoardInspectionController:
         result = self.state.route_evaluation
         if (result is None or self.state.confirmed_board is None
                 or not self.state.confirmed or not result.execution_eligible):
-            raise ValueError("Only a qualifying Route on a confirmed Board can be executed")
+            raise ValueError("僅能執行已確認盤面上、符合條件的路徑")
         if not explicit_confirmation and not self.state.route_approved:
-            raise ValueError("Explicit Route confirmation is required")
+            raise ValueError("必須明確確認路徑")
         serial = serial.strip()
         if not serial:
-            raise ValueError("A device serial is required")
+            raise ValueError("請輸入裝置序號")
         calibration = self.state.calibration
         if calibration is None:
-            raise ValueError("Board calibration is required before execution")
+            raise ValueError("執行前必須先校正盤面")
         if explicit_confirmation:
             self.approve_route(explicit_confirmation=True)
         self.state = replace(self.state, verification=None,
-                             status="Executing Route; safe ADB verification in progress")
+                             status="正在執行路徑；安全 ADB 驗證進行中")
         verification: PlayVerification | None = None
 
         def receive(report: PlayVerification) -> None:
@@ -494,19 +504,19 @@ class BoardInspectionController:
         if not succeeded and verification.success:
             verification = replace(verification, success=False, status="gesture_failed")
         if succeeded:
-            status = ("Gesture sent; post-gesture Board verified (0 mismatches). "
-                      "Capture a new Board before another Route."
+            status = ("手勢已送出；手勢後盤面驗證成功（0 格不符）。"
+                      "再次規劃前請擷取新盤面。"
                       if verification.detected_board is not None else
-                      "Gesture sent; safe ADB flow completed, but no post-gesture Board comparison was reported. "
-                      "Capture a fresh Board before another Route.")
+                      "手勢已送出；安全 ADB 流程已完成，但沒有手勢後盤面的比對結果。"
+                      "再次規劃前請擷取新盤面。")
         elif verification.detected_board is None:
-            status = (f"Gesture released safely; {verification.status}. "
-                      "No post-gesture Board was available. Capture a fresh Board and retry.")
+            status = ("手勢已安全放開；沒有可供驗證的手勢後盤面。"
+                      "請擷取新盤面後再試。")
         else:
-            mismatch = (f"{verification.mismatches} mismatch(es)"
-                        if verification.mismatches is not None else "an uncertain comparison")
-            status = (f"Gesture released safely; post-gesture Board verification failed ({mismatch}). "
-                      "Capture a fresh Board and retry.")
+            mismatch = (f"{verification.mismatches} 格不符"
+                        if verification.mismatches is not None else "比對結果不確定")
+            status = (f"手勢已安全放開；手勢後盤面驗證失敗（{mismatch}）。"
+                      "請擷取新盤面後再試。")
         self.state = replace(self.state, verification=verification, route_approved=False,
                              route_search=None, route_evaluation=None, route_overlay=(),
                              search_options=None, status=status)
@@ -531,35 +541,35 @@ class BoardInspectionApp:
             import tkinter as tk
             from tkinter import ttk
         except ModuleNotFoundError as exc:
-            raise RuntimeError("The Python tkinter module is required to open the desktop GUI") from exc
+            raise RuntimeError("開啟桌面介面需要 Python 的 tkinter 模組") from exc
 
         self.tk = tk
         self.ttk = ttk
         self.root = root or tk.Tk()
-        self.root.title("PAD Router — Board Inspection")
+        self.root.title("PAD Router — 珠盤判讀")
         self.controller = controller or BoardInspectionController()
         self._photo = None
         self._selected_cell: tuple[int, int] | None = None
         self._manual_route: list[tuple[int, int]] = []
         self._dragging_route = False
         self._profile: RuleProfile | None = self.controller.state.rule_profile
-        self._selected_orb = tk.StringVar(value="fire")
+        self._selected_orb = tk.StringVar(value="火")
         self._enhanced = tk.BooleanVar()
         self._locked = tk.BooleanVar()
         self._serial = tk.StringVar()
         self._left = tk.StringVar()
         self._top = tk.StringVar()
         self._cell = tk.StringVar()
-        self._selected_label = tk.StringVar(value="No cell selected")
+        self._selected_label = tk.StringVar(value="尚未選取珠子")
         self._profile_name = tk.StringVar(value="manual")
         self._hazard_policy = tk.StringVar(value="avoid")
         self._condition_groups = tk.StringVar(value="[]")
         self._external_conditions = tk.StringVar(value="[]")
         self._search_attempts = tk.StringVar(value="100")
         self._search_seed = tk.StringVar(value="0")
-        self._profile_label = tk.StringVar(value="No Rule Profile")
-        self._evaluation = tk.StringVar(value="No Route evaluated")
-        self._verification = tk.StringVar(value="No post-gesture verification")
+        self._profile_label = tk.StringVar(value="尚未建立規則設定")
+        self._evaluation = tk.StringVar(value="尚未評估路徑")
+        self._verification = tk.StringVar(value="尚無手勢後驗證結果")
         self._status = tk.StringVar(value=self.controller.state.status)
         self._build()
 
@@ -567,18 +577,18 @@ class BoardInspectionApp:
         tk, ttk = self.tk, self.ttk
         controls = ttk.Frame(self.root, padding=8)
         controls.pack(fill="x")
-        ttk.Button(controls, text="Open PNG", command=self.open_png).pack(side="left")
-        ttk.Label(controls, text="Serial:").pack(side="left", padx=(12, 2))
+        ttk.Button(controls, text="開啟 PNG", command=self.open_png).pack(side="left")
+        ttk.Label(controls, text="裝置序號：").pack(side="left", padx=(12, 2))
         ttk.Entry(controls, width=18, textvariable=self._serial).pack(side="left")
-        ttk.Button(controls, text="Capture", command=self.capture_device).pack(side="left", padx=4)
-        ttk.Label(controls, text="Calibration left/top/cell:").pack(side="left", padx=(12, 2))
+        ttk.Button(controls, text="擷取畫面", command=self.capture_device).pack(side="left", padx=4)
+        ttk.Label(controls, text="校正 左/上/格寬：").pack(side="left", padx=(12, 2))
         for variable, width in ((self._left, 5), (self._top, 6), (self._cell, 5)):
             ttk.Entry(controls, width=width, textvariable=variable).pack(side="left", padx=1)
-        ttk.Button(controls, text="Apply", command=self.apply_calibration).pack(side="left", padx=4)
+        ttk.Button(controls, text="套用", command=self.apply_calibration).pack(side="left", padx=4)
 
         body = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         body.pack(fill="both", expand=True)
-        source_frame = ttk.LabelFrame(body, text="Source and detection overlay", padding=4)
+        source_frame = ttk.LabelFrame(body, text="來源畫面與辨識標示", padding=4)
         source_frame.pack(side="left", fill="both", expand=True)
         self.source = tk.Canvas(source_frame, width=650, height=700, background="#202020")
         source_scroll = ttk.Scrollbar(source_frame, orient="vertical", command=self.source.yview)
@@ -586,7 +596,7 @@ class BoardInspectionApp:
         self.source.pack(side="left", fill="both", expand=True)
         source_scroll.pack(side="right", fill="y")
 
-        board_frame = ttk.LabelFrame(body, text="Editable Board", padding=8)
+        board_frame = ttk.LabelFrame(body, text="可編輯盤面", padding=8)
         board_frame.pack(side="right", fill="y")
         self.board = tk.Canvas(board_frame, width=390, height=330, background="#111111", highlightthickness=0)
         self.board.pack()
@@ -594,95 +604,96 @@ class BoardInspectionApp:
         self.board.bind("<B1-Motion>", self.route_motion)
         self.board.bind("<ButtonRelease-1>", self.route_release)
         ttk.Label(board_frame, textvariable=self._selected_label).pack(pady=(8, 2))
-        ttk.Label(board_frame, text="Correction:").pack(anchor="w")
-        options = list(NAMES.values()) + sorted(HAZARDS)
+        ttk.Label(board_frame, text="修正珠子：").pack(anchor="w")
+        options = [ORB_LABELS[name] for name in NAMES.values()] + [ORB_LABELS[name] for name in sorted(HAZARDS)]
         ttk.Combobox(board_frame, textvariable=self._selected_orb, values=options,
                      state="readonly", width=18).pack(fill="x")
-        ttk.Checkbutton(board_frame, text="Enhanced", variable=self._enhanced).pack(anchor="w")
-        ttk.Checkbutton(board_frame, text="Locked", variable=self._locked).pack(anchor="w")
-        ttk.Button(board_frame, text="Correct selected cell", command=self.correct_selected).pack(fill="x", pady=4)
-        ttk.Button(board_frame, text="Confirm Board", command=self.confirm_board).pack(fill="x")
-        self._execute_button = ttk.Button(board_frame, text="Execute Route", command=self.execute_route,
+        ttk.Checkbutton(board_frame, text="強化", variable=self._enhanced).pack(anchor="w")
+        ttk.Checkbutton(board_frame, text="鎖定", variable=self._locked).pack(anchor="w")
+        ttk.Button(board_frame, text="修正選取珠子", command=self.correct_selected).pack(fill="x", pady=4)
+        ttk.Button(board_frame, text="確認盤面", command=self.confirm_board).pack(fill="x")
+        self._execute_button = ttk.Button(board_frame, text="執行路徑", command=self.execute_route,
                                           state="disabled")
         self._execute_button.pack(fill="x", pady=(4, 0))
-        profile_frame = ttk.LabelFrame(board_frame, text="Rule Profile", padding=6)
+        profile_frame = ttk.LabelFrame(board_frame, text="規則設定", padding=6)
         profile_frame.pack(fill="x", pady=(10, 0))
-        ttk.Label(profile_frame, text="Name:").pack(anchor="w")
+        ttk.Label(profile_frame, text="名稱：").pack(anchor="w")
         ttk.Entry(profile_frame, textvariable=self._profile_name).pack(fill="x")
-        ttk.Label(profile_frame, text="Hazard policy:").pack(anchor="w", pady=(4, 0))
+        ttk.Label(profile_frame, text="危害珠策略（avoid=避免，allow=允許）：").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._hazard_policy, values=("avoid", "allow"),
                      state="readonly", width=12).pack(fill="x")
-        ttk.Label(profile_frame, text="Condition groups JSON (list of conditions/operator; [] means none):").pack(
+        ttk.Label(profile_frame, text="條件群組 JSON（條件與 operator 的清單；[] 表示無）：").pack(
             anchor="w", pady=(4, 0))
         ttk.Entry(profile_frame, textvariable=self._condition_groups, width=42).pack(fill="x")
-        ttk.Label(profile_frame, text="Kinds: combo_minimum, attribute, simultaneous_attributes, match_count, "
-                  "connected_orb_count, enhanced_orb, shape, required_orbs, forbidden_orbs.",
+        ttk.Label(profile_frame, text="可用 kind：combo_minimum、attribute、simultaneous_attributes、match_count、"
+                  "connected_orb_count、enhanced_orb、shape、required_orbs、forbidden_orbs。",
                   wraplength=340).pack(anchor="w")
-        ttk.Label(profile_frame, text="External conditions JSON (name/confirmed/required; [] means none):").pack(
+        ttk.Label(profile_frame, text="外部條件 JSON（name/confirmed/required；[] 表示無）：").pack(
             anchor="w")
         ttk.Entry(profile_frame, textvariable=self._external_conditions, width=42).pack(fill="x")
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
-        ttk.Label(search_controls, text="Attempts:").pack(side="left")
+        ttk.Label(search_controls, text="嘗試次數：").pack(side="left")
         ttk.Entry(search_controls, textvariable=self._search_attempts, width=7).pack(side="left", padx=(2, 6))
-        ttk.Label(search_controls, text="Seed:").pack(side="left")
+        ttk.Label(search_controls, text="隨機種子：").pack(side="left")
         ttk.Entry(search_controls, textvariable=self._search_seed, width=7).pack(side="left", padx=2)
         self._search_attempts.trace_add("write", self._search_settings_changed)
         self._search_seed.trace_add("write", self._search_settings_changed)
-        ttk.Button(search_controls, text="Search", command=self.search_route).pack(side="right")
+        ttk.Button(search_controls, text="搜尋", command=self.search_route).pack(side="right")
         ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
         profile_buttons = ttk.Frame(profile_frame)
         profile_buttons.pack(fill="x")
-        ttk.Button(profile_buttons, text="Create", command=self.create_profile).pack(side="left", expand=True, fill="x")
-        ttk.Button(profile_buttons, text="Apply", command=self.apply_profile).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(profile_buttons, text="Load JSON", command=self.load_profile).pack(side="left", expand=True, fill="x")
-        ttk.Button(profile_buttons, text="Save JSON", command=self.save_profile).pack(side="left", expand=True, fill="x", padx=(2, 0))
+        ttk.Button(profile_buttons, text="建立", command=self.create_profile).pack(side="left", expand=True, fill="x")
+        ttk.Button(profile_buttons, text="套用", command=self.apply_profile).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(profile_buttons, text="載入 JSON", command=self.load_profile).pack(side="left", expand=True, fill="x")
+        ttk.Button(profile_buttons, text="儲存 JSON", command=self.save_profile).pack(side="left", expand=True, fill="x", padx=(2, 0))
         ttk.Label(board_frame, textvariable=self._evaluation, wraplength=370, justify="left").pack(anchor="w", pady=(10, 0))
         ttk.Label(board_frame, textvariable=self._verification, wraplength=370, justify="left").pack(anchor="w", pady=(8, 0))
         ttk.Label(self.root, textvariable=self._status, anchor="w", relief="sunken").pack(fill="x", side="bottom")
 
     def _show_error(self, message: str):
         from tkinter import messagebox
-        messagebox.showerror("PAD Router", message, parent=self.root)
+        messagebox.showerror("PAD Router 錯誤", message, parent=self.root)
 
     @staticmethod
     def _format_evaluation(result: RouteEvaluation | None) -> str:
         if result is None:
-            return "No Route evaluated"
+            return "尚未評估路徑"
         matches = ", ".join(
             f"{NAMES.get(match.key, match.key)}×{len(match.cells)}"
             for match in result.resolved_matches
-        ) or "none"
+        ) or "無"
         groups = ", ".join(
-            f"G{item.index} {'pass' if item.satisfied else 'fail'}"
+            f"第 {item.index} 組：{'通過' if item.satisfied else '未通過'}"
             for item in result.group_results
-        ) or "none"
+        ) or "無"
         conditions = ", ".join(
-            f"{item.identifier}={'pass' if item.satisfied else 'fail'} ({item.message})"
+            f"{item.identifier}：{'通過' if item.satisfied else '未通過'}"
             for item in result.condition_results
-        ) or "none"
-        return (f"Matches: {matches} | Cascades: {result.cascades} | Combos: {result.combo_count}\n"
-                f"Groups: {groups}\nConditions: {conditions}\n"
-                f"Hazard: {result.hazard_outcome} | Status: {result.diagnostic_status} | "
-                f"Qualifying: {'yes' if result.qualifying else 'no'} | "
-                f"Execution: {'yes' if result.execution_eligible else 'no'}\n{result.diagnostic}")
+        ) or "無"
+        hazard = {"none": "無", "allowed": "允許", "required": "依條件消除", "blocked": "已阻擋"}.get(
+            result.hazard_outcome, result.hazard_outcome)
+        return (f"消除：{matches} | 落珠：{result.cascades} | Combo：{result.combo_count}\n"
+                f"條件群組：{groups}\n條件：{conditions}\n"
+                f"危害珠：{hazard} | 符合條件：{'是' if result.qualifying else '否'} | "
+                f"可執行：{'是' if result.execution_eligible else '否'}")
 
     @staticmethod
     def _format_board(board) -> str:
         if board is None:
-            return "unavailable"
+            return "無資料"
         return "/".join(" ".join(orb_display(orb) for orb in row) for row in board)
 
     @classmethod
     def _format_verification(cls, verification: PlayVerification | None) -> str:
         if verification is None:
-            return "No post-gesture verification"
-        mismatches = ("unknown" if verification.mismatches is None
+            return "尚無手勢後驗證結果"
+        mismatches = ("未知" if verification.mismatches is None
                       else str(verification.mismatches))
-        return (f"Post-gesture verification: {'success' if verification.success else 'failed'} "
-                f"({mismatches} mismatch(es); {verification.status})\n"
-                f"Expected: {cls._format_board(verification.expected_board)}\n"
-                f"Detected: {cls._format_board(verification.detected_board)}")
+        return (f"手勢後驗證：{'成功' if verification.success else '失敗'} "
+                f"（{mismatches} 格不符）\n"
+                f"預期：{cls._format_board(verification.expected_board)}\n"
+                f"辨識：{cls._format_board(verification.detected_board)}")
 
     def _display(self, state: BoardInspectionState):
         self._status.set(state.status)
@@ -696,7 +707,7 @@ class BoardInspectionApp:
             self._external_conditions.set(json.dumps(
                 [condition.to_dict() for condition in state.rule_profile.external_conditions],
                 sort_keys=True, separators=(",", ":")))
-            self._profile_label.set(f"Current: {state.rule_profile.name}")
+            self._profile_label.set(f"目前設定：{state.rule_profile.name}")
         if state.search_options is not None:
             self._search_attempts.set(str(state.search_options.attempts))
             self._search_seed.set(str(state.search_options.seed))
@@ -773,7 +784,7 @@ class BoardInspectionApp:
 
     def open_png(self):
         from tkinter import filedialog
-        path = filedialog.askopenfilename(parent=self.root, filetypes=(("PNG image", "*.png"),))
+        path = filedialog.askopenfilename(parent=self.root, filetypes=(("PNG 圖片", "*.png"),))
         if path:
             self._manual_route.clear()
             self._apply(lambda: self.controller.load_png(path))
@@ -795,7 +806,7 @@ class BoardInspectionApp:
         cell = self._cell_at(event)
         if cell is not None:
             self._selected_cell = cell
-            self._selected_label.set(f"Cell {cell[0] + 1},{cell[1] + 1}")
+            self._selected_label.set(f"第 {cell[0] + 1} 列、第 {cell[1] + 1} 行")
             self._display(self.controller.state)
         return "break"
 
@@ -804,7 +815,7 @@ class BoardInspectionApp:
         if cell is None:
             return "break"
         self._selected_cell = cell
-        self._selected_label.set(f"Cell {cell[0] + 1},{cell[1] + 1}")
+        self._selected_label.set(f"第 {cell[0] + 1} 列、第 {cell[1] + 1} 行")
         self._manual_route[:] = [cell]
         self._dragging_route = True
         self._display(self.controller.state)
@@ -836,9 +847,9 @@ class BoardInspectionApp:
 
     def correct_selected(self):
         if self._selected_cell is None:
-            self._show_error("Select a Board cell first")
+            self._show_error("請先選取盤面上的珠子")
             return
-        value = self._selected_orb.get()
+        value = ORB_KINDS[self._selected_orb.get()]
         if value in NAMES.values():
             value += "+" if self._enhanced.get() else ""
             value += "*" if self._locked.get() else ""
@@ -857,14 +868,14 @@ class BoardInspectionApp:
         from tkinter import messagebox
         state = self.controller.state
         if state.route_evaluation is None or not state.route_evaluation.execution_eligible:
-            self._show_error("Only a qualifying Route on a confirmed Board can be executed")
+            self._show_error("僅能執行已確認盤面上、符合條件的路徑")
             return
         if not self._serial.get().strip():
-            self._show_error("A device serial is required")
+            self._show_error("請輸入裝置序號")
             return
         if not messagebox.askyesno(
-                "Confirm Route",
-                "Send this Route to the device and verify the post-gesture Board?",
+                "確認執行路徑",
+                "要將此路徑送至裝置，並驗證手勢後盤面嗎？",
                 parent=self.root):
             return
 
@@ -879,21 +890,21 @@ class BoardInspectionApp:
         try:
             raw_groups = json.loads(self._condition_groups.get() or "[]")
             if not isinstance(raw_groups, list):
-                raise ValueError("Condition groups JSON must be a list")
+                raise ValueError("條件群組 JSON 必須是清單")
             groups = tuple(ConditionGroup.from_dict(item) for item in raw_groups)
             raw_external = json.loads(self._external_conditions.get() or "[]")
             if not isinstance(raw_external, list):
-                raise ValueError("External conditions JSON must be a list")
+                raise ValueError("外部條件 JSON 必須是清單")
             external = tuple(ExternalCondition.from_dict(item) for item in raw_external)
             self._profile = RuleProfile(self._profile_name.get(), condition_groups=groups,
                                         external_conditions=external, hazard_policy=self._hazard_policy.get())
-            self._profile_label.set(f"Created: {self._profile.name}")
+            self._profile_label.set(f"已建立：{self._profile.name}")
         except (ValueError, TypeError) as exc:
             self._show_error(str(exc))
 
     def apply_profile(self):
         if self._profile is None:
-            self._show_error("Create or load a Rule Profile first")
+            self._show_error("請先建立或載入規則設定")
             return
         self._manual_route.clear()
         self._apply(lambda: self.controller.set_rule_profile(self._profile))
@@ -915,12 +926,12 @@ class BoardInspectionApp:
             options = None
         if options != state.search_options:
             self._manual_route.clear()
-            self._display(self.controller.invalidate_route("Search settings changed; Route invalidated"))
+            self._display(self.controller.invalidate_route("搜尋設定已變更；路徑已失效"))
 
     def load_profile(self):
         from tkinter import filedialog
         path = filedialog.askopenfilename(parent=self.root,
-                                          filetypes=(("Rule Profile JSON", "*.json"), ("JSON", "*.json")))
+                                          filetypes=(("規則設定 JSON", "*.json"), ("JSON", "*.json")))
         if not path:
             return
         try:
@@ -932,12 +943,12 @@ class BoardInspectionApp:
     def save_profile(self):
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".json",
-                                            filetypes=(("Rule Profile JSON", "*.json"), ("JSON", "*.json")))
+                                            filetypes=(("規則設定 JSON", "*.json"), ("JSON", "*.json")))
         if not path:
             return
         try:
             self.controller.save_rule_profile(path, self._profile)
-            self._profile_label.set(f"Saved: {self._profile.name if self._profile else 'Rule Profile'}")
+            self._profile_label.set(f"已儲存：{self._profile.name if self._profile else '規則設定'}")
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self._show_error(str(exc))
 

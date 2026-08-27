@@ -168,7 +168,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         controller.evaluate_manual_route(((0, 0), (0, 1)))
         post_route = expected_board_after_path(board, ((0, 0), (0, 1)))
 
-        with self.assertRaisesRegex(ValueError, "confirmation"):
+        with self.assertRaisesRegex(ValueError, "明確確認"):
             controller.execute_route("test-device")
         self.assertEqual(calls, [])
 
@@ -178,8 +178,8 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(calls[0][2], board)
         self.assertEqual(controller.state.verification.expected_board, post_route)
         self.assertEqual(controller.state.verification.mismatches, 0)
-        self.assertIn("verified", controller.state.status.lower())
-        with self.assertRaisesRegex(ValueError, "qualifying Route"):
+        self.assertIn("驗證成功", controller.state.status)
+        with self.assertRaisesRegex(ValueError, "符合條件的路徑"):
             controller.execute_route("test-device", explicit_confirmation=True)
 
     def test_execution_exposes_actionable_post_gesture_mismatch(self):
@@ -203,8 +203,8 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertFalse(controller.execute_route("test-device", explicit_confirmation=True))
         self.assertEqual(controller.state.verification.detected_board, actual)
         self.assertEqual(controller.state.verification.mismatches, 2)
-        self.assertIn("2 mismatch", controller.state.status)
-        self.assertIn("Capture", controller.state.status)
+        self.assertIn("2 格不符", controller.state.status)
+        self.assertIn("擷取新盤面", controller.state.status)
 
     def test_non_qualifying_candidate_cannot_execute(self):
         board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
@@ -223,7 +223,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         result = controller.evaluate_manual_route(((0, 0),))
 
         self.assertFalse(result.qualifying)
-        with self.assertRaisesRegex(ValueError, "qualifying Route"):
+        with self.assertRaisesRegex(ValueError, "符合條件的路徑"):
             controller.execute_route("test-device", explicit_confirmation=True)
         self.assertEqual(calls, [])
 

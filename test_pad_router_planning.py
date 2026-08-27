@@ -258,7 +258,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         unconfirmed = controller.evaluate_manual_route(((0, 0),))
         self.assertTrue(unconfirmed.qualifying)
         self.assertFalse(unconfirmed.execution_eligible)
-        with self.assertRaisesRegex(ValueError, "confirmed Board"):
+        with self.assertRaisesRegex(ValueError, "已確認盤面"):
             controller.execute_route("test-device", explicit_confirmation=True)
 
         controller.confirm_board()
