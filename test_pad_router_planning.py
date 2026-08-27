@@ -38,26 +38,40 @@ class RuleProfileTests(unittest.TestCase):
 
 
 class ManualRouteEvaluationTests(unittest.TestCase):
-    def test_condition_groups_require_both_enabled_leaders_and_confirmed_external_state(self):
+    def test_condition_groups_and_external_conditions_are_table_driven(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
                  (6, 3, 4, 5, 6, 3))
-        profile = RuleProfile(
-            "leaders",
-            condition_groups=(
-                ConditionGroup.all_of((LeaderCondition("combo_minimum", minimum=2),)),
-                ConditionGroup.any_of((LeaderCondition("attribute", value="fire"),
-                                       LeaderCondition("attribute", value="dark"))),
-            ),
-            external_conditions=(ExternalCondition("hp", confirmed=False),),
+        cases = (
+            ("all-of passes", ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(2), LeaderCondition.attribute("fire"))),
+             ExternalCondition("skill", confirmed=True), True, True),
+            ("all-of fails", ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(2), LeaderCondition.attribute("dark"))),
+             ExternalCondition("skill", confirmed=True), False, False),
+            ("any-of passes", ConditionGroup.any_of((
+                LeaderCondition.attribute("dark"), LeaderCondition.attribute("fire"))),
+             ExternalCondition("skill", confirmed=True), True, True),
+            ("any-of fails", ConditionGroup.any_of((
+                LeaderCondition.attribute("dark"), LeaderCondition.attribute("heart"))),
+             ExternalCondition("skill", confirmed=True), False, False),
+            ("required external unconfirmed", ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(2),)),
+             ExternalCondition("skill", confirmed=False, required=True), True, False),
+            ("optional external unconfirmed", ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(2),)),
+             ExternalCondition("skill", confirmed=False, required=False), True, True),
         )
 
-        result = evaluate_manual_route(board, ((0, 0),), profile, confirmed=True)
-
-        self.assertEqual(result.combo_count, 2)
-        self.assertFalse(result.qualifying)
-        self.assertFalse(result.execution_eligible)
-        self.assertEqual(result.failed_conditions, ("external:hp",))
+        for name, group, external, group_satisfied, qualifies in cases:
+            with self.subTest(name=name):
+                result = evaluate_manual_route(
+                    board, ((0, 0),), RuleProfile("leaders", (group,), (external,)), confirmed=True
+                )
+                self.assertEqual(result.combo_count, 2)
+                self.assertEqual(result.group_results[0].satisfied, group_satisfied)
+                self.assertEqual(result.qualifying, qualifies)
+                self.assertEqual(result.execution_eligible, qualifies)
 
     def test_cascade_timing_is_visible_and_condition_can_exclude_cascades(self):
         board = ((3, 2, 2, 3, 2, 1), (1, 2, 1, 3, 3, 1),
@@ -79,7 +93,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         cascade_result = evaluate_manual_route(board, ((0, 0),), all_rounds, confirmed=True)
         direct_result = evaluate_manual_route(board, ((0, 0),), direct_only, confirmed=True)
 
-        self.assertGreater(cascade_result.combo_count, cascade_result.rounds[0].combo_count)
+        self.assertGreater(cascade_result.combo_count, len(cascade_result.rounds[0].matches))
         self.assertTrue(cascade_result.qualifying)
         self.assertFalse(direct_result.qualifying)
 
@@ -102,6 +116,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
 
         self.assertFalse(avoided.qualifying)
         self.assertEqual(avoided.hazard_outcome, "blocked")
+        self.assertEqual(avoided.failed_conditions, ("hazard_policy",))
         self.assertTrue(required.qualifying)
         self.assertEqual(required.hazard_outcome, "required")
 
@@ -116,19 +131,19 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         )),))
 
         controller.capture_device("test-device")
-        controller.apply_profile(profile)
-        unconfirmed = controller.evaluate_route(((0, 0),))
+        controller.set_rule_profile(profile)
+        unconfirmed = controller.evaluate_manual_route(((0, 0),))
         self.assertTrue(unconfirmed.qualifying)
         self.assertFalse(unconfirmed.execution_eligible)
 
         controller.confirm_board()
-        confirmed = controller.evaluate_route(((0, 0),))
+        confirmed = controller.evaluate_manual_route(((0, 0),))
         self.assertTrue(confirmed.execution_eligible)
         with self.assertRaises(ValueError):
             controller.approve_route()
         controller.approve_route(explicit_confirmation=True)
         self.assertTrue(controller.state.route_approved)
-        controller.apply_profile(RuleProfile("changed"))
+        controller.set_rule_profile(RuleProfile("changed"))
         self.assertIsNone(controller.state.route_evaluation)
         self.assertFalse(controller.state.route_approved)
 

@@ -5,7 +5,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-from pad_router import COLS, ROWS, Orb
+from pad_router import COLS, ROWS, Orb, RuleProfile
 from pad_router_gui import BoardCalibration, BoardInspectionController, decode_png
 
 
@@ -82,6 +82,23 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(state.source_name, "test-device")
         self.assertEqual((state.width, state.height), (12, 10))
         self.assertFalse(state.confirmed)
+
+    def test_rule_profile_file_flow_and_manual_route(self):
+        self.controller.load_png(self.path)
+        self.controller.correct_cell(0, 0, 1)
+        self.controller.confirm_board()
+        profile = RuleProfile("manual")
+        self.controller.set_rule_profile(profile)
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = Path(directory) / "profile.json"
+            self.controller.save_rule_profile(profile_path)
+            state = self.controller.load_rule_profile(profile_path)
+
+        self.assertEqual(state.rule_profile, profile)
+        result = self.controller.evaluate_manual_route(((0, 0), (0, 1)))
+        self.assertEqual(result.route, ((0, 0), (0, 1)))
+        self.assertTrue(result.execution_eligible)
 
 
 class BoardCalibrationTests(unittest.TestCase):

@@ -18,10 +18,7 @@ from typing import Callable, Iterable
 
 from pad_router import (
     COLS,
-    ConditionGroup,
-    ExternalCondition,
     HAZARDS,
-    LeaderCondition,
     NAMES,
     ROWS,
     Grid,
@@ -30,10 +27,10 @@ from pad_router import (
     RuleProfile,
     detect_board_pixels,
     evaluate_manual_route,
-    load_rule_profile as read_rule_profile,
+    load_rule_profile,
     orb_display,
     orb_match_key,
-    save_rule_profile as write_rule_profile,
+    save_rule_profile,
     screenshot,
 )
 
@@ -264,14 +261,6 @@ class BoardInspectionState:
     def editable_board(self) -> Board | None:
         return self.board
 
-    @property
-    def profile(self) -> RuleProfile | None:
-        return self.rule_profile
-
-    @property
-    def candidate_route(self) -> RouteEvaluation | None:
-        return self.route_evaluation
-
 
 class BoardInspectionController:
     """Public board inspection seam used by the GUI and standard-library tests."""
@@ -318,15 +307,11 @@ class BoardInspectionController:
             raise ValueError("Only PNG images are supported")
         return self._with_source(decode_png(path), str(path))
 
-    load_image = load_png
-
     def capture_device(self, serial: str) -> BoardInspectionState:
         serial = serial.strip()
         if not serial:
             raise ValueError("A device serial is required")
         return self._with_source(self._capture(serial), serial)
-
-    capture = capture_device
 
     def set_calibration(self, calibration: BoardCalibration) -> BoardInspectionState:
         if self.state.pixels is None or self.state.width is None or self.state.height is None:
@@ -367,9 +352,6 @@ class BoardInspectionController:
         self.state = self._with_overlay(updated)
         return self.state
 
-    set_cell = correct_cell
-    correct = correct_cell
-
     def confirm_board(self) -> Board:
         if self.state.board is None:
             raise ValueError("No Board is loaded")
@@ -380,8 +362,6 @@ class BoardInspectionController:
                              status="Board confirmed")
         return self.state.board
 
-    confirm = confirm_board
-
     def set_rule_profile(self, profile: RuleProfile) -> BoardInspectionState:
         if not isinstance(profile, RuleProfile):
             raise TypeError("profile must be a RuleProfile")
@@ -389,21 +369,14 @@ class BoardInspectionController:
                              route_approved=False, status=f"Rule Profile applied: {profile.name}")
         return self.state
 
-    apply_rule_profile = set_rule_profile
-    apply_profile = set_rule_profile
-
     def save_rule_profile(self, path: str | Path, profile: RuleProfile | None = None) -> None:
         profile = profile or self.state.rule_profile
         if profile is None:
             raise ValueError("No Rule Profile is applied")
-        write_rule_profile(profile, path)
-
-    save_profile = save_rule_profile
+        save_rule_profile(profile, path)
 
     def load_rule_profile(self, path: str | Path) -> BoardInspectionState:
-        return self.set_rule_profile(read_rule_profile(path))
-
-    load_profile = load_rule_profile
+        return self.set_rule_profile(load_rule_profile(path))
 
     def evaluate_manual_route(self, path: Iterable[tuple[int, int]],
                                profile: RuleProfile | None = None) -> RouteEvaluation:
@@ -418,9 +391,6 @@ class BoardInspectionController:
                              status=result.diagnostic)
         return result
 
-    evaluate_route = evaluate_manual_route
-    evaluate = evaluate_manual_route
-
     def approve_route(self, explicit_confirmation: bool = False) -> RouteEvaluation:
         result = self.state.route_evaluation
         if result is None or not result.execution_eligible:
@@ -429,8 +399,6 @@ class BoardInspectionController:
             raise ValueError("Explicit Route confirmation is required")
         self.state = replace(self.state, route_approved=True, status="Route approved")
         return result
-
-    confirm_route = approve_route
 
 
 def _photo_from_screenshot(screenshot_data: Screenshot, tk_module):
@@ -460,6 +428,9 @@ class BoardInspectionApp:
         self.controller = controller or BoardInspectionController()
         self._photo = None
         self._selected_cell: tuple[int, int] | None = None
+        self._manual_route: list[tuple[int, int]] = []
+        self._dragging_route = False
+        self._profile: RuleProfile | None = self.controller.state.rule_profile
         self._selected_orb = tk.StringVar(value="fire")
         self._enhanced = tk.BooleanVar()
         self._locked = tk.BooleanVar()
@@ -468,6 +439,10 @@ class BoardInspectionApp:
         self._top = tk.StringVar()
         self._cell = tk.StringVar()
         self._selected_label = tk.StringVar(value="No cell selected")
+        self._profile_name = tk.StringVar(value="manual")
+        self._hazard_policy = tk.StringVar(value="avoid")
+        self._profile_label = tk.StringVar(value="No Rule Profile")
+        self._evaluation = tk.StringVar(value="No Route evaluated")
         self._status = tk.StringVar(value=self.controller.state.status)
         self._build()
 
@@ -498,7 +473,9 @@ class BoardInspectionApp:
         board_frame.pack(side="right", fill="y")
         self.board = tk.Canvas(board_frame, width=390, height=330, background="#111111", highlightthickness=0)
         self.board.pack()
-        self.board.bind("<Button-1>", self.select_cell)
+        self.board.bind("<ButtonPress-1>", self.route_press)
+        self.board.bind("<B1-Motion>", self.route_motion)
+        self.board.bind("<ButtonRelease-1>", self.route_release)
         ttk.Label(board_frame, textvariable=self._selected_label).pack(pady=(8, 2))
         ttk.Label(board_frame, text="Correction:").pack(anchor="w")
         options = list(NAMES.values()) + sorted(HAZARDS)
@@ -508,14 +485,58 @@ class BoardInspectionApp:
         ttk.Checkbutton(board_frame, text="Locked", variable=self._locked).pack(anchor="w")
         ttk.Button(board_frame, text="Correct selected cell", command=self.correct_selected).pack(fill="x", pady=4)
         ttk.Button(board_frame, text="Confirm Board", command=self.confirm_board).pack(fill="x")
+        profile_frame = ttk.LabelFrame(board_frame, text="Rule Profile", padding=6)
+        profile_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(profile_frame, text="Name:").pack(anchor="w")
+        ttk.Entry(profile_frame, textvariable=self._profile_name).pack(fill="x")
+        ttk.Label(profile_frame, text="Hazard policy:").pack(anchor="w", pady=(4, 0))
+        ttk.Combobox(profile_frame, textvariable=self._hazard_policy, values=("avoid", "allow"),
+                     state="readonly", width=12).pack(fill="x")
+        ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
+        profile_buttons = ttk.Frame(profile_frame)
+        profile_buttons.pack(fill="x")
+        ttk.Button(profile_buttons, text="Create", command=self.create_profile).pack(side="left", expand=True, fill="x")
+        ttk.Button(profile_buttons, text="Apply", command=self.apply_profile).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(profile_buttons, text="Load JSON", command=self.load_profile).pack(side="left", expand=True, fill="x")
+        ttk.Button(profile_buttons, text="Save JSON", command=self.save_profile).pack(side="left", expand=True, fill="x", padx=(2, 0))
+        ttk.Label(board_frame, textvariable=self._evaluation, wraplength=370, justify="left").pack(anchor="w", pady=(10, 0))
         ttk.Label(self.root, textvariable=self._status, anchor="w", relief="sunken").pack(fill="x", side="bottom")
 
     def _show_error(self, message: str):
         from tkinter import messagebox
         messagebox.showerror("PAD Router", message, parent=self.root)
 
+    @staticmethod
+    def _format_evaluation(result: RouteEvaluation | None) -> str:
+        if result is None:
+            return "No Route evaluated"
+        matches = ", ".join(
+            f"{NAMES.get(match.key, match.key)}×{len(match.cells)}"
+            for match in result.resolved_matches
+        ) or "none"
+        groups = ", ".join(
+            f"G{item.index} {'pass' if item.satisfied else 'fail'}"
+            for item in result.group_results
+        ) or "none"
+        conditions = ", ".join(
+            f"{item.identifier}={'pass' if item.satisfied else 'fail'}"
+            for item in result.condition_results
+        ) or "none"
+        return (f"Matches: {matches} | Cascades: {result.cascades} | Combos: {result.combo_count}\n"
+                f"Groups: {groups}\nConditions: {conditions}\n"
+                f"Hazard: {result.hazard_outcome} | Status: {result.diagnostic_status} | "
+                f"Qualifying: {'yes' if result.qualifying else 'no'} | "
+                f"Execution: {'yes' if result.execution_eligible else 'no'}\n{result.diagnostic}")
+
     def _display(self, state: BoardInspectionState):
         self._status.set(state.status)
+        if state.rule_profile is not None:
+            self._profile = state.rule_profile
+            self._profile_name.set(state.rule_profile.name)
+            self._hazard_policy.set(state.rule_profile.hazard_policy)
+            self._profile_label.set(f"Current: {state.rule_profile.name}")
+        result = state.route_evaluation
+        self._evaluation.set(self._format_evaluation(result))
         if state.calibration:
             self._left.set(str(state.calibration.left))
             self._top.set(str(state.calibration.top))
@@ -550,6 +571,18 @@ class BoardInspectionApp:
                                        fill=color, outline="#ff4444" if (row, col) in state.uncertain_cells else "#dddddd", width=2)
                 self.board.create_text(x0 + size // 2, y0 + size // 2, text=orb_display(orb), fill="white",
                                        font=("TkDefaultFont", 14, "bold"))
+        if self._manual_route:
+            points = tuple((col * size + size // 2, row * size + size // 2)
+                           for row, col in self._manual_route)
+            coords = tuple(value for point in points for value in point)
+            if len(coords) > 2:
+                self.board.create_line(*coords, fill="#00e5ff", width=6,
+                                       capstyle="round", joinstyle="round")
+            for index, (x, y) in enumerate(points, 1):
+                self.board.create_oval(x - 12, y - 12, x + 12, y + 12,
+                                       outline="#ffffff", width=2)
+                self.board.create_text(x, y, text=str(index), fill="white",
+                                       font=("TkDefaultFont", 10, "bold"))
 
     def _apply(self, action):
         try:
@@ -561,21 +594,63 @@ class BoardInspectionApp:
         from tkinter import filedialog
         path = filedialog.askopenfilename(parent=self.root, filetypes=(("PNG image", "*.png"),))
         if path:
+            self._manual_route.clear()
             self._apply(lambda: self.controller.load_png(path))
 
     def capture_device(self):
+        self._manual_route.clear()
         self._apply(lambda: self.controller.capture_device(self._serial.get()))
 
     def apply_calibration(self):
         self._apply(lambda: self.controller.set_calibration(BoardCalibration(
             int(self._left.get()), int(self._top.get()), int(self._cell.get()))))
 
-    def select_cell(self, event):
+    def _cell_at(self, event) -> tuple[int, int] | None:
         cell = (event.y // 60, event.x // 60)
-        if 0 <= cell[0] < ROWS and 0 <= cell[1] < COLS:
+        return cell if 0 <= cell[0] < ROWS and 0 <= cell[1] < COLS else None
+
+    def select_cell(self, event):
+        cell = self._cell_at(event)
+        if cell is not None:
             self._selected_cell = cell
             self._selected_label.set(f"Cell {cell[0] + 1},{cell[1] + 1}")
             self._display(self.controller.state)
+        return "break"
+
+    def route_press(self, event):
+        cell = self._cell_at(event)
+        if cell is None:
+            return "break"
+        self._selected_cell = cell
+        self._selected_label.set(f"Cell {cell[0] + 1},{cell[1] + 1}")
+        self._manual_route[:] = [cell]
+        self._dragging_route = True
+        self._display(self.controller.state)
+        return "break"
+
+    def route_motion(self, event):
+        if not self._dragging_route:
+            return "break"
+        cell = self._cell_at(event)
+        if cell is None or cell in self._manual_route:
+            return "break"
+        previous = self._manual_route[-1]
+        if abs(previous[0] - cell[0]) + abs(previous[1] - cell[1]) != 1:
+            return "break"
+        self._manual_route.append(cell)
+        self._display(self.controller.state)
+        return "break"
+
+    def route_release(self, event):
+        if not self._dragging_route:
+            return "break"
+        self._dragging_route = False
+        state = self.controller.state
+        if state.board is not None and state.rule_profile is not None:
+            self._apply(lambda: self.controller.evaluate_manual_route(tuple(self._manual_route)))
+        else:
+            self._display(state)
+        return "break"
 
     def correct_selected(self):
         if self._selected_cell is None:
@@ -585,13 +660,51 @@ class BoardInspectionApp:
         if value in NAMES.values():
             value += "+" if self._enhanced.get() else ""
             value += "*" if self._locked.get() else ""
+        self._manual_route.clear()
         self._apply(lambda: self.controller.correct_cell(*self._selected_cell, value))
 
     def confirm_board(self):
         try:
             self.controller.confirm_board()
+            self._manual_route.clear()
             self._display(self.controller.state)
         except ValueError as exc:
+            self._show_error(str(exc))
+
+    def create_profile(self):
+        try:
+            self._profile = RuleProfile(self._profile_name.get(), hazard_policy=self._hazard_policy.get())
+            self._profile_label.set(f"Created: {self._profile.name}")
+        except (ValueError, TypeError) as exc:
+            self._show_error(str(exc))
+
+    def apply_profile(self):
+        if self._profile is None:
+            self._show_error("Create or load a Rule Profile first")
+            return
+        self._apply(lambda: self.controller.set_rule_profile(self._profile))
+
+    def load_profile(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self.root,
+                                          filetypes=(("Rule Profile JSON", "*.json"), ("JSON", "*.json")))
+        if not path:
+            return
+        try:
+            self._display(self.controller.load_rule_profile(path))
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
+            self._show_error(str(exc))
+
+    def save_profile(self):
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".json",
+                                            filetypes=(("Rule Profile JSON", "*.json"), ("JSON", "*.json")))
+        if not path:
+            return
+        try:
+            self.controller.save_rule_profile(path, self._profile)
+            self._profile_label.set(f"Saved: {self._profile.name if self._profile else 'Rule Profile'}")
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self._show_error(str(exc))
 
 
