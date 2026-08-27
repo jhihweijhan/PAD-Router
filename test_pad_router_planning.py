@@ -107,6 +107,26 @@ class ManualRouteEvaluationTests(unittest.TestCase):
                 self.assertEqual(result.qualifying, qualifies)
                 self.assertEqual(result.execution_eligible, qualifies)
 
+    def test_shape_conditions_cover_the_gui_presets(self):
+        def board_for(points):
+            return tuple(tuple(1 if (row, col) in points else (row + col) % 5 + 2
+                               for col in range(COLS)) for row in range(ROWS))
+
+        cases = (
+            ("色珠一橫列", {(0, col) for col in range(COLS)}, LeaderCondition.shape("full_row")),
+            ("9 顆正方形", {(row, col) for row in range(3) for col in range(3)}, LeaderCondition.shape("box_3x3")),
+            ("十字型", {(1, 2), (0, 2), (2, 2), (1, 1), (1, 3)}, LeaderCondition.shape("cross")),
+            ("4 顆消除", {(0, col) for col in range(4)}, LeaderCondition.connected_orb_count(4, exact=True)),
+            ("L 型", {(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)}, LeaderCondition.shape("l")),
+            ("T 型", {(0, 0), (0, 1), (0, 2), (1, 1), (2, 1)}, LeaderCondition.shape("t")),
+        )
+
+        for name, points, condition in cases:
+            with self.subTest(name=name):
+                profile = RuleProfile(name, (ConditionGroup.all_of((condition,)),))
+                result = evaluate_manual_route(board_for(points), ((4, 5),), profile, confirmed=True)
+                self.assertTrue(result.qualifying)
+
     def test_cascade_timing_is_visible_and_condition_can_exclude_cascades(self):
         board = ((3, 2, 2, 3, 2, 1), (1, 2, 1, 3, 3, 1),
                  (2, 3, 1, 2, 3, 3), (3, 1, 1, 2, 3, 4),

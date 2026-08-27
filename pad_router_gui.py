@@ -71,6 +71,12 @@ CONDITION_PRESETS = {
     "消除心珠": (LeaderCondition.attribute("heart"),),
     "同時消除火、水、木": (LeaderCondition.simultaneous_attributes(("fire", "water", "wood")),),
     "同時消除火、水、木、光、暗": (LeaderCondition.simultaneous_attributes(("fire", "water", "wood", "light", "dark")),),
+    "色珠一橫列": (LeaderCondition.shape("full_row"),),
+    "9 顆正方形": (LeaderCondition.shape("box_3x3"),),
+    "十字型": (LeaderCondition.shape("cross"),),
+    "4 顆消除": (LeaderCondition.connected_orb_count(4, exact=True),),
+    "L 型": (LeaderCondition.shape("l"),),
+    "T 型": (LeaderCondition.shape("t"),),
     "同色連 5 顆以上": (LeaderCondition.connected_orb_count(5),),
     "強化珠至少消除 1 顆": (LeaderCondition.enhanced_orb(1),),
     **{f"{ORB_LABELS[name]}珠至少消除 2 組": (LeaderCondition.match_count(name, 2),)
