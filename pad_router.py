@@ -224,8 +224,10 @@ class LeaderCondition:
                    include_cascades=include_cascades)
 
     @classmethod
-    def shape(cls, shape: str, include_cascades: bool = True) -> "LeaderCondition":
-        return cls("shape", value=shape, include_cascades=include_cascades)
+    def shape(cls, shape: str, include_cascades: bool = True,
+              orb_type: str | int | None = None) -> "LeaderCondition":
+        value: object = shape if orb_type is None else {"shape": shape, "orb_type": orb_type}
+        return cls("shape", value=value, include_cascades=include_cascades)
 
     @classmethod
     def required_orbs(cls, orb_types: Iterable[str | int], include_cascades: bool = True) -> "LeaderCondition":
@@ -558,6 +560,12 @@ def resolve_matches(board: tuple[tuple[object, ...], ...], cascade: bool = True)
     return _resolve_rounds(board, cascade)[0]
 
 
+def _shape_spec(value: object) -> tuple[str, int | str | None]:
+    if isinstance(value, dict):
+        return str(value.get("shape", "")), _normalise_orb_type(value.get("orb_type"))
+    return str(value), None
+
+
 def _shape_matches(cells: tuple[tuple[int, int], ...], shape: str) -> bool:
     shape = str(shape).strip().lower().replace("-", "_").replace(" ", "_")
     points = set(cells)
@@ -643,9 +651,11 @@ def _condition_matches(condition: LeaderCondition, rounds: tuple[MatchRound, ...
         comparator = "exactly" if condition.exact else "at least"
         message = f"{observed} enhanced Orbs; need {comparator} {expected}"
     elif kind == "shape":
-        observed = tuple(_match_type(match) for match in matches if _shape_matches(match.cells, str(condition.value)))
+        shape, target = _shape_spec(condition.value)
+        observed = tuple(_match_type(match) for match in matches
+                         if (target is None or _match_type(match) == target) and _shape_matches(match.cells, shape))
         satisfied = bool(observed)
-        message = f"shape {condition.value}: {'present' if satisfied else 'missing'}"
+        message = f"shape {shape}: {'present' if satisfied else 'missing'}"
     elif kind in {"required_orbs", "forbidden_orbs"}:
         targets = set(_orb_types(condition.value))
         observed = tuple(sorted({_match_type(match) for match in matches}))
@@ -658,6 +668,8 @@ def _condition_matches(condition: LeaderCondition, rounds: tuple[MatchRound, ...
 
 
 def _condition_requires_hazard(condition: LeaderCondition, hazard_types: set[str]) -> bool:
+    if condition.kind == "shape" and isinstance(condition.value, dict):
+        return bool(hazard_types & set(_orb_types(condition.value.get("orb_type"))))
     if condition.kind not in {"attribute", "match_count", "connected_orb_count", "enhanced_orb", "required_orbs", "simultaneous_attributes"}:
         return False
     return bool(hazard_types & set(_orb_types(condition.value)))

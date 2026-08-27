@@ -71,17 +71,18 @@ CONDITION_PRESETS = {
     "消除心珠": (LeaderCondition.attribute("heart"),),
     "同時消除火、水、木": (LeaderCondition.simultaneous_attributes(("fire", "water", "wood")),),
     "同時消除火、水、木、光、暗": (LeaderCondition.simultaneous_attributes(("fire", "water", "wood", "light", "dark")),),
-    "色珠一橫列": (LeaderCondition.shape("full_row"),),
-    "9 顆正方形": (LeaderCondition.shape("box_3x3"),),
-    "十字型": (LeaderCondition.shape("cross"),),
-    "4 顆消除": (LeaderCondition.connected_orb_count(4, exact=True),),
-    "L 型": (LeaderCondition.shape("l"),),
-    "T 型": (LeaderCondition.shape("t"),),
     "同色連 5 顆以上": (LeaderCondition.connected_orb_count(5),),
     "強化珠至少消除 1 顆": (LeaderCondition.enhanced_orb(1),),
     **{f"{ORB_LABELS[name]}珠至少消除 2 組": (LeaderCondition.match_count(name, 2),)
        for name in NAMES.values()},
 }
+SHAPE_PRESETS = {
+    "色珠一橫列": "full_row", "9 顆正方形": "box_3x3", "十字型": "cross",
+    "L 型": "l", "T 型": "t",
+}
+COLORED_PRESETS = tuple(SHAPE_PRESETS) + ("4 顆消除",)
+CONDITION_OPTIONS = tuple(CONDITION_PRESETS) + COLORED_PRESETS
+CONDITION_COLORS = tuple(ORB_LABELS[name] for name in NAMES.values())
 NO_CONDITION = "不限（以最大 Combo 為主）"
 GROUP_OPERATORS = {"全部符合": "all", "任一符合": "any"}
 HAZARD_POLICIES = {"避免危害珠": "avoid", "允許危害珠": "allow"}
@@ -94,13 +95,25 @@ EXTERNAL_CONDITIONS = {
 }
 
 
-def rule_profile_from_selections(condition_labels: Iterable[str], operator_label: str,
+def rule_profile_from_selections(condition_selections: Iterable[tuple[str, str] | str], operator_label: str,
                                  hazard_label: str, external_label: str) -> RuleProfile:
     """Build a profile solely from the GUI's fixed choices."""
 
-    labels = tuple(dict.fromkeys(label for label in condition_labels if label != NO_CONDITION))
-    conditions = tuple(condition for label in labels for condition in CONDITION_PRESETS[label])
+    selections: list[tuple[str, str]] = []
+    for selection in condition_selections:
+        label, color = selection if isinstance(selection, tuple) else (selection, "火")
+        if label != NO_CONDITION and (label, color) not in selections:
+            selections.append((label, color))
+    conditions: list[LeaderCondition] = []
+    for label, color in selections:
+        if label in SHAPE_PRESETS:
+            conditions.append(LeaderCondition.shape(SHAPE_PRESETS[label], orb_type=ORB_KINDS[color]))
+        elif label == "4 顆消除":
+            conditions.append(LeaderCondition.connected_orb_count(4, ORB_KINDS[color], exact=True))
+        else:
+            conditions.extend(CONDITION_PRESETS[label])
     groups = (ConditionGroup(conditions, GROUP_OPERATORS[operator_label]),) if conditions else ()
+    labels = tuple(f"{label}（{color}）" if label in COLORED_PRESETS else label for label, color in selections)
     return RuleProfile("、".join(labels) or "最大 Combo", condition_groups=groups,
                        external_conditions=EXTERNAL_CONDITIONS[external_label],
                        hazard_policy=HAZARD_POLICIES[hazard_label])
@@ -607,6 +620,7 @@ class BoardInspectionApp:
         self._serial = tk.StringVar()
         self._selected_label = tk.StringVar(value="尚未選取珠子")
         self._condition_choices = [tk.StringVar(value=NO_CONDITION) for _ in range(3)]
+        self._condition_colors = [tk.StringVar(value="火") for _ in range(3)]
         self._condition_operator = tk.StringVar(value="全部符合")
         self._hazard_policy = tk.StringVar(value="避免危害珠")
         self._external_condition = tk.StringVar(value="無")
@@ -661,10 +675,14 @@ class BoardInspectionApp:
         self._execute_button.pack(fill="x", pady=(4, 0))
         profile_frame = ttk.LabelFrame(board_frame, text="規則設定", padding=6)
         profile_frame.pack(fill="x", pady=(10, 0))
-        ttk.Label(profile_frame, text="消珠條件（可選最多 3 項）：").pack(anchor="w")
-        for variable in self._condition_choices:
-            ttk.Combobox(profile_frame, textvariable=variable, values=tuple(CONDITION_PRESETS),
-                         state="readonly", width=34).pack(fill="x", pady=(2, 0))
+        ttk.Label(profile_frame, text="消珠條件（可選最多 3 項；形狀請選目標色珠）：").pack(anchor="w")
+        for variable, color in zip(self._condition_choices, self._condition_colors):
+            condition_row = ttk.Frame(profile_frame)
+            condition_row.pack(fill="x", pady=(2, 0))
+            ttk.Combobox(condition_row, textvariable=variable, values=CONDITION_OPTIONS,
+                         state="readonly", width=28).pack(side="left", fill="x", expand=True)
+            ttk.Combobox(condition_row, textvariable=color, values=CONDITION_COLORS,
+                         state="readonly", width=4).pack(side="right", padx=(4, 0))
         ttk.Label(profile_frame, text="條件關係：").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._condition_operator, values=tuple(GROUP_OPERATORS),
                      state="readonly", width=12).pack(fill="x")
@@ -935,7 +953,8 @@ class BoardInspectionApp:
 
     def create_profile(self):
         self._profile = rule_profile_from_selections(
-            (variable.get() for variable in self._condition_choices), self._condition_operator.get(),
+            ((variable.get(), color.get()) for variable, color in zip(self._condition_choices, self._condition_colors)),
+            self._condition_operator.get(),
             self._hazard_policy.get(), self._external_condition.get())
         self._profile_label.set(f"已建立：{self._profile.name}")
 
