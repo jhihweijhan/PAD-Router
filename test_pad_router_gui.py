@@ -5,7 +5,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-from pad_router import COLS, ROWS, Orb, RuleProfile
+from pad_router import COLS, ROWS, Orb, RouteSearchOptions, RuleProfile
 from pad_router_gui import BoardCalibration, BoardInspectionController, decode_png
 
 
@@ -99,6 +99,36 @@ class BoardInspectionControllerTests(unittest.TestCase):
         result = self.controller.evaluate_manual_route(((0, 0), (0, 1)))
         self.assertEqual(result.route, ((0, 0), (0, 1)))
         self.assertTrue(result.execution_eligible)
+
+    def test_search_exposes_candidate_overlay_and_invalidates_it_on_profile_change(self):
+        self.controller.load_png(self.path)
+        self.controller.correct_cell(0, 0, 1)
+        self.controller.confirm_board()
+        self.controller.set_rule_profile(RuleProfile("search"))
+
+        result = self.controller.search_qualifying_route(
+            RouteSearchOptions(attempts=1, seed=4, min_steps=0, max_steps=0)
+        )
+
+        self.assertIs(result, self.controller.state.route_search)
+        self.assertIs(result.candidate, self.controller.state.route_evaluation)
+        self.assertTrue(result.candidate.execution_eligible)
+        self.assertEqual(len(self.controller.state.route_overlay), 1)
+        marker = self.controller.state.route_overlay[0]
+        self.assertEqual(marker["cell"], result.candidate.route[0])
+        self.assertIn("x", marker)
+        self.assertIn("y", marker)
+        self.controller.approve_route(explicit_confirmation=True)
+        self.assertTrue(self.controller.state.route_approved)
+        self.controller.search_qualifying_route(
+            RouteSearchOptions(attempts=1, seed=5, min_steps=0, max_steps=0)
+        )
+        self.assertFalse(self.controller.state.route_approved)
+
+        self.controller.set_rule_profile(RuleProfile("changed"))
+        self.assertIsNone(self.controller.state.route_search)
+        self.assertIsNone(self.controller.state.route_evaluation)
+        self.assertEqual(self.controller.state.route_overlay, ())
 
 
 class BoardCalibrationTests(unittest.TestCase):

@@ -9,9 +9,11 @@ from pad_router import (
     ExternalCondition,
     LeaderCondition,
     Orb,
+    RouteSearchOptions,
     RuleProfile,
     evaluate_manual_route,
     load_rule_profile,
+    search_qualifying_route,
 )
 from pad_router_gui import BoardInspectionController
 
@@ -38,6 +40,22 @@ class RuleProfileTests(unittest.TestCase):
 
 
 class ManualRouteEvaluationTests(unittest.TestCase):
+    def test_search_is_reproducible_and_returns_a_qualifying_candidate(self):
+        board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
+                 (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
+                 (6, 3, 4, 5, 6, 3))
+        profile = RuleProfile("search", condition_groups=(ConditionGroup.all_of((
+            LeaderCondition.combo_minimum(2),
+        )),))
+        options = RouteSearchOptions(attempts=40, seed=17, min_steps=0, max_steps=4)
+
+        first = search_qualifying_route(board, profile, options, confirmed=True)
+        second = search_qualifying_route(board, profile, options, confirmed=True)
+
+        self.assertEqual(first, second)
+        self.assertIsNotNone(first.qualifying_candidate)
+        self.assertTrue(first.qualifying_candidate.execution_eligible)
+
     def test_condition_groups_and_external_conditions_are_table_driven(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
@@ -119,6 +137,63 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertEqual(avoided.failed_conditions, ("hazard_policy",))
         self.assertTrue(required.qualifying)
         self.assertEqual(required.hazard_outcome, "required")
+
+    def test_search_preserves_default_hazard_exclusion_and_required_hazard_exception(self):
+        jammer = Orb("jammer")
+        board = ((jammer, jammer, jammer, 1, 2, 3),) + ((1, 2, 3, 4, 5, 6),) * (ROWS - 1)
+        options = RouteSearchOptions(attempts=1, seed=0, min_steps=0, max_steps=0)
+        avoid = RuleProfile(
+            "safe", condition_groups=(ConditionGroup.all_of((LeaderCondition.combo_minimum(1),)),)
+        )
+        require = RuleProfile(
+            "jammer leader", condition_groups=(ConditionGroup.all_of((
+                LeaderCondition.required_orbs(("jammer",)),
+            )),)
+        )
+
+        avoided = search_qualifying_route(board, avoid, options, confirmed=True)
+        required = search_qualifying_route(board, require, options, confirmed=True)
+
+        self.assertIsNone(avoided.qualifying_candidate)
+        self.assertEqual(avoided.diagnostic_candidate.hazard_outcome, "blocked")
+        self.assertFalse(avoided.diagnostic_candidate.execution_eligible)
+        self.assertIsNotNone(required.qualifying_candidate)
+        self.assertEqual(required.qualifying_candidate.hazard_outcome, "required")
+
+    def test_search_returns_the_best_non_qualifying_diagnostic_candidate(self):
+        board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
+                 (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
+                 (6, 3, 4, 5, 6, 3))
+        options = RouteSearchOptions(attempts=60, seed=9, min_steps=0, max_steps=4)
+        qualifying = search_qualifying_route(board, RuleProfile("open"), options, confirmed=True)
+        blocked = search_qualifying_route(
+            board, RuleProfile("blocked", external_conditions=(ExternalCondition("skill"),)),
+            options, confirmed=True
+        )
+
+        self.assertIsNotNone(qualifying.qualifying_candidate)
+        self.assertIsNone(blocked.qualifying_candidate)
+        self.assertEqual(blocked.diagnostic_candidate.route, qualifying.qualifying_candidate.route)
+        self.assertEqual(blocked.diagnostic_candidate.combo_count, qualifying.qualifying_candidate.combo_count)
+        self.assertIn("external:skill", blocked.diagnostic_candidate.failed_conditions)
+        self.assertFalse(blocked.diagnostic_candidate.execution_eligible)
+
+    def test_search_diagnostic_explains_a_missing_condition(self):
+        board = tuple(tuple((row + col) % 6 + 1 for col in range(COLS)) for row in range(ROWS))
+        profile = RuleProfile(
+            "needs a match", condition_groups=(ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(1),
+            )),)
+        )
+
+        result = search_qualifying_route(
+            board, profile, RouteSearchOptions(attempts=1, seed=0, min_steps=0, max_steps=0), confirmed=True
+        )
+
+        self.assertIsNone(result.qualifying_candidate)
+        self.assertEqual(result.diagnostic_candidate.failed_conditions, ("combo_minimum",))
+        self.assertIn("combo_minimum", result.diagnostic)
+        self.assertFalse(result.diagnostic_candidate.execution_eligible)
 
     def test_controller_applies_profile_and_keeps_execution_locked_until_confirmation(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),

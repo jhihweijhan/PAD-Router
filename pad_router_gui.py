@@ -24,12 +24,15 @@ from pad_router import (
     Grid,
     Orb,
     RouteEvaluation,
+    RouteSearchOptions,
+    RouteSearchResult,
     RuleProfile,
     detect_board_pixels,
     evaluate_manual_route,
     load_rule_profile,
     orb_display,
     orb_match_key,
+    search_qualifying_route,
     save_rule_profile,
     screenshot,
 )
@@ -252,6 +255,8 @@ class BoardInspectionState:
     rule_profile: RuleProfile | None = None
     route_evaluation: RouteEvaluation | None = None
     route_approved: bool = False
+    route_search: RouteSearchResult | None = None
+    route_overlay: tuple[dict[str, object], ...] = ()
 
     @property
     def source_path(self) -> str | None:
@@ -302,6 +307,13 @@ class BoardInspectionController:
                          for row in range(ROWS) for col in range(COLS))
         return replace(state, overlay=overlay)
 
+    def _route_overlay(self, result: RouteEvaluation | None) -> tuple[dict[str, object], ...]:
+        if result is None or self.state.calibration is None:
+            return ()
+        grid = self.state.calibration.to_grid()
+        return tuple({"cell": cell, "step": index, "x": grid.point(*cell)[0], "y": grid.point(*cell)[1]}
+                     for index, cell in enumerate(result.route, 1))
+
     def load_png(self, path: str | Path) -> BoardInspectionState:
         if Path(path).suffix.lower() != ".png":
             raise ValueError("Only PNG images are supported")
@@ -348,6 +360,7 @@ class BoardInspectionController:
         updated = replace(self.state, board=tuple(map(tuple, board)), confirmed_board=None,
                           confirmed=False, uncertain_cells=_uncertain_cells(tuple(map(tuple, board))),
                           overlay=(), route_evaluation=None, route_approved=False,
+                          route_search=None, route_overlay=(),
                           status="Cell corrected; review and confirm the Board")
         self.state = self._with_overlay(updated)
         return self.state
@@ -359,6 +372,7 @@ class BoardInspectionController:
             raise ValueError("Uncertain cells require manual correction before confirmation")
         self.state = replace(self.state, confirmed_board=self.state.board, confirmed=True,
                              uncertain_cells=(), route_evaluation=None, route_approved=False,
+                             route_search=None, route_overlay=(),
                              status="Board confirmed")
         return self.state.board
 
@@ -366,7 +380,8 @@ class BoardInspectionController:
         if not isinstance(profile, RuleProfile):
             raise TypeError("profile must be a RuleProfile")
         self.state = replace(self.state, rule_profile=profile, route_evaluation=None,
-                             route_approved=False, status=f"Rule Profile applied: {profile.name}")
+                             route_approved=False, route_search=None, route_overlay=(),
+                             status=f"Rule Profile applied: {profile.name}")
         return self.state
 
     def save_rule_profile(self, path: str | Path, profile: RuleProfile | None = None) -> None:
@@ -388,8 +403,26 @@ class BoardInspectionController:
             raise ValueError("Apply a Rule Profile before evaluating a Route")
         result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed)
         self.state = replace(self.state, route_evaluation=result, route_approved=False,
+                             route_search=None, route_overlay=self._route_overlay(result),
                              status=result.diagnostic)
         return result
+
+    def search_qualifying_route(self, options: RouteSearchOptions | None = None) -> RouteSearchResult:
+        board = self.state.confirmed_board or self.state.board
+        if board is None:
+            raise ValueError("Load and confirm a Board before searching for a Route")
+        profile = self.state.rule_profile
+        if profile is None:
+            raise ValueError("Apply a Rule Profile before searching for a Route")
+        result = search_qualifying_route(board, profile, options, confirmed=self.state.confirmed)
+        candidate = result.candidate
+        self.state = replace(self.state, route_search=result, route_evaluation=candidate,
+                             route_approved=False, route_overlay=self._route_overlay(candidate),
+                             status=result.diagnostic)
+        return result
+
+    def search_route(self, options: RouteSearchOptions | None = None) -> RouteSearchResult:
+        return self.search_qualifying_route(options)
 
     def approve_route(self, explicit_confirmation: bool = False) -> RouteEvaluation:
         result = self.state.route_evaluation
@@ -441,6 +474,8 @@ class BoardInspectionApp:
         self._selected_label = tk.StringVar(value="No cell selected")
         self._profile_name = tk.StringVar(value="manual")
         self._hazard_policy = tk.StringVar(value="avoid")
+        self._search_attempts = tk.StringVar(value="100")
+        self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="No Rule Profile")
         self._evaluation = tk.StringVar(value="No Route evaluated")
         self._status = tk.StringVar(value=self.controller.state.status)
@@ -492,6 +527,13 @@ class BoardInspectionApp:
         ttk.Label(profile_frame, text="Hazard policy:").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._hazard_policy, values=("avoid", "allow"),
                      state="readonly", width=12).pack(fill="x")
+        search_controls = ttk.Frame(profile_frame)
+        search_controls.pack(fill="x", pady=(4, 0))
+        ttk.Label(search_controls, text="Attempts:").pack(side="left")
+        ttk.Entry(search_controls, textvariable=self._search_attempts, width=7).pack(side="left", padx=(2, 6))
+        ttk.Label(search_controls, text="Seed:").pack(side="left")
+        ttk.Entry(search_controls, textvariable=self._search_seed, width=7).pack(side="left", padx=2)
+        ttk.Button(search_controls, text="Search", command=self.search_route).pack(side="right")
         ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
         profile_buttons = ttk.Frame(profile_frame)
         profile_buttons.pack(fill="x")
@@ -552,6 +594,17 @@ class BoardInspectionApp:
                 self.source.create_oval(x - radius, y - radius, x + radius, y + radius,
                                         outline="#ff4444" if uncertain else "#61dafb", width=3)
                 self.source.create_text(x, y, text=item["label"], fill="white", font=("TkDefaultFont", 12, "bold"))
+            route_points = tuple((item["x"], item["y"]) for item in state.route_overlay)
+            if route_points:
+                coords = tuple(value for point in route_points for value in point)
+                if len(coords) > 2:
+                    self.source.create_line(*coords, fill="#ffcc33", width=6,
+                                             capstyle="round", joinstyle="round")
+                for item, (x, y) in zip(state.route_overlay, route_points):
+                    self.source.create_oval(x - 12, y - 12, x + 12, y + 12,
+                                            outline="#ffcc33", width=2)
+                    self.source.create_text(x, y, text=str(item["step"]), fill="white",
+                                            font=("TkDefaultFont", 10, "bold"))
             self.source.configure(scrollregion=(0, 0, state.width, state.height))
         self.board.delete("all")
         if state.board is None:
@@ -571,16 +624,17 @@ class BoardInspectionApp:
                                        fill=color, outline="#ff4444" if (row, col) in state.uncertain_cells else "#dddddd", width=2)
                 self.board.create_text(x0 + size // 2, y0 + size // 2, text=orb_display(orb), fill="white",
                                        font=("TkDefaultFont", 14, "bold"))
-        if self._manual_route:
+        route = tuple(item["cell"] for item in state.route_overlay) or tuple(self._manual_route)
+        if route:
             points = tuple((col * size + size // 2, row * size + size // 2)
-                           for row, col in self._manual_route)
+                           for row, col in route)
             coords = tuple(value for point in points for value in point)
             if len(coords) > 2:
-                self.board.create_line(*coords, fill="#00e5ff", width=6,
+                self.board.create_line(*coords, fill="#ffcc33" if state.route_overlay else "#00e5ff", width=6,
                                        capstyle="round", joinstyle="round")
             for index, (x, y) in enumerate(points, 1):
                 self.board.create_oval(x - 12, y - 12, x + 12, y + 12,
-                                       outline="#ffffff", width=2)
+                                       outline="#ffcc33" if state.route_overlay else "#ffffff", width=2)
                 self.board.create_text(x, y, text=str(index), fill="white",
                                        font=("TkDefaultFont", 10, "bold"))
 
@@ -683,6 +737,12 @@ class BoardInspectionApp:
             self._show_error("Create or load a Rule Profile first")
             return
         self._apply(lambda: self.controller.set_rule_profile(self._profile))
+
+    def search_route(self):
+        self._manual_route.clear()
+        self._apply(lambda: self.controller.search_qualifying_route(
+            RouteSearchOptions(attempts=int(self._search_attempts.get()), seed=int(self._search_seed.get()))
+        ))
 
     def load_profile(self):
         from tkinter import filedialog

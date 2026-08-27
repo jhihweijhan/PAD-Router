@@ -9,6 +9,7 @@ import heapq
 import json
 import math
 from pathlib import Path
+import random
 import shlex
 import struct
 import statistics
@@ -718,6 +719,89 @@ def evaluate_manual_route(
     return RouteEvaluation(route, expected, rounds, tuple(condition_results), tuple(group_results),
                            sum(len(item.matches) for item in rounds), hazard_outcome, qualifies,
                            bool(confirmed), bool(confirmed and qualifies), status, diagnostic)
+
+
+@dataclass(frozen=True)
+class RouteSearchOptions:
+    """Reproducible bounds for a qualifying Route search."""
+
+    attempts: int = 100
+    seed: int = 0
+    min_steps: int = 1
+    max_steps: int = 8
+    cascade: bool = True
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempts, bool) or not isinstance(self.attempts, int) or self.attempts <= 0:
+            raise ValueError("Search attempts must be a positive integer")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError("Search seed must be an integer")
+        if isinstance(self.min_steps, bool) or not isinstance(self.min_steps, int) or self.min_steps < 0:
+            raise ValueError("Minimum search steps must be a non-negative integer")
+        if isinstance(self.max_steps, bool) or not isinstance(self.max_steps, int) or self.max_steps < self.min_steps:
+            raise ValueError("Maximum search steps must be at least the minimum")
+        if self.max_steps >= ROWS * COLS:
+            raise ValueError("Search routes cannot visit more than one Board cell each")
+
+
+@dataclass(frozen=True)
+class RouteSearchResult:
+    qualifying_candidate: RouteEvaluation | None
+    diagnostic_candidate: RouteEvaluation | None
+    attempts: int
+    seed: int
+
+    @property
+    def candidate(self) -> RouteEvaluation | None:
+        return self.qualifying_candidate or self.diagnostic_candidate
+
+    @property
+    def route_evaluation(self) -> RouteEvaluation | None:
+        return self.candidate
+
+    @property
+    def qualifying(self) -> bool:
+        return self.qualifying_candidate is not None
+
+    @property
+    def diagnostic(self) -> str:
+        return self.candidate.diagnostic if self.candidate else "No Route candidates were evaluated"
+
+
+def search_qualifying_route(
+    board: tuple[tuple[object, ...], ...], profile: RuleProfile,
+    options: RouteSearchOptions | None = None, confirmed: bool = False,
+) -> RouteSearchResult:
+    """Search seeded Route candidates, returning the best qualifier or diagnosis."""
+    if options is None:
+        options = RouteSearchOptions()
+    if not isinstance(options, RouteSearchOptions):
+        raise TypeError("options must be a RouteSearchOptions")
+    generator = random.Random(options.seed)
+    qualifying: list[RouteEvaluation] = []
+    diagnostic: list[RouteEvaluation] = []
+    # ponytail: seeded random walks cap route coverage; replace with exhaustive/beam search if attempts miss useful Routes.
+    for _attempt in range(options.attempts):
+        target_steps = generator.randint(options.min_steps, options.max_steps)
+        route = [(generator.randrange(ROWS), generator.randrange(COLS))]
+        for _step in range(target_steps):
+            choices = [(route[-1][0] + dr, route[-1][1] + dc) for dr, dc in DIRECTIONS
+                       if 0 <= route[-1][0] + dr < ROWS and 0 <= route[-1][1] + dc < COLS
+                       and (route[-1][0] + dr, route[-1][1] + dc) not in route]
+            if not choices:
+                break
+            route.append(generator.choice(choices))
+        if len(route) - 1 < target_steps:
+            continue
+        result = evaluate_manual_route(board, route, profile, confirmed=confirmed, cascade=options.cascade)
+        (qualifying if result.qualifying else diagnostic).append(result)
+
+    def rank(result: RouteEvaluation) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+        return -result.combo_count, len(result.route) - 1, result.route
+
+    best_qualifying = min(qualifying, key=rank) if qualifying else None
+    best_diagnostic = min(diagnostic, key=rank) if diagnostic else None
+    return RouteSearchResult(best_qualifying, best_diagnostic, options.attempts, options.seed)
 
 
 def _board_cell_key(value: object) -> object:
