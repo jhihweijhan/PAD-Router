@@ -5,7 +5,8 @@ import unittest
 import zlib
 from pathlib import Path
 
-from pad_router import COLS, ROWS, Orb, RouteSearchOptions, RuleProfile
+from pad_router import (COLS, ROWS, ConditionGroup, LeaderCondition, Orb, PlayVerification,
+                        RouteSearchOptions, RuleProfile, expected_board_after_path)
 from pad_router_gui import BoardCalibration, BoardInspectionController, decode_png
 
 
@@ -145,6 +146,86 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertIsNone(state.route_evaluation)
         self.assertFalse(state.route_approved)
         self.assertEqual(state.route_overlay, ())
+
+    def test_execution_requires_final_confirmation_and_reports_post_gesture_board(self):
+        board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        calls = []
+
+        def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
+                    max_corrections, on_verification):
+            calls.append((serial, path, expected_board))
+            actual = expected_board_after_path(expected_board, path)
+            on_verification(PlayVerification(actual, actual, 0, True, "verified"))
+            return True
+
+        controller = BoardInspectionController(
+            detector=lambda *args: board, capture=lambda serial: source, executor=execute
+        )
+        controller.capture_device("test-device")
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0), (0, 1)))
+        post_route = expected_board_after_path(board, ((0, 0), (0, 1)))
+
+        with self.assertRaisesRegex(ValueError, "confirmation"):
+            controller.execute_route("test-device")
+        self.assertEqual(calls, [])
+
+        self.assertTrue(controller.execute_route("test-device", explicit_confirmation=True))
+        self.assertEqual(calls[0][0], "test-device")
+        self.assertEqual(calls[0][1], ((0, 0), (0, 1)))
+        self.assertEqual(calls[0][2], board)
+        self.assertEqual(controller.state.verification.expected_board, post_route)
+        self.assertEqual(controller.state.verification.mismatches, 0)
+        self.assertIn("verified", controller.state.status.lower())
+        with self.assertRaisesRegex(ValueError, "qualifying Route"):
+            controller.execute_route("test-device", explicit_confirmation=True)
+
+    def test_execution_exposes_actionable_post_gesture_mismatch(self):
+        board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
+        actual = tuple(tuple(Orb("normal", (r + c + 1) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        def execute(*args, on_verification):
+            expected = args[6]
+            on_verification(PlayVerification(expected, actual, 2, False, "post_gesture_mismatch"))
+            return False
+
+        controller = BoardInspectionController(
+            detector=lambda *args: board, capture=lambda serial: source, executor=execute
+        )
+        controller.capture_device("test-device")
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0),))
+
+        self.assertFalse(controller.execute_route("test-device", explicit_confirmation=True))
+        self.assertEqual(controller.state.verification.detected_board, actual)
+        self.assertEqual(controller.state.verification.mismatches, 2)
+        self.assertIn("2 mismatch", controller.state.status)
+        self.assertIn("Capture", controller.state.status)
+
+    def test_non_qualifying_candidate_cannot_execute(self):
+        board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        calls = []
+        profile = RuleProfile("blocked", condition_groups=(ConditionGroup.all_of((
+            LeaderCondition.combo_minimum(99),
+        )),))
+        controller = BoardInspectionController(
+            detector=lambda *args: board, capture=lambda serial: source,
+            executor=lambda *args, **kwargs: calls.append(args),
+        )
+        controller.capture_device("test-device")
+        controller.set_rule_profile(profile)
+        controller.confirm_board()
+        result = controller.evaluate_manual_route(((0, 0),))
+
+        self.assertFalse(result.qualifying)
+        with self.assertRaisesRegex(ValueError, "qualifying Route"):
+            controller.execute_route("test-device", explicit_confirmation=True)
+        self.assertEqual(calls, [])
 
 
 class BoardCalibrationTests(unittest.TestCase):

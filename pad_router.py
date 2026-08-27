@@ -17,7 +17,7 @@ import subprocess
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 ROWS, COLS = 5, 6
@@ -1129,6 +1129,17 @@ def send_moves(serial: str, points: Iterable[tuple[int, int]], delay: float) -> 
         subprocess.run(["adb", "-s", serial, "shell", f"sh -c {shlex.quote(script)}"], check=True)
 
 
+@dataclass(frozen=True)
+class PlayVerification:
+    """The board comparison produced by the safe gesture flow."""
+
+    expected_board: tuple[tuple[object, ...], ...] | None
+    detected_board: tuple[tuple[object, ...], ...] | None
+    mismatches: int | None
+    success: bool
+    status: str
+
+
 def play(
     serial: str,
     path: Iterable[tuple[int, int]] | None,
@@ -1145,8 +1156,23 @@ def play(
     min_steps: int = 5,
     max_steps: int = 25,
     cascade: bool = True,
+    on_verification: Callable[[PlayVerification], None] | None = None,
 ) -> bool:
     path = tuple(path or ())
+
+    def report_verification(status: str, current=None, mismatches: int | None = None,
+                            success: bool = False, expected=None) -> None:
+        if on_verification is None:
+            return
+        try:
+            on_verification(PlayVerification(
+                expected if expected is not None else expected_board,
+                current, mismatches, success, status,
+            ))
+        except Exception:
+            # A status consumer must never change the gesture safety outcome.
+            pass
+
     scan = blind_scan_path() if blind_scan else ()
     if blind_scan:
         path = scan
@@ -1172,6 +1198,7 @@ def play(
         change = cell_visual_change(baseline, held, points[0])
         if change < lift_threshold:
             print(f"Start orb hold not verified (cell RGB change {change:.1f} < {lift_threshold:.1f})")
+            report_verification("hold_not_verified")
             return False
 
         if blind_scan:
@@ -1181,6 +1208,7 @@ def play(
             expected_board = detect_board(serial, grid)
             if not _board_is_routeable(expected_board):
                 print("Blind scan did not reveal a complete board; releasing")
+                report_verification("blind_scan_board_uncertain", expected_board)
                 return False
             solution = solve(expected_board, beam_width, min_steps, max_steps, cascade,
                              starts=(cursor_cell,))
@@ -1197,10 +1225,12 @@ def play(
             current = detect_board(serial, grid)
             if not _board_is_routeable(current):
                 print("Final board verification uncertain; releasing without correction")
+                report_verification("post_gesture_board_uncertain", current, expected=expected)
                 return False
             mismatches = board_mismatch_count(current, expected)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"Final board verification failed: {exc}")
+            report_verification(f"post_gesture_verification_failed: {exc}", expected=expected)
             return False
 
         corrections = 0
@@ -1208,6 +1238,8 @@ def play(
             target = corrective_move(current, expected, cursor_cell)
             if target is None:
                 print(f"Final board mismatch ({mismatches} cells); no safe correction found")
+                report_verification("post_gesture_mismatch_no_safe_correction", current, mismatches,
+                                    expected=expected)
                 return False
             send_motion(serial, "MOVE", grid.point(*target))
             cursor = grid.point(*target)
@@ -1218,21 +1250,26 @@ def play(
                 current = detect_board(serial, grid)
                 if not _board_is_routeable(current):
                     print("Board correction verification uncertain; releasing")
+                    report_verification("board_correction_verification_uncertain", current, expected=expected)
                     return False
                 mismatches = board_mismatch_count(current, expected)
             except (OSError, RuntimeError, ValueError) as exc:
                 print(f"Board correction verification failed: {exc}")
+                report_verification(f"board_correction_verification_failed: {exc}", expected=expected)
                 return False
 
         if mismatches:
             print(f"Final board mismatch ({mismatches} cells) after {corrections} corrections")
+            report_verification("post_gesture_mismatch", current, mismatches, expected=expected)
             return False
         send_motion(serial, "UP", cursor)
         down = False
         print(f"Final board verified ({corrections} corrections)")
+        report_verification("verified", current, 0, True, expected)
         return True
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Gesture failed before final board verification: {exc}")
+        report_verification(f"gesture_failed: {exc}")
         return False
     finally:
         if down:

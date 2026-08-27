@@ -26,6 +26,7 @@ from pad_router import (
     ROWS,
     Grid,
     Orb,
+    PlayVerification,
     RouteEvaluation,
     RouteSearchOptions,
     RouteSearchResult,
@@ -35,6 +36,7 @@ from pad_router import (
     load_rule_profile,
     orb_display,
     orb_match_key,
+    play,
     search_qualifying_route,
     save_rule_profile,
     screenshot,
@@ -45,6 +47,7 @@ Screenshot = tuple[int, int, bytes]
 Board = tuple[tuple[object, ...], ...]
 Detector = Callable[[int, int, bytes, Grid], Board]
 Capture = Callable[[str], Screenshot]
+Executor = Callable[..., bool | PlayVerification]
 
 
 @dataclass(frozen=True)
@@ -258,6 +261,7 @@ class BoardInspectionState:
     rule_profile: RuleProfile | None = None
     route_evaluation: RouteEvaluation | None = None
     route_approved: bool = False
+    verification: PlayVerification | None = None
     route_search: RouteSearchResult | None = None
     route_overlay: tuple[dict[str, object], ...] = ()
     search_options: RouteSearchOptions | None = None
@@ -274,9 +278,11 @@ class BoardInspectionState:
 class BoardInspectionController:
     """Public board inspection seam used by the GUI and standard-library tests."""
 
-    def __init__(self, detector: Detector = detect_board_pixels, capture: Capture = screenshot):
+    def __init__(self, detector: Detector = detect_board_pixels, capture: Capture = screenshot,
+                 executor: Executor = play):
         self._detector = detector
         self._capture = capture
+        self._executor = executor
         self.state = BoardInspectionState()
 
     def _with_source(self, source: Screenshot, source_name: str) -> BoardInspectionState:
@@ -363,7 +369,7 @@ class BoardInspectionController:
         board[row][col] = _coerce_orb(value)
         updated = replace(self.state, board=tuple(map(tuple, board)), confirmed_board=None,
                           confirmed=False, uncertain_cells=_uncertain_cells(tuple(map(tuple, board))),
-                          overlay=(), route_evaluation=None, route_approved=False,
+                          overlay=(), route_evaluation=None, route_approved=False, verification=None,
                           route_search=None, route_overlay=(), search_options=None,
                           status="Cell corrected; review and confirm the Board")
         self.state = self._with_overlay(updated)
@@ -375,7 +381,7 @@ class BoardInspectionController:
         if self.state.uncertain_cells:
             raise ValueError("Uncertain cells require manual correction before confirmation")
         self.state = replace(self.state, confirmed_board=self.state.board, confirmed=True,
-                             uncertain_cells=(), route_evaluation=None, route_approved=False,
+                             uncertain_cells=(), route_evaluation=None, route_approved=False, verification=None,
                              route_search=None, route_overlay=(), search_options=None,
                              status="Board confirmed")
         return self.state.board
@@ -384,7 +390,7 @@ class BoardInspectionController:
         if not isinstance(profile, RuleProfile):
             raise TypeError("profile must be a RuleProfile")
         self.state = replace(self.state, rule_profile=profile, route_evaluation=None,
-                             route_approved=False, route_search=None, route_overlay=(), search_options=None,
+                             route_approved=False, verification=None, route_search=None, route_overlay=(), search_options=None,
                              status=f"Rule Profile applied: {profile.name}")
         return self.state
 
@@ -407,6 +413,7 @@ class BoardInspectionController:
             raise ValueError("Apply a Rule Profile before evaluating a Route")
         result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed)
         self.state = replace(self.state, route_evaluation=result, route_approved=False,
+                             verification=None,
                              route_search=None, route_overlay=self._route_overlay(result), search_options=None,
                              status=result.diagnostic)
         return result
@@ -422,7 +429,7 @@ class BoardInspectionController:
         result = search_qualifying_route(board, profile, options, confirmed=self.state.confirmed)
         candidate = result.candidate
         self.state = replace(self.state, route_search=result, route_evaluation=candidate,
-                             route_approved=False, route_overlay=self._route_overlay(candidate),
+                             route_approved=False, verification=None, route_overlay=self._route_overlay(candidate),
                              search_options=options, status=result.diagnostic)
         return result
 
@@ -431,7 +438,7 @@ class BoardInspectionController:
 
     def invalidate_route(self, status: str = "Route invalidated; review inputs before searching again") -> BoardInspectionState:
         self.state = replace(self.state, route_search=None, route_evaluation=None,
-                             route_approved=False, route_overlay=(), search_options=None,
+                             route_approved=False, verification=None, route_overlay=(), search_options=None,
                              status=status)
         return self.state
 
@@ -443,6 +450,67 @@ class BoardInspectionController:
             raise ValueError("Explicit Route confirmation is required")
         self.state = replace(self.state, route_approved=True, status="Route approved")
         return result
+
+    def execute_route(self, serial: str, explicit_confirmation: bool = False,
+                      delay: float = 0.04, hold_delay: float = 0.15,
+                      lift_threshold: float = 12.0, max_corrections: int = 2) -> bool:
+        result = self.state.route_evaluation
+        if (result is None or self.state.confirmed_board is None
+                or not self.state.confirmed or not result.execution_eligible):
+            raise ValueError("Only a qualifying Route on a confirmed Board can be executed")
+        if not explicit_confirmation and not self.state.route_approved:
+            raise ValueError("Explicit Route confirmation is required")
+        serial = serial.strip()
+        if not serial:
+            raise ValueError("A device serial is required")
+        calibration = self.state.calibration
+        if calibration is None:
+            raise ValueError("Board calibration is required before execution")
+        if explicit_confirmation:
+            self.approve_route(explicit_confirmation=True)
+        self.state = replace(self.state, verification=None,
+                             status="Executing Route; safe ADB verification in progress")
+        verification: PlayVerification | None = None
+
+        def receive(report: PlayVerification) -> None:
+            nonlocal verification
+            verification = report
+
+        outcome = self._executor(
+            serial, result.route, calibration.to_grid(), delay, hold_delay, lift_threshold,
+            self.state.confirmed_board, max_corrections, on_verification=receive,
+        )
+        if isinstance(outcome, PlayVerification):
+            verification = outcome
+            succeeded = outcome.success
+        else:
+            succeeded = bool(outcome)
+        if verification is None:
+            verification = PlayVerification(
+                result.expected_board, None, None, succeeded,
+                "executor_result" if succeeded else "verification_unavailable",
+            )
+        succeeded = succeeded and verification.success
+        if not succeeded and verification.success:
+            verification = replace(verification, success=False, status="gesture_failed")
+        if succeeded:
+            status = ("Gesture sent; post-gesture Board verified (0 mismatches). "
+                      "Capture a new Board before another Route."
+                      if verification.detected_board is not None else
+                      "Gesture sent; safe ADB flow completed, but no post-gesture Board comparison was reported. "
+                      "Capture a fresh Board before another Route.")
+        elif verification.detected_board is None:
+            status = (f"Gesture released safely; {verification.status}. "
+                      "No post-gesture Board was available. Capture a fresh Board and retry.")
+        else:
+            mismatch = (f"{verification.mismatches} mismatch(es)"
+                        if verification.mismatches is not None else "an uncertain comparison")
+            status = (f"Gesture released safely; post-gesture Board verification failed ({mismatch}). "
+                      "Capture a fresh Board and retry.")
+        self.state = replace(self.state, verification=verification, route_approved=False,
+                             route_search=None, route_evaluation=None, route_overlay=(),
+                             search_options=None, status=status)
+        return succeeded
 
 
 def _photo_from_screenshot(screenshot_data: Screenshot, tk_module):
@@ -491,6 +559,7 @@ class BoardInspectionApp:
         self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="No Rule Profile")
         self._evaluation = tk.StringVar(value="No Route evaluated")
+        self._verification = tk.StringVar(value="No post-gesture verification")
         self._status = tk.StringVar(value=self.controller.state.status)
         self._build()
 
@@ -533,6 +602,9 @@ class BoardInspectionApp:
         ttk.Checkbutton(board_frame, text="Locked", variable=self._locked).pack(anchor="w")
         ttk.Button(board_frame, text="Correct selected cell", command=self.correct_selected).pack(fill="x", pady=4)
         ttk.Button(board_frame, text="Confirm Board", command=self.confirm_board).pack(fill="x")
+        self._execute_button = ttk.Button(board_frame, text="Execute Route", command=self.execute_route,
+                                          state="disabled")
+        self._execute_button.pack(fill="x", pady=(4, 0))
         profile_frame = ttk.LabelFrame(board_frame, text="Rule Profile", padding=6)
         profile_frame.pack(fill="x", pady=(10, 0))
         ttk.Label(profile_frame, text="Name:").pack(anchor="w")
@@ -566,6 +638,7 @@ class BoardInspectionApp:
         ttk.Button(profile_buttons, text="Load JSON", command=self.load_profile).pack(side="left", expand=True, fill="x")
         ttk.Button(profile_buttons, text="Save JSON", command=self.save_profile).pack(side="left", expand=True, fill="x", padx=(2, 0))
         ttk.Label(board_frame, textvariable=self._evaluation, wraplength=370, justify="left").pack(anchor="w", pady=(10, 0))
+        ttk.Label(board_frame, textvariable=self._verification, wraplength=370, justify="left").pack(anchor="w", pady=(8, 0))
         ttk.Label(self.root, textvariable=self._status, anchor="w", relief="sunken").pack(fill="x", side="bottom")
 
     def _show_error(self, message: str):
@@ -594,6 +667,23 @@ class BoardInspectionApp:
                 f"Qualifying: {'yes' if result.qualifying else 'no'} | "
                 f"Execution: {'yes' if result.execution_eligible else 'no'}\n{result.diagnostic}")
 
+    @staticmethod
+    def _format_board(board) -> str:
+        if board is None:
+            return "unavailable"
+        return "/".join(" ".join(orb_display(orb) for orb in row) for row in board)
+
+    @classmethod
+    def _format_verification(cls, verification: PlayVerification | None) -> str:
+        if verification is None:
+            return "No post-gesture verification"
+        mismatches = ("unknown" if verification.mismatches is None
+                      else str(verification.mismatches))
+        return (f"Post-gesture verification: {'success' if verification.success else 'failed'} "
+                f"({mismatches} mismatch(es); {verification.status})\n"
+                f"Expected: {cls._format_board(verification.expected_board)}\n"
+                f"Detected: {cls._format_board(verification.detected_board)}")
+
     def _display(self, state: BoardInspectionState):
         self._status.set(state.status)
         if state.rule_profile is not None:
@@ -612,6 +702,10 @@ class BoardInspectionApp:
             self._search_seed.set(str(state.search_options.seed))
         result = state.route_evaluation
         self._evaluation.set(self._format_evaluation(result))
+        self._verification.set(self._format_verification(state.verification))
+        self._execute_button.configure(
+            state="normal" if result is not None and result.execution_eligible else "disabled"
+        )
         if state.calibration:
             self._left.set(str(state.calibration.left))
             self._top.set(str(state.calibration.top))
@@ -758,6 +852,28 @@ class BoardInspectionApp:
             self._display(self.controller.state)
         except ValueError as exc:
             self._show_error(str(exc))
+
+    def execute_route(self):
+        from tkinter import messagebox
+        state = self.controller.state
+        if state.route_evaluation is None or not state.route_evaluation.execution_eligible:
+            self._show_error("Only a qualifying Route on a confirmed Board can be executed")
+            return
+        if not self._serial.get().strip():
+            self._show_error("A device serial is required")
+            return
+        if not messagebox.askyesno(
+                "Confirm Route",
+                "Send this Route to the device and verify the post-gesture Board?",
+                parent=self.root):
+            return
+
+        def execute():
+            self.controller.execute_route(self._serial.get(), explicit_confirmation=True)
+            self._manual_route.clear()
+            return self.controller.state
+
+        self._apply(execute)
 
     def create_profile(self):
         try:
