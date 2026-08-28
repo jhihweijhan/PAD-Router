@@ -4,11 +4,12 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 from pad_router import (COLS, ROWS, ConditionGroup, LeaderCondition, Orb, PlayVerification,
                         RouteSearchOptions, RuleProfile, expected_board_after_path)
-from pad_router_gui import (_photo_from_screenshot, BoardCalibration, BoardInspectionController, decode_png,
-                            rule_profile_from_selections)
+from pad_router_gui import (_photo_from_screenshot, BoardCalibration, BoardInspectionApp,
+                            BoardInspectionController, decode_png, rule_profile_from_selections)
 
 
 def png_bytes(width=12, height=10):
@@ -236,6 +237,23 @@ class BoardCalibrationTests(unittest.TestCase):
             BoardCalibration(1, 0, 1).validate(6, 5)
         with self.assertRaises(ValueError):
             BoardCalibration(0, 0, 0).validate(6, 5)
+
+
+class SearchButtonTests(unittest.TestCase):
+    def test_search_button_displays_controller_state_not_search_result(self):
+        state = object()
+        result = object()
+        app = object.__new__(BoardInspectionApp)
+        app.controller = SimpleNamespace(state=state, search_qualifying_route=lambda options: result)
+        app._manual_route = []
+        app._search_attempts = SimpleNamespace(get=lambda: "5")
+        app._search_seed = SimpleNamespace(get=lambda: "0")
+        displayed = []
+        app._apply = lambda action: displayed.append(action())
+
+        app.search_route()
+
+        self.assertIs(displayed[0], state)
 
 
 class ScreenshotPhotoTests(unittest.TestCase):

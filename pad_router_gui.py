@@ -623,7 +623,7 @@ class BoardInspectionApp:
         self._condition_operator = tk.StringVar(value="全部符合")
         self._hazard_policy = tk.StringVar(value="避免危害珠")
         self._external_condition = tk.StringVar(value="無")
-        self._search_attempts = tk.StringVar(value="100")
+        self._search_attempts = tk.StringVar(value="50")
         self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="尚未建立規則設定")
         self._evaluation = tk.StringVar(value="尚未評估路徑")
@@ -694,7 +694,8 @@ class BoardInspectionApp:
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
         ttk.Label(search_controls, text="嘗試次數：").pack(side="left")
-        ttk.Combobox(search_controls, textvariable=self._search_attempts, values=("50", "100", "300", "1000"),
+        ttk.Combobox(search_controls, textvariable=self._search_attempts,
+                     values=tuple(str(value) for value in range(5, 51, 5)),
                      state="readonly", width=7).pack(side="left", padx=(2, 6))
         ttk.Label(search_controls, text="隨機種子：").pack(side="left")
         ttk.Combobox(search_controls, textvariable=self._search_seed, values=("0", "1", "42", "2026"),
@@ -966,9 +967,14 @@ class BoardInspectionApp:
 
     def search_route(self):
         self._manual_route.clear()
-        self._apply(lambda: self.controller.search_qualifying_route(
-            RouteSearchOptions(attempts=int(self._search_attempts.get()), seed=int(self._search_seed.get()))
-        ))
+
+        def search():
+            self.controller.search_qualifying_route(
+                RouteSearchOptions(attempts=int(self._search_attempts.get()), seed=int(self._search_seed.get()))
+            )
+            return self.controller.state
+
+        self._apply(search)
 
     def _search_settings_changed(self, *_):
         state = self.controller.state
