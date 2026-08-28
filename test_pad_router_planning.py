@@ -138,6 +138,15 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertTrue(evaluate_manual_route(fire_row, ((4, 5),), profile, confirmed=True).qualifying)
         self.assertFalse(evaluate_manual_route(water_row, ((4, 5),), profile, confirmed=True).qualifying)
 
+    def test_full_row_condition_allows_connected_extra_orbs(self):
+        board = ((1,) * COLS, (1, 3, 4, 5, 6, 2),
+                 (2, 3, 4, 5, 6, 2), (3, 4, 5, 6, 2, 3), (4, 5, 6, 2, 3, 4))
+        profile = RuleProfile("火一橫列", (ConditionGroup.all_of((
+            LeaderCondition.shape("full_row", orb_type="fire"),
+        )),))
+
+        self.assertTrue(evaluate_manual_route(board, ((4, 5),), profile, confirmed=True).qualifying)
+
     def test_cascade_timing_is_visible_and_condition_can_exclude_cascades(self):
         board = ((3, 2, 2, 3, 2, 1), (1, 2, 1, 3, 3, 1),
                  (2, 3, 1, 2, 3, 3), (3, 1, 1, 2, 3, 4),

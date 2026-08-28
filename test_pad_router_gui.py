@@ -256,6 +256,22 @@ class SearchButtonTests(unittest.TestCase):
         self.assertIs(displayed[0], state)
 
 
+class ManualRouteButtonTests(unittest.TestCase):
+    def test_manual_route_button_displays_controller_state_not_evaluation(self):
+        state = SimpleNamespace(board=object(), rule_profile=object())
+        result = object()
+        app = object.__new__(BoardInspectionApp)
+        app.controller = SimpleNamespace(state=state, evaluate_manual_route=lambda route: result)
+        app._manual_route = [(0, 0)]
+        app._dragging_route = True
+        displayed = []
+        app._apply = lambda action: displayed.append(action())
+
+        app.route_release(None)
+
+        self.assertIs(displayed[0], state)
+
+
 class ScreenshotPhotoTests(unittest.TestCase):
     def test_bgra_screenshot_loads_in_tk(self):
         import tkinter as tk

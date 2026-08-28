@@ -574,7 +574,7 @@ def _shape_matches(cells: tuple[tuple[int, int], ...], shape: str) -> bool:
     rows = {row for row, _ in points}
     cols = {col for _, col in points}
     if shape in {"full_row", "row_6", "six_row"}:
-        return len(rows) == 1 and len(points) == COLS and len(cols) == COLS
+        return any({(row, col) for col in range(COLS)} <= points for row in range(ROWS))
     if shape in {"row", "horizontal"}:
         return len(rows) == 1 and len(points) >= 3 and len({col for _, col in points}) == max(cols) - min(cols) + 1
     if shape in {"column", "vertical"}:

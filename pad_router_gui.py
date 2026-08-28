@@ -921,7 +921,11 @@ class BoardInspectionApp:
         self._dragging_route = False
         state = self.controller.state
         if state.board is not None and state.rule_profile is not None:
-            self._apply(lambda: self.controller.evaluate_manual_route(tuple(self._manual_route)))
+            def evaluate():
+                self.controller.evaluate_manual_route(tuple(self._manual_route))
+                return self.controller.state
+
+            self._apply(evaluate)
         else:
             self._display(state)
         return "break"
