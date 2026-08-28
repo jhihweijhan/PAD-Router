@@ -693,6 +693,14 @@ def evaluate_manual_route(
     if any(abs(first[0] - second[0]) + abs(first[1] - second[1]) != 1 for first, second in zip(route, route[1:])):
         raise ValueError("Route points must be adjacent Board cells")
     expected = expected_board_after_path(board, route)
+    return _evaluate_expected_route(route, expected, profile, confirmed, cascade)
+
+
+def _evaluate_expected_route(
+    route: tuple[tuple[int, int], ...], expected: tuple[tuple[object, ...], ...],
+    profile: RuleProfile, confirmed: bool, cascade: bool,
+) -> RouteEvaluation:
+    """Evaluate a validated Route when its final Board is already available."""
     rounds, _remaining = _resolve_rounds(expected, cascade)
     group_results: list[ConditionGroupResult] = []
     condition_results: list[ConditionResult] = []
@@ -806,8 +814,20 @@ def search_qualifying_route(
     if not isinstance(options, RouteSearchOptions):
         raise TypeError("options must be a RouteSearchOptions")
     generator = random.Random(options.seed)
-    qualifying: list[RouteEvaluation] = []
-    diagnostic: list[RouteEvaluation] = []
+    def rank(result: RouteEvaluation) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+        return -result.combo_count, len(result.route) - 1, result.route
+
+    best_qualifying: RouteEvaluation | None = None
+    best_diagnostic: RouteEvaluation | None = None
+
+    def record(result: RouteEvaluation) -> None:
+        nonlocal best_qualifying, best_diagnostic
+        if result.qualifying:
+            if best_qualifying is None or rank(result) < rank(best_qualifying):
+                best_qualifying = result
+        elif best_diagnostic is None or rank(result) < rank(best_diagnostic):
+            best_diagnostic = result
+
     for _attempt in range(options.attempts):
         target_steps = generator.randint(options.min_steps, options.max_steps)
         route = [(generator.randrange(ROWS), generator.randrange(COLS))]
@@ -820,17 +840,16 @@ def search_qualifying_route(
                 break
             route.append(generator.choice(choices))
         result = evaluate_manual_route(board, route, profile, confirmed=confirmed, cascade=options.cascade)
-        (qualifying if result.qualifying else diagnostic).append(result)
+        record(result)
 
     if profile.condition_groups:
-        beam_width = max(ROWS * COLS, options.attempts * 12)
+        beam_width = max(ROWS * COLS, options.attempts * 24)
         starts = [(row, col) for row in range(ROWS) for col in range(COLS)]
         generator.shuffle(starts)
-        initial_score, initial_combos = score(board, options.cascade)
-        beam = [Node(-initial_score, board, start, (start,), initial_combos)
-                for start in starts]
+        beam = [Node(0, board, start, (start,), 0) for start in starts]
         for depth in range(1, options.max_steps + 1):
-            candidates: list[tuple[tuple[object, ...], Node, RouteEvaluation]] = []
+            candidates: dict[tuple[object, tuple[int, int], tuple[int, int]],
+                             tuple[tuple[object, ...], tuple[object, ...], Node, RouteEvaluation]] = {}
             for node in beam:
                 previous = node.path[-2] if len(node.path) > 1 else None
                 for dr, dc in DIRECTIONS:
@@ -839,10 +858,11 @@ def search_qualifying_route(
                             or next_cursor == previous):
                         continue
                     next_board = moved(node.board, node.cursor, next_cursor)
-                    next_score, combos = score(next_board, options.cascade)
-                    next_node = Node(-next_score, next_board, next_cursor, node.path + (next_cursor,), combos)
-                    result = evaluate_manual_route(board, next_node.path, profile,
-                                                   confirmed=confirmed, cascade=options.cascade)
+                    next_node = Node(0, next_board, next_cursor, node.path + (next_cursor,), 0)
+                    result = _evaluate_expected_route(next_node.path, next_board, profile,
+                                                      confirmed, options.cascade)
+                    next_node = Node(-result.combo_count, next_board, next_cursor,
+                                     next_node.path, result.combo_count)
                     group_count = sum(group.satisfied for group in result.group_results)
                     condition_count = sum(item.satisfied for item in result.condition_results
                                           if not item.identifier.startswith("external:"))
@@ -852,22 +872,34 @@ def search_qualifying_route(
                     row_distances = (_full_row_target_distance(next_board, item.condition)
                                      for item in result.condition_results if item.condition.kind == "shape")
                     row_distance = min((distance for distance in row_distances if distance is not None), default=0)
-                    candidates.append(((-int(result.team_condition_satisfied), -group_count,
-                                        -condition_count, row_distance, -shape_progress, -result.combo_count,
-                                        next_node.priority, next_node.path), next_node, result))
+                    condition_rank = (-int(result.team_condition_satisfied), -group_count,
+                                      -condition_count, row_distance, -shape_progress, -result.combo_count,
+                                      next_node.path)
+                    combo_rank = (-result.combo_count, -int(result.team_condition_satisfied),
+                                  row_distance, -shape_progress, -group_count, -condition_count,
+                                  next_node.path)
+                    key = next_board, next_cursor, node.cursor
+                    previous_candidate = candidates.get(key)
+                    if previous_candidate is None or condition_rank < previous_candidate[0]:
+                        candidates[key] = condition_rank, combo_rank, next_node, result
             if not candidates:
                 break
-            candidates.sort(key=lambda item: item[0])
-            beam = [node for _rank, node, _result in candidates[:beam_width]]
+            values = tuple(candidates.values())
+            condition_first = sorted(values, key=lambda item: item[0])
+            combo_first = sorted(values, key=lambda item: item[1])
+            selected = condition_first[:beam_width // 2]
+            selected_keys = {(item[2].board, item[2].cursor, item[2].path[-2]) for item in selected}
+            for item in combo_first:
+                key = item[2].board, item[2].cursor, item[2].path[-2]
+                if key not in selected_keys:
+                    selected.append(item)
+                    selected_keys.add(key)
+                    if len(selected) == beam_width:
+                        break
+            beam = [node for _condition_rank, _combo_rank, node, _result in selected]
             if depth >= max(1, options.min_steps):
-                for _rank, _node, result in candidates[:beam_width]:
-                    (qualifying if result.qualifying else diagnostic).append(result)
-
-    def rank(result: RouteEvaluation) -> tuple[int, int, tuple[tuple[int, int], ...]]:
-        return -result.combo_count, len(result.route) - 1, result.route
-
-    best_qualifying = min(qualifying, key=rank) if qualifying else None
-    best_diagnostic = min(diagnostic, key=rank) if diagnostic else None
+                for _condition_rank, _combo_rank, _node, result in selected:
+                    record(result)
     return RouteSearchResult(best_qualifying, best_diagnostic, options.attempts, options.seed)
 
 

@@ -250,6 +250,7 @@ class SearchButtonTests(unittest.TestCase):
         app._search_attempts = SimpleNamespace(get=lambda: "5")
         app._search_steps = SimpleNamespace(get=lambda: "50")
         app._search_seed = SimpleNamespace(get=lambda: "0")
+        app._cascade = SimpleNamespace(get=lambda: "只計轉珠直接消除")
         displayed = []
         app._apply = lambda action: displayed.append(action())
 
@@ -257,22 +258,27 @@ class SearchButtonTests(unittest.TestCase):
 
         self.assertIs(displayed[0], state)
         self.assertEqual(received[0].max_steps, 50)
+        self.assertFalse(received[0].cascade)
 
 
 class ManualRouteButtonTests(unittest.TestCase):
     def test_manual_route_button_displays_controller_state_not_evaluation(self):
         state = SimpleNamespace(board=object(), rule_profile=object())
         result = object()
+        received = []
         app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=state, evaluate_manual_route=lambda route: result)
+        app.controller = SimpleNamespace(
+            state=state, evaluate_manual_route=lambda route, cascade=True: received.append(cascade) or result)
         app._manual_route = [(0, 0)]
         app._dragging_route = True
+        app._cascade = SimpleNamespace(get=lambda: "只計轉珠直接消除")
         displayed = []
         app._apply = lambda action: displayed.append(action())
 
         app.route_release(None)
 
         self.assertIs(displayed[0], state)
+        self.assertEqual(received, [False])
 
 
 class ScreenshotPhotoTests(unittest.TestCase):

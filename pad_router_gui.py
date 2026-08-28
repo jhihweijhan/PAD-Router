@@ -92,6 +92,7 @@ EXTERNAL_CONDITIONS = {
     "技能條件已確認": (ExternalCondition("技能條件", confirmed=True),),
     "技能條件未確認": (ExternalCondition("技能條件", confirmed=False),),
 }
+CASCADE_OPTIONS = {"計入落珠連鎖": True, "只計轉珠直接消除": False}
 
 
 def rule_profile_from_selections(condition_selections: Iterable[tuple[str, str] | str], operator_label: str,
@@ -472,14 +473,14 @@ class BoardInspectionController:
         return self.set_rule_profile(load_rule_profile(path))
 
     def evaluate_manual_route(self, path: Iterable[tuple[int, int]],
-                               profile: RuleProfile | None = None) -> RouteEvaluation:
+                               profile: RuleProfile | None = None, cascade: bool = True) -> RouteEvaluation:
         board = self.state.confirmed_board or self.state.board
         if board is None:
             raise ValueError("請先載入並確認盤面，再評估路徑")
         profile = profile or self.state.rule_profile
         if profile is None:
             raise ValueError("請先套用規則設定，再評估路徑")
-        result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed)
+        result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed, cascade=cascade)
         self.state = replace(self.state, route_evaluation=result, route_approved=False,
                              verification=None,
                              route_search=None, route_overlay=self._route_overlay(result), search_options=None,
@@ -626,6 +627,7 @@ class BoardInspectionApp:
         self._search_attempts = tk.StringVar(value="50")
         self._search_steps = tk.StringVar(value="50")
         self._search_seed = tk.StringVar(value="0")
+        self._cascade = tk.StringVar(value="計入落珠連鎖")
         self._profile_label = tk.StringVar(value="尚未建立規則設定")
         self._evaluation = tk.StringVar(value="尚未評估路徑")
         self._verification = tk.StringVar(value="尚無手勢後驗證結果")
@@ -697,6 +699,9 @@ class BoardInspectionApp:
         ttk.Label(profile_frame, text="外部條件：").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._external_condition, values=tuple(EXTERNAL_CONDITIONS),
                      state="readonly", width=18).pack(fill="x")
+        ttk.Label(profile_frame, text="消珠結算：").pack(anchor="w", pady=(4, 0))
+        ttk.Combobox(profile_frame, textvariable=self._cascade, values=tuple(CASCADE_OPTIONS),
+                     state="readonly", width=18).pack(fill="x")
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
         ttk.Label(search_controls, text="嘗試次數：").pack(side="left")
@@ -713,6 +718,7 @@ class BoardInspectionApp:
         self._search_attempts.trace_add("write", self._search_settings_changed)
         self._search_steps.trace_add("write", self._search_settings_changed)
         self._search_seed.trace_add("write", self._search_settings_changed)
+        self._cascade.trace_add("write", self._search_settings_changed)
         ttk.Button(search_controls, text="搜尋", command=self.search_route).pack(side="right")
         ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
         profile_buttons = ttk.Frame(profile_frame)
@@ -791,6 +797,8 @@ class BoardInspectionApp:
             self._search_attempts.set(str(state.search_options.attempts))
             self._search_steps.set(str(state.search_options.max_steps))
             self._search_seed.set(str(state.search_options.seed))
+            self._cascade.set(next(label for label, value in CASCADE_OPTIONS.items()
+                                   if value == state.search_options.cascade))
         result = state.route_evaluation
         self._evaluation.set(self._format_evaluation(result))
         self._verification.set(self._format_verification(state.verification))
@@ -929,7 +937,8 @@ class BoardInspectionApp:
         state = self.controller.state
         if state.board is not None and state.rule_profile is not None:
             def evaluate():
-                self.controller.evaluate_manual_route(tuple(self._manual_route))
+                self.controller.evaluate_manual_route(
+                    tuple(self._manual_route), cascade=CASCADE_OPTIONS[self._cascade.get()])
                 return self.controller.state
 
             self._apply(evaluate)
@@ -998,7 +1007,7 @@ class BoardInspectionApp:
         def search():
             self.controller.search_qualifying_route(
                 RouteSearchOptions(attempts=int(self._search_attempts.get()), max_steps=int(self._search_steps.get()),
-                                   seed=int(self._search_seed.get()))
+                                   seed=int(self._search_seed.get()), cascade=CASCADE_OPTIONS[self._cascade.get()])
             )
             return self.controller.state
 
@@ -1011,7 +1020,8 @@ class BoardInspectionApp:
         try:
             options = RouteSearchOptions(attempts=int(self._search_attempts.get()),
                                          max_steps=int(self._search_steps.get()),
-                                         seed=int(self._search_seed.get()))
+                                         seed=int(self._search_seed.get()),
+                                         cascade=CASCADE_OPTIONS[self._cascade.get()])
         except (TypeError, ValueError):
             options = None
         if options != state.search_options:

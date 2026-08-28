@@ -40,6 +40,30 @@ class RuleProfileTests(unittest.TestCase):
 
 
 class ManualRouteEvaluationTests(unittest.TestCase):
+    def test_dark_row_search_keeps_combo_candidates_after_the_row_is_formed(self):
+        board = (
+            (Orb("normal", 4), Orb("normal", 5, enhanced=True), Orb("normal", 2), Orb("normal", 4), Orb("normal", 1), Orb("normal", 5)),
+            (Orb("normal", 4), Orb("normal", 3), Orb("normal", 1), Orb("normal", 2), Orb("normal", 6), Orb("normal", 5)),
+            (Orb("normal", 6, enhanced=True), Orb("normal", 3), Orb("normal", 6), Orb("normal", 5, enhanced=True), Orb("normal", 2), Orb("normal", 1)),
+            (Orb("normal", 3), Orb("normal", 6), Orb("normal", 4), Orb("normal", 3), Orb("normal", 2, enhanced=True), Orb("normal", 4)),
+            (Orb("normal", 5), Orb("jammer"), Orb("normal", 4), Orb("normal", 3), Orb("normal", 1), Orb("normal", 5)),
+        )
+        profile = RuleProfile(
+            "dark row", (ConditionGroup.all_of((LeaderCondition.shape("full_row", orb_type="dark"),)),),
+            hazard_policy="allow",
+        )
+
+        result = search_qualifying_route(
+            board, profile,
+            RouteSearchOptions(attempts=50, seed=0, min_steps=1, max_steps=100),
+            confirmed=True,
+        )
+
+        self.assertIsNotNone(result.qualifying_candidate)
+        self.assertTrue(result.qualifying_candidate.qualifying)
+        self.assertTrue(result.qualifying_candidate.condition_results[0].satisfied)
+        self.assertGreaterEqual(result.qualifying_candidate.combo_count, 6)
+
     def test_search_gathers_six_scattered_dark_orbs_into_a_full_row(self):
         raw_board = (
             (4, 5, 2, 4, 1, 5),
