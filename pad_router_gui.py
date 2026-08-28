@@ -8,7 +8,6 @@ adapters around the existing PAD Router functions.
 
 from __future__ import annotations
 
-import base64
 import binascii
 import subprocess
 import struct
@@ -591,7 +590,7 @@ def _photo_from_screenshot(screenshot_data: Screenshot, tk_module):
         blue, green, red = pixels[index * 4:index * 4 + 3]
         rgb[index * 3:index * 3 + 3] = bytes((red, green, blue))
     ppm = f"P6\n{width} {height}\n255\n".encode() + bytes(rgb)
-    return tk_module.PhotoImage(data=base64.b64encode(ppm).decode("ascii"))
+    return tk_module.PhotoImage(data=ppm, format="PPM")
 
 
 class BoardInspectionApp:

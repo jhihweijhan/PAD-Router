@@ -7,7 +7,8 @@ from pathlib import Path
 
 from pad_router import (COLS, ROWS, ConditionGroup, LeaderCondition, Orb, PlayVerification,
                         RouteSearchOptions, RuleProfile, expected_board_after_path)
-from pad_router_gui import BoardCalibration, BoardInspectionController, decode_png, rule_profile_from_selections
+from pad_router_gui import (_photo_from_screenshot, BoardCalibration, BoardInspectionController, decode_png,
+                            rule_profile_from_selections)
 
 
 def png_bytes(width=12, height=10):
@@ -235,6 +236,18 @@ class BoardCalibrationTests(unittest.TestCase):
             BoardCalibration(1, 0, 1).validate(6, 5)
         with self.assertRaises(ValueError):
             BoardCalibration(0, 0, 0).validate(6, 5)
+
+
+class ScreenshotPhotoTests(unittest.TestCase):
+    def test_bgra_screenshot_loads_in_tk(self):
+        import tkinter as tk
+
+        root = tk.Tk()
+        try:
+            image = _photo_from_screenshot((1, 1, bytes((60, 40, 20, 255))), tk)
+            self.assertEqual((image.width(), image.height()), (1, 1))
+        finally:
+            root.destroy()
 
 
 class RuleProfileSelectionTests(unittest.TestCase):
