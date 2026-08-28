@@ -243,10 +243,12 @@ class SearchButtonTests(unittest.TestCase):
     def test_search_button_displays_controller_state_not_search_result(self):
         state = object()
         result = object()
+        received = []
         app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=state, search_qualifying_route=lambda options: result)
+        app.controller = SimpleNamespace(state=state, search_qualifying_route=lambda options: received.append(options) or result)
         app._manual_route = []
         app._search_attempts = SimpleNamespace(get=lambda: "5")
+        app._search_steps = SimpleNamespace(get=lambda: "50")
         app._search_seed = SimpleNamespace(get=lambda: "0")
         displayed = []
         app._apply = lambda action: displayed.append(action())
@@ -254,6 +256,7 @@ class SearchButtonTests(unittest.TestCase):
         app.search_route()
 
         self.assertIs(displayed[0], state)
+        self.assertEqual(received[0].max_steps, 50)
 
 
 class ManualRouteButtonTests(unittest.TestCase):

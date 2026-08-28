@@ -757,7 +757,7 @@ class RouteSearchOptions:
     attempts: int = 100
     seed: int = 0
     min_steps: int = 1
-    max_steps: int = 8
+    max_steps: int = 50
     cascade: bool = True
 
     def __post_init__(self) -> None:

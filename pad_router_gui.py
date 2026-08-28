@@ -624,6 +624,7 @@ class BoardInspectionApp:
         self._hazard_policy = tk.StringVar(value="避免危害珠")
         self._external_condition = tk.StringVar(value="無")
         self._search_attempts = tk.StringVar(value="50")
+        self._search_steps = tk.StringVar(value="50")
         self._search_seed = tk.StringVar(value="0")
         self._profile_label = tk.StringVar(value="尚未建立規則設定")
         self._evaluation = tk.StringVar(value="尚未評估路徑")
@@ -702,10 +703,15 @@ class BoardInspectionApp:
         ttk.Combobox(search_controls, textvariable=self._search_attempts,
                      values=tuple(str(value) for value in range(5, 51, 5)),
                      state="readonly", width=7).pack(side="left", padx=(2, 6))
+        ttk.Label(search_controls, text="執行步數上限：").pack(side="left")
+        ttk.Combobox(search_controls, textvariable=self._search_steps,
+                     values=tuple(str(value) for value in range(30, 101, 5)),
+                     state="readonly", width=7).pack(side="left", padx=(2, 6))
         ttk.Label(search_controls, text="隨機種子：").pack(side="left")
         ttk.Combobox(search_controls, textvariable=self._search_seed, values=("0", "1", "42", "2026"),
                      state="readonly", width=7).pack(side="left", padx=2)
         self._search_attempts.trace_add("write", self._search_settings_changed)
+        self._search_steps.trace_add("write", self._search_settings_changed)
         self._search_seed.trace_add("write", self._search_settings_changed)
         ttk.Button(search_controls, text="搜尋", command=self.search_route).pack(side="right")
         ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
@@ -783,6 +789,7 @@ class BoardInspectionApp:
             self._profile_label.set(f"目前設定：{state.rule_profile.name}")
         if state.search_options is not None:
             self._search_attempts.set(str(state.search_options.attempts))
+            self._search_steps.set(str(state.search_options.max_steps))
             self._search_seed.set(str(state.search_options.seed))
         result = state.route_evaluation
         self._evaluation.set(self._format_evaluation(result))
@@ -990,7 +997,8 @@ class BoardInspectionApp:
 
         def search():
             self.controller.search_qualifying_route(
-                RouteSearchOptions(attempts=int(self._search_attempts.get()), seed=int(self._search_seed.get()))
+                RouteSearchOptions(attempts=int(self._search_attempts.get()), max_steps=int(self._search_steps.get()),
+                                   seed=int(self._search_seed.get()))
             )
             return self.controller.state
 
@@ -1002,6 +1010,7 @@ class BoardInspectionApp:
             return
         try:
             options = RouteSearchOptions(attempts=int(self._search_attempts.get()),
+                                         max_steps=int(self._search_steps.get()),
                                          seed=int(self._search_seed.get()))
         except (TypeError, ValueError):
             options = None
