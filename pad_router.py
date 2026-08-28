@@ -807,7 +807,6 @@ def search_qualifying_route(
     generator = random.Random(options.seed)
     qualifying: list[RouteEvaluation] = []
     diagnostic: list[RouteEvaluation] = []
-    # ponytail: seeded random walks cap route coverage; replace with exhaustive/beam search if attempts miss useful Routes.
     for _attempt in range(options.attempts):
         target_steps = generator.randint(options.min_steps, options.max_steps)
         route = [(generator.randrange(ROWS), generator.randrange(COLS))]
@@ -822,12 +821,60 @@ def search_qualifying_route(
         result = evaluate_manual_route(board, route, profile, confirmed=confirmed, cascade=options.cascade)
         (qualifying if result.qualifying else diagnostic).append(result)
 
+    if profile.condition_groups:
+        beam_width = max(ROWS * COLS, options.attempts * 3)
+        starts = [(row, col) for row in range(ROWS) for col in range(COLS)]
+        generator.shuffle(starts)
+        initial_score, initial_combos = score(board, options.cascade)
+        beam = [Node(-initial_score, board, start, (start,), initial_combos)
+                for start in starts]
+        for depth in range(1, options.max_steps + 1):
+            candidates: list[tuple[tuple[object, ...], Node, RouteEvaluation]] = []
+            for node in beam:
+                previous = node.path[-2] if len(node.path) > 1 else None
+                for dr, dc in DIRECTIONS:
+                    next_cursor = node.cursor[0] + dr, node.cursor[1] + dc
+                    if (not (0 <= next_cursor[0] < ROWS and 0 <= next_cursor[1] < COLS)
+                            or next_cursor == previous):
+                        continue
+                    next_board = moved(node.board, node.cursor, next_cursor)
+                    next_score, combos = score(next_board, options.cascade)
+                    next_node = Node(-next_score, next_board, next_cursor, node.path + (next_cursor,), combos)
+                    result = evaluate_manual_route(board, next_node.path, profile,
+                                                   confirmed=confirmed, cascade=options.cascade)
+                    group_count = sum(group.satisfied for group in result.group_results)
+                    condition_count = sum(item.satisfied for item in result.condition_results
+                                          if not item.identifier.startswith("external:"))
+                    shape_progress = max((_shape_search_progress(next_board, item.condition)
+                                          for item in result.condition_results
+                                          if item.condition.kind == "shape"), default=0)
+                    candidates.append(((-int(result.team_condition_satisfied), -group_count,
+                                        -condition_count, -shape_progress, -result.combo_count,
+                                        next_node.priority, next_node.path), next_node, result))
+            if not candidates:
+                break
+            candidates.sort(key=lambda item: item[0])
+            beam = [node for _rank, node, _result in candidates[:beam_width]]
+            if depth >= max(1, options.min_steps):
+                for _rank, _node, result in candidates[:beam_width]:
+                    (qualifying if result.qualifying else diagnostic).append(result)
+
     def rank(result: RouteEvaluation) -> tuple[int, int, tuple[tuple[int, int], ...]]:
         return -result.combo_count, len(result.route) - 1, result.route
 
     best_qualifying = min(qualifying, key=rank) if qualifying else None
     best_diagnostic = min(diagnostic, key=rank) if diagnostic else None
     return RouteSearchResult(best_qualifying, best_diagnostic, options.attempts, options.seed)
+
+
+def _shape_search_progress(board: tuple[tuple[object, ...], ...], condition: LeaderCondition) -> int:
+    """Return the number of selected Orbs nearest to a configured shape."""
+    shape, target = _shape_spec(condition.value)
+    if shape not in {"full_row", "row_6", "six_row"}:
+        return 0
+    if target is not None:
+        return max(sum(_normalise_orb_type(orb) == target for orb in row) for row in board)
+    return max(max(Counter(_normalise_orb_type(orb) for orb in row).values(), default=0) for row in board)
 
 
 def _board_cell_key(value: object) -> object:

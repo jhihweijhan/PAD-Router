@@ -40,6 +40,32 @@ class RuleProfileTests(unittest.TestCase):
 
 
 class ManualRouteEvaluationTests(unittest.TestCase):
+    def test_search_prioritizes_a_dark_full_row_before_combo_count(self):
+        jammer = Orb("jammer")
+        board = (
+            (4, 2, 6, 5, 3, 5),
+            (6, 1, 3, 1, 4, 1),
+            (5, 2, 5, 2, 5, 2),
+            (3, 2, 1, 3, 4, 5),
+            (5, jammer, 5, 2, 3, 5),
+        )
+        profile = RuleProfile(
+            "dark row",
+            (ConditionGroup.all_of((LeaderCondition.shape("full_row", orb_type="dark"),)),),
+            hazard_policy="allow",
+        )
+
+        result = search_qualifying_route(
+            board, profile,
+            RouteSearchOptions(attempts=50, seed=0, min_steps=1, max_steps=50),
+            confirmed=True,
+        )
+
+        self.assertIsNotNone(result.qualifying_candidate)
+        self.assertTrue(result.qualifying_candidate.qualifying)
+        self.assertLessEqual(len(result.qualifying_candidate.route) - 1, 50)
+        self.assertGreaterEqual(result.qualifying_candidate.combo_count, 2)
+
     def test_search_is_reproducible_and_returns_a_qualifying_candidate(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
