@@ -619,7 +619,7 @@ class BoardInspectionApp:
         self._serial = tk.StringVar()
         self._selected_label = tk.StringVar(value="尚未選取珠子")
         self._condition_choices = [tk.StringVar(value=NO_CONDITION) for _ in range(3)]
-        self._condition_colors = [tk.StringVar(value="火") for _ in range(3)]
+        self._condition_colors = [tk.StringVar(value="不指定") for _ in range(3)]
         self._condition_operator = tk.StringVar(value="全部符合")
         self._hazard_policy = tk.StringVar(value="避免危害珠")
         self._external_condition = tk.StringVar(value="無")
@@ -674,14 +674,19 @@ class BoardInspectionApp:
         self._execute_button.pack(fill="x", pady=(4, 0))
         profile_frame = ttk.LabelFrame(board_frame, text="規則設定", padding=6)
         profile_frame.pack(fill="x", pady=(10, 0))
-        ttk.Label(profile_frame, text="消珠條件（可選最多 3 項；形狀請選目標色珠）：").pack(anchor="w")
+        ttk.Label(profile_frame, text="消珠條件（預設不限＝最大 Combo；形狀才選色珠）：").pack(anchor="w")
+        self._condition_color_boxes = []
         for variable, color in zip(self._condition_choices, self._condition_colors):
             condition_row = ttk.Frame(profile_frame)
             condition_row.pack(fill="x", pady=(2, 0))
             ttk.Combobox(condition_row, textvariable=variable, values=CONDITION_OPTIONS,
                          state="readonly", width=28).pack(side="left", fill="x", expand=True)
-            ttk.Combobox(condition_row, textvariable=color, values=CONDITION_COLORS,
-                         state="readonly", width=4).pack(side="right", padx=(4, 0))
+            color_box = ttk.Combobox(condition_row, textvariable=color, values=CONDITION_COLORS,
+                                     state="disabled", width=4)
+            color_box.pack(side="right", padx=(4, 0))
+            self._condition_color_boxes.append(color_box)
+        for index, variable in enumerate(self._condition_choices):
+            variable.trace_add("write", lambda *_args, index=index: self._sync_condition_color(index))
         ttk.Label(profile_frame, text="條件關係：").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._condition_operator, values=tuple(GROUP_OPERATORS),
                      state="readonly", width=12).pack(fill="x")
@@ -713,6 +718,17 @@ class BoardInspectionApp:
         ttk.Label(board_frame, textvariable=self._evaluation, wraplength=370, justify="left").pack(anchor="w", pady=(10, 0))
         ttk.Label(board_frame, textvariable=self._verification, wraplength=370, justify="left").pack(anchor="w", pady=(8, 0))
         ttk.Label(self.root, textvariable=self._status, anchor="w", relief="sunken").pack(fill="x", side="bottom")
+
+    def _sync_condition_color(self, index: int) -> None:
+        choice = self._condition_choices[index].get()
+        color = self._condition_colors[index]
+        if choice in COLORED_PRESETS:
+            if color.get() not in CONDITION_COLORS:
+                color.set("火")
+            self._condition_color_boxes[index].configure(state="readonly")
+        else:
+            color.set("不指定")
+            self._condition_color_boxes[index].configure(state="disabled")
 
     def _show_error(self, message: str):
         from tkinter import messagebox

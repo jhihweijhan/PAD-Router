@@ -268,6 +268,26 @@ class ScreenshotPhotoTests(unittest.TestCase):
             root.destroy()
 
 
+class ConditionColorUiTests(unittest.TestCase):
+    def test_max_combo_does_not_offer_a_colour_until_a_shape_is_selected(self):
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = BoardInspectionApp(root)
+            self.assertEqual(app._condition_colors[0].get(), "不指定")
+            self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "disabled")
+            app._condition_choices[0].set("十字型")
+            self.assertEqual(app._condition_colors[0].get(), "火")
+            self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "readonly")
+            app._condition_choices[0].set("不限（以最大 Combo 為主）")
+            self.assertEqual(app._condition_colors[0].get(), "不指定")
+            self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "disabled")
+        finally:
+            root.destroy()
+
+
 class RuleProfileSelectionTests(unittest.TestCase):
     def test_fixed_choices_build_combined_conditions_without_json_input(self):
         profile = rule_profile_from_selections(
