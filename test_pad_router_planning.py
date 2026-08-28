@@ -66,6 +66,31 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertLessEqual(len(result.qualifying_candidate.route) - 1, 50)
         self.assertGreaterEqual(result.qualifying_candidate.combo_count, 2)
 
+    def test_dark_row_search_maximizes_combos_on_reported_board(self):
+        board = (
+            (Orb("normal", 4), Orb("normal", 2), Orb("normal", 6), Orb("normal", 5, enhanced=True), Orb("normal", 3), Orb("normal", 5)),
+            (Orb("normal", 6, enhanced=True), Orb("normal", 1), Orb("normal", 3), Orb("normal", 1), Orb("normal", 4), Orb("normal", 1)),
+            (Orb("normal", 5, enhanced=True), Orb("normal", 2), Orb("normal", 5, enhanced=True), Orb("normal", 2), Orb("normal", 5, enhanced=True), Orb("normal", 2)),
+            (Orb("normal", 3), Orb("normal", 2), Orb("normal", 1), Orb("normal", 3), Orb("normal", 4), Orb("normal", 5, enhanced=True)),
+            (Orb("normal", 5), Orb("jammer"), Orb("normal", 5), Orb("normal", 2), Orb("normal", 3), Orb("normal", 5)),
+        )
+        profile = RuleProfile(
+            "dark row",
+            (ConditionGroup.all_of((LeaderCondition.shape("full_row", orb_type="dark"),)),),
+            hazard_policy="allow",
+        )
+
+        result = search_qualifying_route(
+            board, profile,
+            RouteSearchOptions(attempts=50, seed=1, min_steps=1, max_steps=70),
+            confirmed=True,
+        )
+
+        self.assertIsNotNone(result.qualifying_candidate)
+        self.assertTrue(result.qualifying_candidate.qualifying)
+        self.assertLessEqual(len(result.qualifying_candidate.route) - 1, 70)
+        self.assertGreaterEqual(result.qualifying_candidate.combo_count, 6)
+
     def test_search_is_reproducible_and_returns_a_qualifying_candidate(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),

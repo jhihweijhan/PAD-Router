@@ -822,7 +822,7 @@ def search_qualifying_route(
         (qualifying if result.qualifying else diagnostic).append(result)
 
     if profile.condition_groups:
-        beam_width = max(ROWS * COLS, options.attempts * 3)
+        beam_width = max(ROWS * COLS, options.attempts * 12)
         starts = [(row, col) for row in range(ROWS) for col in range(COLS)]
         generator.shuffle(starts)
         initial_score, initial_combos = score(board, options.cascade)
