@@ -2,7 +2,7 @@
 
 **Recommendation:** do not add an “edge-calculation-level AI model” to the
 current recognizer.  Keep the calibrated HSV/prototype classifier recommended
-in `IMAGE_RECOGNITION_RESEARCH.md`; add edge/contour evidence only as a
+in [the image-recognition research](image-recognition.md); add edge/contour evidence only as a
 measured, optional *reject/structure* feature after its corpus is available.
 For a genuinely new orb visual, the safe outcome is `unknown` and no drag—not
 an automatic new label.  A trained model can learn a later labelled class, but

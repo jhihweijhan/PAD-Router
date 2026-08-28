@@ -9,8 +9,11 @@ adapters around the existing PAD Router functions.
 from __future__ import annotations
 
 import binascii
+import json
+import math
 import subprocess
 import struct
+import tempfile
 import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -31,6 +34,7 @@ from pad_router import (
     RouteSearchOptions,
     RouteSearchResult,
     RuleProfile,
+    _cell_features,
     detect_board_pixels,
     evaluate_manual_route,
     load_rule_profile,
@@ -48,6 +52,158 @@ Board = tuple[tuple[object, ...], ...]
 Detector = Callable[[int, int, bytes, Grid], Board]
 Capture = Callable[[str], Screenshot]
 Executor = Callable[..., bool | PlayVerification]
+
+
+class OrbPrototypeModel:
+    """Small local, no-training classifier fed by corrected board cells."""
+
+    def __init__(self, path: Path | None = None):
+        self.path = path
+        self.samples: list[dict[str, object]] = []
+        if path is not None and path.exists():
+            try:
+                self.samples = json.loads(path.read_text()).get("samples", [])
+            except (OSError, ValueError):
+                self.samples = []
+
+    @classmethod
+    def default(cls) -> "OrbPrototypeModel":
+        return cls(Path(__file__).resolve().parent / ".pad-router" / "orb-prototypes.json")
+
+    @staticmethod
+    def _feature(feature) -> list[float]:
+        center_hue = getattr(feature, "center_hue", None)
+        values = [feature.hue, feature.saturation, feature.value, feature.dark, feature.white,
+                  feature.orange, feature.purple, feature.blue, feature.green, feature.plus,
+                  center_hue if center_hue is not None else -1.0,
+                  getattr(feature, "center_saturation", 0.0),
+                  getattr(feature, "center_value", 0.0)]
+        pattern = getattr(feature, "center_pattern", None)
+        if pattern is not None:
+            values.extend(pattern)
+        return values
+
+    @staticmethod
+    def _distance(left: list[float], right: list[float]) -> float:
+        hue = min(abs(left[0] - right[0]), 1.0 - abs(left[0] - right[0]))
+        weights = (1.4, 0.45, 0.75, 0.35, 0.25, 0.25, 0.25, 0.25, 0.25, 0.4)
+        distance = sum(weight * abs(a - b) for weight, a, b in zip(
+            weights, (hue, *left[1:]), (0.0, *right[1:])
+        ))
+        if (len(left) >= 13 and len(right) >= 13
+                and left[10] >= 0 and right[10] >= 0):
+            center_hue = min(abs(left[10] - right[10]), 1.0 - abs(left[10] - right[10]))
+            distance += (0.5 * center_hue
+                         + 0.2 * abs(left[11] - right[11])
+                         + 0.2 * abs(left[12] - right[12]))
+        if (len(left) == len(right) and len(left) > 18
+                and len(left[13:]) == len(right[13:])):
+            distance += 0.8 * sum(abs(a - b) for a, b in zip(left[13:], right[13:])) / len(left[13:])
+        return distance
+
+    @staticmethod
+    def _record(orb: Orb, feature, human: bool,
+                cell: tuple[int, int] | None = None) -> dict[str, object]:
+        record = {"kind": orb.kind, "color": orb.color, "enhanced": orb.enhanced,
+                  "visual_class": orb.visual_class, "locked": orb.locked,
+                  "feature": OrbPrototypeModel._feature(feature), "human": human}
+        if cell is not None:
+            record["cell"] = list(cell)
+        return record
+
+    def _save(self, samples: list[dict[str, object]] | None = None) -> None:
+        if self.path is None:
+            return
+        try:
+            payload = json.dumps(
+                {"samples": self.samples if samples is None else samples},
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            raise OSError("原型模型資料序列化失敗") from exc
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+            temporary.replace(self.path)
+        except Exception as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if isinstance(exc, OSError):
+                raise
+            raise OSError("原型模型暫存檔寫入或取代失敗") from exc
+
+    def learn(self, orb: object, feature, human: bool,
+              cell: tuple[int, int] | None = None) -> bool:
+        if not isinstance(orb, Orb) or orb_match_key(orb) is None:
+            return False
+        record = self._record(orb, feature, human, cell)
+        candidate = self.samples
+        if human:
+            candidate = [
+                sample for sample in self.samples
+                if not (sample.get("feature") == record["feature"]
+                        and sample.get("cell") == record.get("cell"))
+            ]
+        candidate = [*candidate, record]
+        self._save(candidate)
+        self.samples = candidate
+        return True
+
+    def _predict_sample(self, feature) -> tuple[Orb, float, dict[str, object]] | None:
+        candidates = self.samples
+        if not candidates:
+            return None
+        vector = self._feature(feature)
+        scored = sorted(((self._distance(vector, sample["feature"]) + (0 if sample.get("human") else .02), sample)
+                         for sample in candidates),
+                        key=lambda item: item[0])
+        distance, sample = scored[0]
+        label = (sample["kind"], sample.get("color"), sample.get("enhanced"), sample.get("locked"))
+        runner_up = next((score for score, other in scored[1:]
+                          if (other["kind"], other.get("color"), other.get("enhanced"), other.get("locked")) != label),
+                         math.inf)
+        if distance > 0.14 or runner_up - distance < 0.035:
+            return None
+        return Orb(str(sample["kind"]), sample.get("color"), bool(sample.get("enhanced")),
+                   sample.get("visual_class"), bool(sample.get("locked"))), distance, sample
+
+    def predict(self, feature) -> tuple[Orb, float] | None:
+        prediction = self._predict_sample(feature)
+        return prediction[:2] if prediction is not None else None
+
+    def detect(self, width: int, height: int, pixels: bytes, grid: Grid, baseline: Detector) -> Board:
+        board = [list(row) for row in baseline(width, height, pixels, grid)]
+        if not self.samples:
+            return tuple(map(tuple, board))
+        for row in range(ROWS):
+            for col in range(COLS):
+                try:
+                    feature = _cell_features(width, height, pixels, grid.point(row, col), grid.cell)
+                except ValueError:
+                    continue
+                prediction = self._predict_sample(feature)
+                if prediction is None:
+                    continue
+                orb, distance, sample = prediction
+                baseline_key = orb_match_key(board[row][col])
+                if (baseline_key in (5, 6)
+                        and orb_match_key(orb) != baseline_key
+                        and not sample.get("human")):
+                    continue
+                if baseline_key is None or distance <= 0.06:
+                    board[row][col] = orb
+        return tuple(map(tuple, board))
 
 
 # 介面顯示名稱；規則檔與核心運算仍使用英文代號。
@@ -334,6 +490,7 @@ class BoardInspectionState:
     route_search: RouteSearchResult | None = None
     route_overlay: tuple[dict[str, object], ...] = ()
     search_options: RouteSearchOptions | None = None
+    learning_status: str = "尚未學習資料"
 
     @property
     def source_path(self) -> str | None:
@@ -348,28 +505,103 @@ class BoardInspectionController:
     """Public board inspection seam used by the GUI and standard-library tests."""
 
     def __init__(self, detector: Detector = detect_board_pixels, capture: Capture = screenshot,
-                 executor: Executor = play):
+                 executor: Executor = play, model: OrbPrototypeModel | None = None,
+                 max_recognition_attempts: int = 2):
         self._detector = detector
         self._capture = capture
         self._executor = executor
+        self._model = model
+        self._max_recognition_attempts = 2
+        self.max_recognition_attempts = max_recognition_attempts
         self.state = BoardInspectionState()
+
+    @property
+    def max_recognition_attempts(self) -> int:
+        return self._max_recognition_attempts
+
+    @max_recognition_attempts.setter
+    def max_recognition_attempts(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+            raise ValueError("主動辨識次數必須是 1 到 5 的整數")
+        self._max_recognition_attempts = value
+
+    def _detect(self, width: int, height: int, pixels: bytes, grid: Grid) -> Board:
+        if self._model is None:
+            return self._detector(width, height, pixels, grid)
+        return self._model.detect(width, height, pixels, grid, self._detector)
+    def _detect_with_retries(self, width: int, height: int, pixels: bytes, grid: Grid) -> tuple[Board, int]:
+        for attempt in range(1, self.max_recognition_attempts + 1):
+            detected = self._detect(width, height, pixels, grid)
+            _board_shape(detected)
+            if not _uncertain_cells(detected):
+                return detected, attempt
+        return detected, self.max_recognition_attempts
+
+
+    def _learn_implicit(self, label: str = "上一張", data_label: str = "隱式資料") -> str:
+        state = self.state
+        if (self._model is None or state.board is None or state.width is None or state.height is None
+                or state.pixels is None or state.calibration is None):
+            return ""
+        grid = state.calibration.to_grid()
+        learned = 0
+        for row in range(ROWS):
+            for col in range(COLS):
+                try:
+                    feature = _cell_features(state.width, state.height, state.pixels,
+                                             grid.point(row, col), grid.cell)
+                except ValueError:
+                    continue
+                learned += self._model.learn(state.board[row][col], feature, human=False,
+                                             cell=(row, col))
+        return f"{label}已學習（{learned} 格{data_label}）" if learned else ""
+
+    def accept_current_board(self) -> BoardInspectionState:
+        learned = self._learn_implicit("目前盤面", "低權重資料")
+        if learned:
+            self.state = replace(self.state, learning_status=learned)
+        return self.state
+
+    def _learn_human(self, row: int, col: int, orb: Orb) -> None:
+        if (self._model is None or self.state.width is None or self.state.height is None
+                or self.state.pixels is None or self.state.calibration is None):
+            return
+        grid = self.state.calibration.to_grid()
+        try:
+            feature = _cell_features(self.state.width, self.state.height, self.state.pixels,
+                                     grid.point(row, col), grid.cell)
+        except ValueError:
+            return
+        self._model.learn(orb, feature, human=True, cell=(row, col))
 
     def _with_source(self, source: Screenshot, source_name: str) -> BoardInspectionState:
         width, height, pixels = source
         if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
             raise ValueError("截圖必須包含 width×height 個 BGRA 像素")
         calibration = infer_calibration(width, height)
-        detected = self._detector(width, height, pixels, calibration.to_grid())
-        _board_shape(detected)
-        return self._replace_source(source_name, source, calibration, detected)
+        learned = self._learn_implicit()
+        detected, recognition_attempts = self._detect_with_retries(
+            width, height, pixels, calibration.to_grid()
+        )
+        return self._replace_source(source_name, source, calibration, detected, learned,
+                                    recognition_attempts)
 
     def _replace_source(self, source_name: str, source: Screenshot,
-                        calibration: BoardCalibration, detected: Board) -> BoardInspectionState:
+                        calibration: BoardCalibration, detected: Board, learned: str = "",
+                        recognition_attempts: int = 1) -> BoardInspectionState:
         uncertain = _uncertain_cells(detected)
         status = (f"已載入 {source_name}；有 {len(uncertain)} 格需要手動修正"
-                  if uncertain else f"已載入 {source_name}；請確認盤面")
+                  if uncertain else f"已載入 {source_name}；辨識完成")
+        status += f"；主動辨識第 {recognition_attempts}/{self.max_recognition_attempts} 次"
+        if uncertain:
+            status += "；仍有問號，請手動修正"
+        elif recognition_attempts < self.max_recognition_attempts:
+            status += "；已提前停止"
+        if learned:
+            status += f"；{learned}"
         state = BoardInspectionState(source_name, source[0], source[1], source[2], calibration,
-                                     detected, detected, None, False, uncertain, (), status)
+                                     detected, detected, detected if not uncertain else None, not uncertain,
+                                     uncertain, (), status, learning_status=learned or "目前畫面尚未學習")
         if self.state.rule_profile is not None:
             state = replace(state, rule_profile=self.state.rule_profile)
         self.state = self._with_overlay(state)
@@ -379,10 +611,10 @@ class BoardInspectionController:
         if state.board is None or state.calibration is None:
             return state
         grid = state.calibration.to_grid()
-        source_board = state.detected_board or state.board
+        source_board = state.board
         overlay = tuple({"cell": (row, col), "x": grid.point(row, col)[0],
                          "y": grid.point(row, col)[1], "label": orb_display(source_board[row][col]),
-                         "uncertain": orb_match_key(source_board[row][col]) is None}
+                         "uncertain": (row, col) in state.uncertain_cells}
                          for row in range(ROWS) for col in range(COLS))
         return replace(state, overlay=overlay)
 
@@ -410,12 +642,14 @@ class BoardInspectionController:
         if not isinstance(calibration, BoardCalibration):
             raise TypeError("calibration 必須是 BoardCalibration")
         calibration.validate(self.state.width, self.state.height)
-        detected = self._detector(self.state.width, self.state.height, self.state.pixels,
-                                  calibration.to_grid())
-        _board_shape(detected)
-        return self._replace_source(self.state.source_name or "source",
-                                    (self.state.width, self.state.height, self.state.pixels),
-                                    calibration, detected)
+        detected, recognition_attempts = self._detect_with_retries(
+            self.state.width, self.state.height, self.state.pixels, calibration.to_grid()
+        )
+        return self._replace_source(
+            self.state.source_name or "source",
+            (self.state.width, self.state.height, self.state.pixels),
+            calibration, detected, recognition_attempts=recognition_attempts,
+        )
 
     def calibrate(self, left: BoardCalibration | int, top: int | None = None,
                   cell: int | None = None) -> BoardInspectionState:
@@ -435,12 +669,18 @@ class BoardInspectionController:
         if not (0 <= row < ROWS and 0 <= col < COLS):
             raise ValueError("珠子必須位於 6×5 標準盤面內")
         board = [list(items) for items in self.state.board]
-        board[row][col] = _coerce_orb(value)
-        updated = replace(self.state, board=tuple(map(tuple, board)), confirmed_board=None,
-                          confirmed=False, uncertain_cells=_uncertain_cells(tuple(map(tuple, board))),
+        orb = _coerce_orb(value)
+        board[row][col] = orb
+        updated_board = tuple(map(tuple, board))
+        uncertain = _uncertain_cells(updated_board)
+        self._learn_human(row, col, orb)
+        updated = replace(self.state, board=updated_board,
+                          confirmed_board=updated_board if not uncertain else None,
+                          confirmed=not uncertain, uncertain_cells=uncertain,
                           overlay=(), route_evaluation=None, route_approved=False, verification=None,
                           route_search=None, route_overlay=(), search_options=None,
-                          status="珠子已修正；請確認盤面")
+                          status="珠子已修正並寫入模型；辨識結果已自動更新",
+                          learning_status="人工標記已寫入模型")
         self.state = self._with_overlay(updated)
         return self.state
 
@@ -584,13 +824,32 @@ class BoardInspectionController:
         return succeeded
 
 
-def _photo_from_screenshot(screenshot_data: Screenshot, tk_module):
+def _fit_scale(width: int, height: int, available_width: int,
+               available_height: int) -> tuple[float, int, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("截圖尺寸必須為正數")
+    if available_width <= 0 or available_height <= 0:
+        raise ValueError("可視區域尺寸必須為正數")
+    scale = min(1.0, available_width / width, available_height / height)
+    return scale, max(1, int(width * scale)), max(1, int(height * scale))
+
+
+def _photo_from_screenshot(screenshot_data: Screenshot, tk_module,
+                           display_size: tuple[int, int] | None = None):
     width, height, pixels = screenshot_data
-    rgb = bytearray(width * height * 3)
-    for index in range(width * height):
-        blue, green, red = pixels[index * 4:index * 4 + 3]
-        rgb[index * 3:index * 3 + 3] = bytes((red, green, blue))
-    ppm = f"P6\n{width} {height}\n255\n".encode() + bytes(rgb)
+    display_width, display_height = display_size or (width, height)
+    if display_width <= 0 or display_height <= 0:
+        raise ValueError("顯示尺寸必須為正數")
+    rgb = bytearray(display_width * display_height * 3)
+    for display_y in range(display_height):
+        source_y = display_y * height // display_height
+        source_row = source_y * width * 4
+        display_row = display_y * display_width * 3
+        for display_x in range(display_width):
+            source_x = display_x * width // display_width
+            blue, green, red = pixels[source_row + source_x * 4:source_row + source_x * 4 + 3]
+            rgb[display_row + display_x * 3:display_row + display_x * 3 + 3] = bytes((red, green, blue))
+    ppm = f"P6\n{display_width} {display_height}\n255\n".encode() + bytes(rgb)
     return tk_module.PhotoImage(data=ppm, format="PPM")
 
 
@@ -608,12 +867,13 @@ class BoardInspectionApp:
         self.ttk = ttk
         self.root = root or tk.Tk()
         self.root.title("PAD Router — 珠盤判讀")
-        self.controller = controller or BoardInspectionController()
+        self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
         self._photo = None
+        self._display_scale = 1.0
         self._selected_cell: tuple[int, int] | None = None
         self._manual_route: list[tuple[int, int]] = []
         self._dragging_route = False
-        self._profile: RuleProfile | None = self.controller.state.rule_profile
+        self._correction_mode = False
         self._selected_orb = tk.StringVar(value="火")
         self._enhanced = tk.BooleanVar()
         self._locked = tk.BooleanVar()
@@ -628,11 +888,18 @@ class BoardInspectionApp:
         self._search_steps = tk.StringVar(value="50")
         self._search_seed = tk.StringVar(value="0")
         self._cascade = tk.StringVar(value="計入落珠連鎖")
-        self._profile_label = tk.StringVar(value="尚未建立規則設定")
+        self._recognition_attempts = tk.StringVar(value=str(self.controller.max_recognition_attempts))
+        self._profile_label = tk.StringVar(value="尚未套用規則設定")
         self._evaluation = tk.StringVar(value="尚未評估路徑")
         self._verification = tk.StringVar(value="尚無手勢後驗證結果")
+        self._learning = tk.StringVar(value=self.controller.state.learning_status)
         self._status = tk.StringVar(value=self.controller.state.status)
+        self._syncing_controls = False
         self._build()
+        if self.controller.state.rule_profile is None:
+            self._apply_profile_from_controls()
+        else:
+            self._display(self.controller.state)
 
     def _build(self):
         tk, ttk = self.tk, self.ttk
@@ -654,24 +921,41 @@ class BoardInspectionApp:
         source_scroll = ttk.Scrollbar(source_frame, orient="vertical", command=self.source.yview)
         self.source.configure(yscrollcommand=source_scroll.set)
         self.source.pack(side="left", fill="both", expand=True)
+        self.source.bind("<Configure>", self._source_resized)
         source_scroll.pack(side="right", fill="y")
 
         board_frame = ttk.LabelFrame(body, text="可編輯盤面", padding=8)
         board_frame.pack(side="right", fill="y")
-        self.board = tk.Canvas(board_frame, width=390, height=330, background="#111111", highlightthickness=0)
+        self.board = tk.Canvas(board_frame, width=390, height=330, background="#111111",
+                               highlightthickness=2, takefocus=True)
         self.board.pack()
         self.board.bind("<ButtonPress-1>", self.route_press)
         self.board.bind("<B1-Motion>", self.route_motion)
         self.board.bind("<ButtonRelease-1>", self.route_release)
+        self.board.bind("<Key>", self.answer_key)
         ttk.Label(board_frame, textvariable=self._selected_label).pack(pady=(8, 2))
-        ttk.Label(board_frame, text="修正珠子：").pack(anchor="w")
-        options = [ORB_LABELS[name] for name in NAMES.values()] + [ORB_LABELS[name] for name in sorted(HAZARDS)]
-        ttk.Combobox(board_frame, textvariable=self._selected_orb, values=options,
-                     state="readonly", width=18).pack(fill="x")
-        ttk.Checkbutton(board_frame, text="強化", variable=self._enhanced).pack(anchor="w")
-        ttk.Checkbutton(board_frame, text="鎖定", variable=self._locked).pack(anchor="w")
-        ttk.Button(board_frame, text="修正選取珠子", command=self.correct_selected).pack(fill="x", pady=4)
-        ttk.Button(board_frame, text="確認盤面", command=self.confirm_board).pack(fill="x")
+        self._review_frame = ttk.LabelFrame(board_frame, text="回答模型無法判斷的珠子", padding=6)
+        self._review_frame.pack(fill="x", pady=(4, 0))
+        self._review_message = tk.StringVar(value="載入盤面後，這裡會顯示需要回答的珠子。")
+        ttk.Label(self._review_frame, textvariable=self._review_message, wraplength=370,
+                  justify="left").pack(anchor="w")
+        answer_buttons = ttk.Frame(self._review_frame)
+        answer_buttons.pack(fill="x", pady=(4, 0))
+        self._answer_buttons = []
+        for index, kind in enumerate((*NAMES.values(), *sorted(HAZARDS)), 1):
+            shortcut = index % 10
+            button = ttk.Button(answer_buttons, text=f"{ORB_LABELS[kind]} {shortcut}",
+                                command=lambda kind=kind: self.answer_selected(kind), width=8)
+            button.grid(row=(index - 1) // 5, column=(index - 1) % 5, sticky="ew", padx=1, pady=1)
+            self._answer_buttons.append(button)
+        for column in range(5):
+            answer_buttons.columnconfigure(column, weight=1)
+        ttk.Checkbutton(self._review_frame, text="強化（E）", variable=self._enhanced).pack(side="left")
+        ttk.Checkbutton(self._review_frame, text="鎖定（L）", variable=self._locked).pack(side="left", padx=8)
+        self._correction_button = ttk.Button(board_frame, text="修正辨識",
+                                             command=self.toggle_correction_mode)
+        self._correction_button.pack(fill="x", pady=(4, 0))
+        ttk.Label(board_frame, textvariable=self._learning, wraplength=370, justify="left").pack(anchor="w")
         self._execute_button = ttk.Button(board_frame, text="執行路徑", command=self.execute_route,
                                           state="disabled")
         self._execute_button.pack(fill="x", pady=(4, 0))
@@ -690,6 +974,10 @@ class BoardInspectionApp:
             self._condition_color_boxes.append(color_box)
         for index, variable in enumerate(self._condition_choices):
             variable.trace_add("write", lambda *_args, index=index: self._sync_condition_color(index))
+        for variable in (*self._condition_colors, self._condition_operator, self._hazard_policy,
+                         self._external_condition, self._cascade, self._search_attempts,
+                         self._search_steps, self._search_seed):
+            variable.trace_add("write", self._settings_changed)
         ttk.Label(profile_frame, text="條件關係：").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._condition_operator, values=tuple(GROUP_OPERATORS),
                      state="readonly", width=12).pack(fill="x")
@@ -702,6 +990,14 @@ class BoardInspectionApp:
         ttk.Label(profile_frame, text="消珠結算：").pack(anchor="w", pady=(4, 0))
         ttk.Combobox(profile_frame, textvariable=self._cascade, values=tuple(CASCADE_OPTIONS),
                      state="readonly", width=18).pack(fill="x")
+        ttk.Label(profile_frame, text="問號時主動重試：").pack(anchor="w", pady=(4, 0))
+        self._recognition_attempts_box = ttk.Combobox(
+            profile_frame, textvariable=self._recognition_attempts,
+            values=tuple(str(value) for value in range(1, 6)),
+            state="readonly", width=8,
+        )
+        self._recognition_attempts_box.pack(fill="x")
+        self._recognition_attempts.trace_add("write", self._recognition_attempts_changed)
         search_controls = ttk.Frame(profile_frame)
         search_controls.pack(fill="x", pady=(4, 0))
         ttk.Label(search_controls, text="嘗試次數：").pack(side="left")
@@ -715,32 +1011,118 @@ class BoardInspectionApp:
         ttk.Label(search_controls, text="隨機種子：").pack(side="left")
         ttk.Combobox(search_controls, textvariable=self._search_seed, values=("0", "1", "42", "2026"),
                      state="readonly", width=7).pack(side="left", padx=2)
-        self._search_attempts.trace_add("write", self._search_settings_changed)
-        self._search_steps.trace_add("write", self._search_settings_changed)
-        self._search_seed.trace_add("write", self._search_settings_changed)
-        self._cascade.trace_add("write", self._search_settings_changed)
         ttk.Button(search_controls, text="搜尋", command=self.search_route).pack(side="right")
         ttk.Label(profile_frame, textvariable=self._profile_label, wraplength=340).pack(anchor="w", pady=4)
         profile_buttons = ttk.Frame(profile_frame)
         profile_buttons.pack(fill="x")
-        ttk.Button(profile_buttons, text="建立", command=self.create_profile).pack(side="left", expand=True, fill="x")
-        ttk.Button(profile_buttons, text="套用", command=self.apply_profile).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(profile_buttons, text="載入 JSON", command=self.load_profile).pack(side="left", expand=True, fill="x")
         ttk.Button(profile_buttons, text="儲存 JSON", command=self.save_profile).pack(side="left", expand=True, fill="x", padx=(2, 0))
         ttk.Label(board_frame, textvariable=self._evaluation, wraplength=370, justify="left").pack(anchor="w", pady=(10, 0))
         ttk.Label(board_frame, textvariable=self._verification, wraplength=370, justify="left").pack(anchor="w", pady=(8, 0))
         ttk.Label(self.root, textvariable=self._status, anchor="w", relief="sunken").pack(fill="x", side="bottom")
 
+    def _recognition_attempts_changed(self, *_args) -> None:
+        if self._syncing_controls:
+            return
+        try:
+            self.controller.max_recognition_attempts = int(self._recognition_attempts.get())
+        except (TypeError, ValueError) as exc:
+            self._show_error(str(exc))
+
+    @staticmethod
+    def _condition_selection(condition: LeaderCondition) -> tuple[str, str] | None:
+        for label, presets in CONDITION_PRESETS.items():
+            if len(presets) == 1 and condition == presets[0]:
+                return label, "不指定"
+        if condition.kind == "shape" and isinstance(condition.value, dict):
+            shape = condition.value.get("shape")
+            orb_type = ORB_LABELS.get(str(condition.value.get("orb_type")))
+            if shape in SHAPE_PRESETS.values() and orb_type is not None:
+                label = next(label for label, value in SHAPE_PRESETS.items() if value == shape)
+                return label, orb_type
+        if (condition.kind == "connected_orb_count" and condition.minimum == 4
+                and condition.exact):
+            color = ORB_LABELS.get(str(condition.value))
+            if color is not None:
+                return "4 顆消除", color
+        return None
+
+    @classmethod
+    def _profile_control_values(cls, profile: RuleProfile) -> tuple[list[str], list[str], str, str, str]:
+        choices = [NO_CONDITION] * 3
+        colors = ["不指定"] * 3
+        groups = tuple(group for group in profile.condition_groups if group.enabled)
+        operator = "全部符合"
+        if len(groups) == 1:
+            group = groups[0]
+            operator = next((label for label, value in GROUP_OPERATORS.items()
+                             if value == group.operator), operator)
+            selections = tuple(
+                selection for condition in group.conditions
+                if (selection := cls._condition_selection(condition)) is not None
+            )
+            for index, (choice, color) in enumerate(selections[:3]):
+                choices[index], colors[index] = choice, color
+        hazard = next((label for label, value in HAZARD_POLICIES.items()
+                       if value == profile.hazard_policy), "避免危害珠")
+        external = next((label for label, value in EXTERNAL_CONDITIONS.items()
+                         if value == profile.external_conditions), "無")
+        return choices, colors, operator, hazard, external
+
+    def _sync_profile_controls(self, profile: RuleProfile) -> None:
+        choices, colors, operator, hazard, external = self._profile_control_values(profile)
+        self._syncing_controls = True
+        try:
+            for variable, value in zip(self._condition_choices, choices):
+                variable.set(value)
+            for variable, value in zip(self._condition_colors, colors):
+                variable.set(value)
+            self._condition_operator.set(operator)
+            self._hazard_policy.set(hazard)
+            self._external_condition.set(external)
+            for index in range(len(self._condition_choices)):
+                self._sync_condition_color(index)
+        finally:
+            self._syncing_controls = False
+
+    def _settings_changed(self, *_args) -> None:
+        if not self._syncing_controls:
+            self._apply_profile_from_controls()
+
+    def _apply_profile_from_controls(self) -> None:
+        profile = rule_profile_from_selections(
+            ((variable.get(), color.get()) for variable, color in zip(
+                self._condition_choices, self._condition_colors)),
+            self._condition_operator.get(),
+            self._hazard_policy.get(),
+            self._external_condition.get(),
+        )
+        self._manual_route.clear()
+
+        def apply():
+            state = self.controller.set_rule_profile(profile)
+            return state
+
+        self._apply(apply)
+
     def _sync_condition_color(self, index: int) -> None:
-        choice = self._condition_choices[index].get()
-        color = self._condition_colors[index]
-        if choice in COLORED_PRESETS:
-            if color.get() not in CONDITION_COLORS:
-                color.set("火")
-            self._condition_color_boxes[index].configure(state="readonly")
-        else:
-            color.set("不指定")
-            self._condition_color_boxes[index].configure(state="disabled")
+        syncing = self._syncing_controls
+        self._syncing_controls = True
+        try:
+            choice = self._condition_choices[index].get()
+            color = self._condition_colors[index]
+            if choice in COLORED_PRESETS:
+                if color.get() not in CONDITION_COLORS:
+                    color.set("火")
+                self._condition_color_boxes[index].configure(state="readonly")
+            else:
+                color.set("不指定")
+                self._condition_color_boxes[index].configure(state="disabled")
+        finally:
+            self._syncing_controls = syncing
+        if not syncing:
+            self._apply_profile_from_controls()
+
 
     def _show_error(self, message: str):
         from tkinter import messagebox
@@ -788,46 +1170,104 @@ class BoardInspectionApp:
 
     def _display(self, state: BoardInspectionState):
         self._status.set(state.status)
+        self._learning.set(state.learning_status)
         if state.rule_profile is not None:
-            self._profile = state.rule_profile
-            self._hazard_policy.set(next(
-                label for label, policy in HAZARD_POLICIES.items() if policy == state.rule_profile.hazard_policy))
-            self._profile_label.set(f"目前設定：{state.rule_profile.name}")
-        if state.search_options is not None:
-            self._search_attempts.set(str(state.search_options.attempts))
-            self._search_steps.set(str(state.search_options.max_steps))
-            self._search_seed.set(str(state.search_options.seed))
-            self._cascade.set(next(label for label, value in CASCADE_OPTIONS.items()
-                                   if value == state.search_options.cascade))
+            self._sync_profile_controls(state.rule_profile)
+            self._profile_label.set(f"已套用：{state.rule_profile.name}")
+        syncing = self._syncing_controls
+        self._syncing_controls = True
+        try:
+            self._recognition_attempts.set(str(self.controller.max_recognition_attempts))
+            if state.search_options is not None:
+                self._search_attempts.set(str(state.search_options.attempts))
+                self._search_steps.set(str(state.search_options.max_steps))
+                self._search_seed.set(str(state.search_options.seed))
+                self._cascade.set(next(label for label, value in CASCADE_OPTIONS.items()
+                                       if value == state.search_options.cascade))
+        finally:
+            self._syncing_controls = syncing
         result = state.route_evaluation
         self._evaluation.set(self._format_evaluation(result))
         self._verification.set(self._format_verification(state.verification))
         self._execute_button.configure(
             state="normal" if result is not None and result.execution_eligible else "disabled"
         )
+        correction_mode = getattr(self, "_correction_mode", False)
+        if state.uncertain_cells:
+            if correction_mode:
+                self._correction_mode = False
+                correction_mode = False
+                self._manual_route.clear()
+                self._dragging_route = False
+            self._correction_button.configure(state="disabled", text="修正辨識")
+            if self._selected_cell not in state.uncertain_cells:
+                self._selected_cell = state.uncertain_cells[0]
+                self.board.focus_set()
+            row, col = self._selected_cell
+            self._selected_label.set(f"第 {row + 1} 列、第 {col + 1} 行")
+            self._review_message.set(
+                f"目前：檢視模式。模型無法判斷 {len(state.uncertain_cells)} 格；"
+                "按一次珠種即永久學習，完成後可拖曳盤面規劃路徑。"
+            )
+            for button in self._answer_buttons:
+                button.configure(state="normal")
+        elif correction_mode:
+            self._correction_button.configure(state="normal", text="結束修正")
+            self._review_message.set(
+                "目前：修正模式。點選任一格後按珠種覆寫；完成後按「結束修正」回到路徑模式。"
+            )
+            for button in self._answer_buttons:
+                button.configure(state="normal")
+        elif state.board is not None:
+            self._correction_button.configure(state="normal", text="修正辨識")
+            self._review_message.set(
+                "目前：路徑模式。拖曳盤面規劃路徑；模型仍可能看錯，"
+                "按「修正辨識」後可點選任一格覆寫。"
+            )
+            for button in self._answer_buttons:
+                button.configure(state="disabled")
+        else:
+            self._correction_button.configure(state="disabled", text="修正辨識")
+            self._review_message.set("尚未載入盤面。載入後可拖曳規劃路徑，或進入修正辨識。")
+            for button in self._answer_buttons:
+                button.configure(state="disabled")
         self.source.delete("all")
         if state.width and state.height and state.pixels:
-            self._photo = _photo_from_screenshot((state.width, state.height, state.pixels), self.tk)
+            viewport_width = self.source.winfo_width()
+            viewport_height = self.source.winfo_height()
+            if viewport_width <= 1:
+                viewport_width = int(self.source.cget("width"))
+            if viewport_height <= 1:
+                viewport_height = int(self.source.cget("height"))
+            scale, display_width, display_height = _fit_scale(
+                state.width, state.height, viewport_width, viewport_height)
+            self._display_scale = scale
+            self._photo = _photo_from_screenshot(
+                (state.width, state.height, state.pixels), self.tk,
+                (display_width, display_height),
+            )
             self.source.create_image(0, 0, image=self._photo, anchor="nw")
-            radius = max(8, min(36, (state.calibration.cell // 3) if state.calibration else 20))
+            radius = max(8, min(36, (state.calibration.cell // 3) if state.calibration else 20)) * scale
             for item in state.overlay:
-                x, y = item["x"], item["y"]
-                uncertain = item["uncertain"]
+                x, y = item["x"] * scale, item["y"] * scale
+                uncertain = (item["cell"] in state.uncertain_cells)
                 self.source.create_oval(x - radius, y - radius, x + radius, y + radius,
                                         outline="#ff4444" if uncertain else "#61dafb", width=3)
-                self.source.create_text(x, y, text=item["label"], fill="white", font=("TkDefaultFont", 12, "bold"))
-            route_points = tuple((item["x"], item["y"]) for item in state.route_overlay)
+                self.source.create_text(x, y, text="?" if uncertain else item["label"], fill="white",
+                                        font=("TkDefaultFont", 12, "bold"))
+            route_points = tuple((item["x"] * scale, item["y"] * scale) for item in state.route_overlay)
             if route_points:
                 coords = tuple(value for point in route_points for value in point)
                 if len(coords) > 2:
                     self.source.create_line(*coords, fill="#ffcc33", width=6,
-                                             capstyle="round", joinstyle="round")
+                                            capstyle="round", joinstyle="round")
                 for item, (x, y) in zip(state.route_overlay, route_points):
-                    self.source.create_oval(x - 12, y - 12, x + 12, y + 12,
+                    self.source.create_oval(x - 12 * scale, y - 12 * scale,
+                                            x + 12 * scale, y + 12 * scale,
                                             outline="#ffcc33", width=2)
                     self.source.create_text(x, y, text=str(item["step"]), fill="white",
                                             font=("TkDefaultFont", 10, "bold"))
-            self.source.configure(scrollregion=(0, 0, state.width, state.height))
+            self.source.configure(scrollregion=(0, 0, display_width, display_height))
         self.board.delete("all")
         if state.board is None:
             return
@@ -859,6 +1299,11 @@ class BoardInspectionApp:
                                        outline="#ffcc33" if state.route_overlay else "#ffffff", width=2)
                 self.board.create_text(x, y, text=str(index), fill="white",
                                        font=("TkDefaultFont", 10, "bold"))
+
+    def _source_resized(self, _event=None):
+        state = self.controller.state
+        if state.width and state.height and state.pixels:
+            self._display(state)
 
     def _apply(self, action):
         try:
@@ -894,6 +1339,19 @@ class BoardInspectionApp:
         self._apply(lambda: self.controller.set_calibration(infer_calibration(
             state.width or 0, state.height or 0)))
 
+    def toggle_correction_mode(self):
+        state = self.controller.state
+        if getattr(self, "_correction_mode", False):
+            self._correction_mode = False
+        elif state.board is not None and not state.uncertain_cells:
+            self._correction_mode = True
+        else:
+            return "break"
+        self._manual_route.clear()
+        self._dragging_route = False
+        self._display(state)
+        return "break"
+
     def _cell_at(self, event) -> tuple[int, int] | None:
         cell = (event.y // 60, event.x // 60)
         return cell if 0 <= cell[0] < ROWS and 0 <= cell[1] < COLS else None
@@ -912,13 +1370,22 @@ class BoardInspectionApp:
             return "break"
         self._selected_cell = cell
         self._selected_label.set(f"第 {cell[0] + 1} 列、第 {cell[1] + 1} 行")
+        if getattr(self, "_correction_mode", False) or self.controller.state.uncertain_cells:
+            self._manual_route.clear()
+            self._dragging_route = False
+            board = getattr(self, "board", None)
+            if board is not None:
+                board.focus_set()
+            self._display(self.controller.state)
+            return "break"
         self._manual_route[:] = [cell]
         self._dragging_route = True
         self._display(self.controller.state)
         return "break"
 
     def route_motion(self, event):
-        if not self._dragging_route:
+        if getattr(self, "_correction_mode", False) or not self._dragging_route:
+            self._dragging_route = False
             return "break"
         cell = self._cell_at(event)
         if cell is None or cell in self._manual_route:
@@ -946,16 +1413,36 @@ class BoardInspectionApp:
             self._display(state)
         return "break"
 
-    def correct_selected(self):
+    def answer_key(self, event):
+        key = event.char.lower()
+        kinds = (*NAMES.values(), *sorted(HAZARDS))
+        correction_mode = getattr(self, "_correction_mode", False)
+        if key in "1234567890" and (self.controller.state.uncertain_cells or correction_mode):
+            self.answer_selected(kinds[(int(key) - 1) % 10])
+            return "break"
+        if key == "e" and (self.controller.state.uncertain_cells or correction_mode):
+            self._enhanced.set(not self._enhanced.get())
+            return "break"
+        if key == "l" and (self.controller.state.uncertain_cells or correction_mode):
+            self._locked.set(not self._locked.get())
+            return "break"
+
+    def answer_selected(self, kind: str):
+        if not (self.controller.state.uncertain_cells or getattr(self, "_correction_mode", False)):
+            self._show_error("請先進入修正辨識模式")
+            return
         if self._selected_cell is None:
             self._show_error("請先選取盤面上的珠子")
             return
-        value = ORB_KINDS[self._selected_orb.get()]
-        if value in NAMES.values():
+        value = kind
+        if kind in NAMES.values():
             value += "+" if self._enhanced.get() else ""
             value += "*" if self._locked.get() else ""
         self._manual_route.clear()
         self._apply(lambda: self.controller.correct_cell(*self._selected_cell, value))
+
+    def correct_selected(self):
+        self.answer_selected(ORB_KINDS[self._selected_orb.get()])
 
     def confirm_board(self):
         try:
@@ -966,7 +1453,6 @@ class BoardInspectionApp:
             self._show_error(str(exc))
 
     def execute_route(self):
-        from tkinter import messagebox
         state = self.controller.state
         if state.route_evaluation is None or not state.route_evaluation.execution_eligible:
             self._show_error("僅能執行已確認盤面上、符合條件的路徑")
@@ -974,10 +1460,10 @@ class BoardInspectionApp:
         if not self._serial.get().strip():
             self._show_error("請先按「更新裝置」並選擇裝置")
             return
-        if not messagebox.askyesno(
-                "確認執行路徑",
-                "要將此路徑送至裝置，並驗證手勢後盤面嗎？",
-                parent=self.root):
+        try:
+            self.controller.accept_current_board()
+        except OSError as exc:
+            self._status.set(f"執行前學習失敗：{exc}")
             return
 
         def execute():
@@ -987,19 +1473,6 @@ class BoardInspectionApp:
 
         self._apply(execute)
 
-    def create_profile(self):
-        self._profile = rule_profile_from_selections(
-            ((variable.get(), color.get()) for variable, color in zip(self._condition_choices, self._condition_colors)),
-            self._condition_operator.get(),
-            self._hazard_policy.get(), self._external_condition.get())
-        self._profile_label.set(f"已建立：{self._profile.name}")
-
-    def apply_profile(self):
-        if self._profile is None:
-            self._show_error("請先建立或載入規則設定")
-            return
-        self._manual_route.clear()
-        self._apply(lambda: self.controller.set_rule_profile(self._profile))
 
     def search_route(self):
         self._manual_route.clear()
@@ -1013,20 +1486,6 @@ class BoardInspectionApp:
 
         self._apply(search)
 
-    def _search_settings_changed(self, *_):
-        state = self.controller.state
-        if state.search_options is None:
-            return
-        try:
-            options = RouteSearchOptions(attempts=int(self._search_attempts.get()),
-                                         max_steps=int(self._search_steps.get()),
-                                         seed=int(self._search_seed.get()),
-                                         cascade=CASCADE_OPTIONS[self._cascade.get()])
-        except (TypeError, ValueError):
-            options = None
-        if options != state.search_options:
-            self._manual_route.clear()
-            self._display(self.controller.invalidate_route("搜尋設定已變更；路徑已失效"))
 
     def load_profile(self):
         from tkinter import filedialog
@@ -1047,8 +1506,11 @@ class BoardInspectionApp:
         if not path:
             return
         try:
-            self.controller.save_rule_profile(path, self._profile)
-            self._profile_label.set(f"已儲存：{self._profile.name if self._profile else '規則設定'}")
+            profile = self.controller.state.rule_profile
+            if profile is None:
+                raise ValueError("尚未套用規則設定")
+            self.controller.save_rule_profile(path, profile)
+            self._profile_label.set(f"已儲存：{profile.name}")
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self._show_error(str(exc))
 

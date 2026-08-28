@@ -105,19 +105,24 @@ def settle(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple
     return sum(len(item.matches) for item in rounds), remaining
 
 
-def score(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple[float, int]:
-    combos, remaining = settle(board, cascade)
+def _combo_distance_penalty(board: tuple[tuple[object, ...], ...]) -> int:
+    """Return the sum of each matching Orb's nearest-neighbour distance."""
     positions: dict[int | str, list[tuple[int, int]]] = {}
-    for r, row in enumerate(remaining):
-        for c, orb in enumerate(row):
+    for row, values in enumerate(board):
+        for col, orb in enumerate(values):
             key = orb_match_key(orb)
             if key is not None:
-                positions.setdefault(key, []).append((r, c))
-    penalty = sum(
-        min(abs(r - rr) + abs(c - cc) for j, (rr, cc) in enumerate(orbs) if i != j)
+                positions.setdefault(key, []).append((row, col))
+    return sum(
+        min(abs(row - other_row) + abs(col - other_col)
+            for index, (other_row, other_col) in enumerate(orbs) if index != current)
         for orbs in positions.values() if len(orbs) >= 3
-        for i, (r, c) in enumerate(orbs)
+        for current, (row, col) in enumerate(orbs)
     )
+
+def score(board: tuple[tuple[object, ...], ...], cascade: bool = True) -> tuple[float, int]:
+    combos, remaining = settle(board, cascade)
+    penalty = _combo_distance_penalty(remaining)
     return combos * 1000.0 - penalty * 2.0, combos
 
 
@@ -842,6 +847,14 @@ def search_qualifying_route(
         result = evaluate_manual_route(board, route, profile, confirmed=confirmed, cascade=options.cascade)
         record(result)
 
+    # Shape progress already supplies a domain-specific secondary signal; keep
+    # the generic potential for ordinary condition searches only.
+    use_combo_distance = not any(
+        condition.kind == "shape"
+        for group in profile.condition_groups if group.enabled
+        for condition in group.conditions
+    )
+
     if profile.condition_groups:
         beam_width = max(ROWS * COLS, options.attempts * 24)
         starts = [(row, col) for row in range(ROWS) for col in range(COLS)]
@@ -858,6 +871,7 @@ def search_qualifying_route(
                             or next_cursor == previous):
                         continue
                     next_board = moved(node.board, node.cursor, next_cursor)
+                    combo_distance = _combo_distance_penalty(next_board) if use_combo_distance else 0
                     next_node = Node(0, next_board, next_cursor, node.path + (next_cursor,), 0)
                     result = _evaluate_expected_route(next_node.path, next_board, profile,
                                                       confirmed, options.cascade)
@@ -874,13 +888,14 @@ def search_qualifying_route(
                     row_distance = min((distance for distance in row_distances if distance is not None), default=0)
                     condition_rank = (-int(result.team_condition_satisfied), -group_count,
                                       -condition_count, row_distance, -shape_progress, -result.combo_count,
-                                      next_node.path)
+                                      combo_distance, next_node.path)
                     combo_rank = (-result.combo_count, -int(result.team_condition_satisfied),
                                   row_distance, -shape_progress, -group_count, -condition_count,
-                                  next_node.path)
+                                  combo_distance, next_node.path)
                     key = next_board, next_cursor, node.cursor
                     previous_candidate = candidates.get(key)
-                    if previous_candidate is None or condition_rank < previous_candidate[0]:
+                    if (previous_candidate is None
+                            or (condition_rank, combo_rank) < (previous_candidate[0], previous_candidate[1])):
                         candidates[key] = condition_rank, combo_rank, next_node, result
             if not candidates:
                 break
@@ -1040,6 +1055,10 @@ class CellFeatures:
     blue: float
     green: float
     plus: float
+    center_hue: float | None = None
+    center_saturation: float = 0.0
+    center_value: float = 0.0
+    center_pattern: tuple[float, ...] | None = None
 
 
 def _hue_distance(a: float, b: float) -> float:
@@ -1085,15 +1104,47 @@ def _cell_features(
             )
             marker_samples.append((dx, dy, marker_hue, marker_saturation, marker_value))
 
-    # Palette uses a central annulus: the centre icon and outer rim are both
-    # unstable. The lower-right marker is intentionally outside this sample.
-    inner = max(4, round(cell * 0.16))
-    outer = max(inner + 4, round(cell * 0.35))
+    legacy_inner = max(4, round(cell * 0.16))
+    center_radius = max(4, min(radius - 5, max(8, round(cell * 0.32))))
     marker_start = max(20, round(cell * 0.15))
+    center_points = [
+        (dx, dy, hue, saturation, value)
+        for dx, dy, hue, saturation, value in samples
+        if math.hypot(dx, dy) < legacy_inner and saturation >= 0.12 and value >= 0.08
+    ]
+    center = [(hue, saturation, value) for _dx, _dy, hue, saturation, value in center_points]
+    center_hue = _palette_hue(center) if center else None
+    center_saturation = statistics.median(sample[1] for sample in center) if center else 0.0
+    center_value = statistics.median(sample[2] for sample in center) if center else 0.0
+    pattern_points = [
+        (dx, dy, hue, saturation, value)
+        for dx, dy, hue, saturation, value in samples
+        if math.hypot(dx, dy) < center_radius
+        and not (dx >= marker_start and dy >= marker_start)
+        and saturation >= 0.12 and value >= 0.08
+    ]
+    center_pattern = None
+    if len(pattern_points) >= 25:
+        baseline_value = max(statistics.median(sample[4] for sample in pattern_points), 0.08)
+        extent = max(5, round(center_radius * 0.72))
+        grid_positions = tuple(round(extent * index / 2) for index in (-2, -1, 0, 1, 2))
+        pattern_values = []
+        for target_y in grid_positions:
+            for target_x in grid_positions:
+                sample = min(pattern_points, key=lambda item: (item[0] - target_x) ** 2
+                             + (item[1] - target_y) ** 2)
+                pattern_values.append((sample[4] - baseline_value) / baseline_value)
+        horizontal_edges = tuple(abs(pattern_values[row * 5 + col + 1] - pattern_values[row * 5 + col])
+                                 for row in range(5) for col in range(4))
+        vertical_edges = tuple(abs(pattern_values[(row + 1) * 5 + col] - pattern_values[row * 5 + col])
+                               for row in range(4) for col in range(5))
+        center_pattern = tuple(pattern_values) + horizontal_edges + vertical_edges
+    palette_inner = legacy_inner
+    palette_outer = max(legacy_inner + 4, round(cell * 0.35))
     palette = [
         (hue, saturation, value)
         for dx, dy, hue, saturation, value in samples
-        if inner <= math.hypot(dx, dy) <= outer
+        if palette_inner <= math.hypot(dx, dy) <= palette_outer
         and not (dx >= marker_start and dy >= marker_start)
         and saturation >= 0.12 and value >= 0.08
     ]
@@ -1124,7 +1175,9 @@ def _cell_features(
     marker_yellow = sum(yellow(sample) for sample in marker)
     all_yellow = sum(yellow(sample) for sample in marker_samples)
     plus = 1.0 if marker_yellow >= 8 and all_yellow <= marker_yellow * 3 else 0.0
-    return CellFeatures(hue, saturation, value, dark, white, orange, purple, blue, green, max(0.0, plus))
+    return CellFeatures(hue, saturation, value, dark, white, orange, purple, blue, green,
+                         max(0.0, plus), center_hue, center_saturation, center_value,
+                         center_pattern)
 
 
 def _hazard_kind(features: CellFeatures) -> str | None:
@@ -1151,8 +1204,21 @@ def _normal_color(features: CellFeatures) -> int | None:
         for color, prototype in ORB_PROTOTYPES.items()
     )
     best, color, limit = distances[0]
-    runner_up = distances[1][0]
-    return color if best <= limit and runner_up - best >= NORMAL_MIN_MARGIN else None
+    runner_up, runner_color = distances[1][:2]
+    if best > limit:
+        return None
+    if color in (5, 6) and runner_color in (5, 6) and runner_up - best < 0.15:
+        center_hue = getattr(features, "center_hue", None)
+        center_saturation = getattr(features, "center_saturation", 0.0)
+        center_value = getattr(features, "center_value", 0.0)
+        if center_hue is None or center_saturation < 0.25 or center_value < 0.25:
+            return None
+        heart_distance = _hue_distance(center_hue, 0.76)
+        dark_distance = _hue_distance(center_hue, 0.94)
+        if min(heart_distance, dark_distance) > 0.06 or abs(heart_distance - dark_distance) < 0.02:
+            return None
+        return 6 if heart_distance < dark_distance else 5
+    return color if runner_up - best >= NORMAL_MIN_MARGIN else None
 
 
 def screenshot(serial: str) -> tuple[int, int, bytes]:

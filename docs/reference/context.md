@@ -16,6 +16,14 @@ _Avoid_: Default grid
 One movable board cell, defined by a base type and optional observable state such as enhanced or locked.
 _Avoid_: Bead, jewel
 
+**Base Orb Type**:
+The underlying kind of an Orb, independent of any observable state.
+_Avoid_: Orb state, appearance
+
+**Orb State**:
+An observable qualifier of an Orb, such as enhanced or locked, recorded separately from its Base Orb Type.
+_Avoid_: Orb type, colour
+
 **Hazard Orb**:
 An orb whose removal may be undesirable or harmful: poison, mortal poison, jammer, or bomb.
 _Avoid_: Special orb
@@ -24,9 +32,29 @@ _Avoid_: Special orb
 The Board inferred from a supplied screenshot before a user accepts or corrects it.
 _Avoid_: Verified board
 
+**Recognition Rejection**:
+A reason a Board cell cannot be trusted: missing detection, ambiguous visual class, a suspected new visual class, or an unstable frame. A Board with a Recognition Rejection is not a Confirmed Board.
+_Avoid_: Uncertain result, bad read
+
+**Unknown Orb**:
+An Orb whose visual type cannot be safely assigned to a known type. It may be ambiguous or a suspected new visual class.
+_Avoid_: New orb, unrecorded orb
+
+**Recognition Corpus**:
+The permanent local collection of cell visual-feature samples and annotations used to calibrate recognition.
+_Avoid_: Temporary screenshots, cloud dataset
+
+**Human Annotation**:
+A user's permanent classification or Recognition Rejection for one cell in a Board capture.
+_Avoid_: Mark, correction
+
+**Implicit Annotation**:
+A low-weight recognition observation recorded when a user moves to the next Board capture without correcting the current one. It can help classify a later Unknown Orb, while Human Annotations take priority when evidence conflicts.
+_Avoid_: Ground truth, auto-confirmation
+
 **Confirmed Board**:
-A Detected Board accepted or corrected by the user and eligible for route execution checks.
-_Avoid_: Valid board
+A Detected Board with no Recognition Rejection. It becomes eligible for route execution checks automatically after recognition or a Human Annotation changes.
+_Avoid_: User-approved board, valid board
 
 **Board Calibration**:
 The user-approved mapping from a screenshot to the cells of a Standard Board.

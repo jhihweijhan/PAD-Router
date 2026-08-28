@@ -161,6 +161,31 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIsNotNone(first.qualifying_candidate)
         self.assertTrue(first.qualifying_candidate.execution_eligible)
 
+
+    def test_sparse_reward_fixture_uses_combo_distance_as_a_secondary_tie_break(self):
+        board = (
+            (4, 2, 1, 4, 5, 6),
+            (6, 3, 2, 4, 5, 5),
+            (2, 1, 2, 4, 2, 2),
+            (1, 3, 2, 6, 2, 5),
+            (5, 5, 4, 3, 2, 6),
+        )
+        profile = RuleProfile(
+            "sparse", condition_groups=(ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(1),
+            )),)
+        )
+        options = RouteSearchOptions(attempts=2, seed=0, min_steps=1, max_steps=6)
+        baseline_combo_count = 4  # HEAD ordering: ((2, 1), (3, 1))
+
+        first = search_qualifying_route(board, profile, options, confirmed=True)
+        second = search_qualifying_route(board, profile, options, confirmed=True)
+
+        self.assertEqual(first, second)
+        self.assertIsNotNone(first.qualifying_candidate)
+        self.assertTrue(first.qualifying_candidate.qualifying)
+        self.assertGreater(first.qualifying_candidate.combo_count, baseline_combo_count)
+        self.assertEqual(first.qualifying_candidate.combo_count, 5)
     def test_search_ranks_qualifying_candidates_by_combos_steps_then_route_order(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
@@ -388,7 +413,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIn("0 combos; need at least 1", result.diagnostic)
         self.assertFalse(result.diagnostic_candidate.execution_eligible)
 
-    def test_controller_applies_profile_and_keeps_execution_locked_until_confirmation(self):
+    def test_controller_auto_confirms_clean_board_but_keeps_execution_locked_until_route_approval(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
                  (6, 3, 4, 5, 6, 3))
@@ -400,15 +425,10 @@ class ManualRouteEvaluationTests(unittest.TestCase):
 
         controller.capture_device("test-device")
         controller.set_rule_profile(profile)
-        unconfirmed = controller.evaluate_manual_route(((0, 0),))
-        self.assertTrue(unconfirmed.qualifying)
-        self.assertFalse(unconfirmed.execution_eligible)
-        with self.assertRaisesRegex(ValueError, "已確認盤面"):
-            controller.execute_route("test-device", explicit_confirmation=True)
-
-        controller.confirm_board()
         confirmed = controller.evaluate_manual_route(((0, 0),))
         self.assertTrue(confirmed.execution_eligible)
+        with self.assertRaisesRegex(ValueError, "明確確認"):
+            controller.execute_route("test-device")
         with self.assertRaises(ValueError):
             controller.approve_route()
         controller.approve_route(explicit_confirmation=True)
