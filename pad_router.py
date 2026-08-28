@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import functools
 import heapq
 import json
 import math
@@ -848,8 +849,11 @@ def search_qualifying_route(
                     shape_progress = max((_shape_search_progress(next_board, item.condition)
                                           for item in result.condition_results
                                           if item.condition.kind == "shape"), default=0)
+                    row_distances = (_full_row_target_distance(next_board, item.condition)
+                                     for item in result.condition_results if item.condition.kind == "shape")
+                    row_distance = min((distance for distance in row_distances if distance is not None), default=0)
                     candidates.append(((-int(result.team_condition_satisfied), -group_count,
-                                        -condition_count, -shape_progress, -result.combo_count,
+                                        -condition_count, row_distance, -shape_progress, -result.combo_count,
                                         next_node.priority, next_node.path), next_node, result))
             if not candidates:
                 break
@@ -875,6 +879,38 @@ def _shape_search_progress(board: tuple[tuple[object, ...], ...], condition: Lea
     if target is not None:
         return max(sum(_normalise_orb_type(orb) == target for orb in row) for row in board)
     return max(max(Counter(_normalise_orb_type(orb) for orb in row).values(), default=0) for row in board)
+
+
+def _full_row_target_distance(board: tuple[tuple[object, ...], ...], condition: LeaderCondition) -> int | None:
+    """Return how far the nearest selected Orbs are from any target row."""
+    shape, target = _shape_spec(condition.value)
+    if shape not in {"full_row", "row_6", "six_row"} or target is None:
+        return None
+    sources = [(row, col) for row, values in enumerate(board) for col, orb in enumerate(values)
+               if _normalise_orb_type(orb) == target]
+    if len(sources) < COLS:
+        return ROWS * COLS
+    return _minimum_full_row_distance(tuple(sources))
+
+
+@functools.cache
+def _minimum_full_row_distance(sources: tuple[tuple[int, int], ...]) -> int:
+    """Find the closest row-to-cell assignment for the selected Orb positions."""
+    distances = []
+    for goal_row in range(ROWS):
+        costs = {0: 0}
+        for source_row, source_col in sources:
+            next_costs = dict(costs)
+            for mask, total in costs.items():
+                for goal_col in range(COLS):
+                    if not mask & (1 << goal_col):
+                        next_mask = mask | (1 << goal_col)
+                        cost = total + abs(source_row - goal_row) + abs(source_col - goal_col)
+                        if cost < next_costs.get(next_mask, math.inf):
+                            next_costs[next_mask] = cost
+            costs = next_costs
+        distances.append(costs[(1 << COLS) - 1])
+    return min(distances)
 
 
 def _board_cell_key(value: object) -> object:

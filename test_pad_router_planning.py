@@ -40,6 +40,36 @@ class RuleProfileTests(unittest.TestCase):
 
 
 class ManualRouteEvaluationTests(unittest.TestCase):
+    def test_search_gathers_six_scattered_dark_orbs_into_a_full_row(self):
+        raw_board = (
+            (4, 5, 2, 4, 1, 5),
+            (4, 3, 1, 2, 6, 5),
+            (6, 3, 6, 5, 2, 1),
+            (3, 6, 4, 3, 2, 4),
+            (5, "jammer", 4, 3, 1, 5),
+        )
+        board = tuple(tuple(
+            Orb("normal", color, enhanced=(row == 2 and col == 0) or (row == 3 and col == 4))
+            if isinstance(color, int) else Orb("jammer")
+            for col, color in enumerate(values)
+        ) for row, values in enumerate(raw_board))
+        profile = RuleProfile(
+            "dark row",
+            (ConditionGroup.all_of((LeaderCondition.shape("full_row", orb_type="dark"),)),),
+            hazard_policy="allow",
+        )
+
+        result = search_qualifying_route(
+            board, profile,
+            RouteSearchOptions(attempts=30, seed=0, min_steps=1, max_steps=60),
+            confirmed=True,
+        )
+
+        self.assertIsNotNone(result.qualifying_candidate)
+        self.assertTrue(result.qualifying_candidate.qualifying)
+        self.assertTrue(result.qualifying_candidate.condition_results[0].satisfied)
+        self.assertLessEqual(len(result.qualifying_candidate.route) - 1, 60)
+
     def test_search_prioritizes_a_dark_full_row_before_combo_count(self):
         jammer = Orb("jammer")
         board = (
