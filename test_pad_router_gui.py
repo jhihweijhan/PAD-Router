@@ -10,7 +10,7 @@ import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, Grid, LeaderCondition, Orb, PlayVerification,
+from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, ExternalCondition, Grid, LeaderCondition, Orb, PlayVerification,
                         RouteSearchOptions, RouteSearchResult, RuleProfile, _cell_features, _normal_color, detect_board_pixels,
                         search_qualifying_route,
                         expected_board_after_path)
@@ -1420,6 +1420,218 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertEqual(result["execution"]["status"], "stopped")
         self.assertEqual(gestures, [])
 
+    def test_device_and_calibration_operations_report_async_success_and_error(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        listed = []
+        captures = []
+        fail_devices = []
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        def list_devices():
+            if fail_devices:
+                raise RuntimeError("adb offline")
+            listed.append(True)
+            return ("device-a", "device-b")
+
+        def capture(serial):
+            captures.append(serial)
+            return source
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=capture,
+        )
+        executor = DeferredExecutor()
+        bridge = BoardInspectionBridge(
+            controller=controller,
+            device_lister=list_devices,
+            executor=executor,
+        )
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+
+        refreshed = bridge.command({"action": "refresh_devices"})
+        self.assertTrue(refreshed["accepted"])
+        self.assertTrue(refreshed["snapshot"]["busy"])
+        self.assertEqual(listed, [])
+        executor.run_next()
+        refreshed = bridge.snapshot()
+        self.assertEqual(refreshed["devices"], ["device-a", "device-b"])
+        self.assertEqual(refreshed["selected_device"], "device-a")
+        self.assertEqual(refreshed["console"][-1]["level"], "success")
+
+        bridge.command({"action": "select_device", "serial": "device-b"})
+        captured = bridge.command({"action": "capture_screen"})
+        self.assertTrue(captured["accepted"])
+        self.assertTrue(captured["snapshot"]["busy"])
+        self.assertEqual(captures, [])
+        executor.run_next()
+        self.assertEqual(captures, ["device-b"])
+
+        calibration = bridge.command({
+            "action": "calibrate",
+            "left": 0,
+            "top": 0,
+            "cell": 20,
+        })
+        self.assertTrue(calibration["accepted"])
+        self.assertTrue(calibration["snapshot"]["busy"])
+        executor.run_next()
+        calibrated = bridge.snapshot()
+        self.assertEqual(calibrated["calibration"], {"left": 0, "top": 0, "cell": 20})
+        self.assertEqual(calibrated["console"][-1]["level"], "success")
+
+        automatic = bridge.command({"action": "auto_calibrate"})
+        self.assertTrue(automatic["accepted"])
+        self.assertTrue(automatic["snapshot"]["busy"])
+        executor.run_next()
+        self.assertEqual(
+            bridge.snapshot()["calibration"],
+            {"left": 0, "top": 0, "cell": 24},
+        )
+        self.assertEqual(bridge.snapshot()["console"][-1]["level"], "success")
+
+        invalid = bridge.command({
+            "action": "calibrate",
+            "left": 120,
+            "top": 0,
+            "cell": 20,
+        })
+        self.assertTrue(invalid["accepted"])
+        executor.run_next()
+        failed = bridge.snapshot()
+        self.assertEqual(failed["console"][-1]["level"], "error")
+        self.assertIn("校正範圍", failed["status"])
+
+        fail_devices.append(True)
+        failed_refresh = bridge.command({"action": "refresh_devices"})
+        self.assertTrue(failed_refresh["accepted"])
+        executor.run_next()
+        self.assertEqual(bridge.snapshot()["console"][-1]["level"], "error")
+        self.assertIn("adb offline", bridge.snapshot()["status"])
+
+    def test_rule_profile_import_export_preserves_legacy_json_outside_board_flow(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+        original_source = bridge.snapshot()["source"]
+        profile = RuleProfile(
+            "legacy-compatible",
+            condition_groups=(ConditionGroup.all_of(
+                (LeaderCondition.combo_minimum(3),), name="combo",
+            ),),
+            external_conditions=(ExternalCondition("HP", confirmed=True),),
+            hazard_policy="allow",
+        )
+
+        exported = bridge.command({"action": "export_rule_profile"})
+        self.assertEqual(exported["profile"], bridge.snapshot()["rule_profile"])
+        self.assertEqual(
+            json.loads(exported["profile_json"]),
+            exported["profile"],
+        )
+
+        imported = bridge.command({
+            "action": "import_rule_profile",
+            "profile_json": profile.to_json(),
+        })
+        self.assertTrue(imported["accepted"])
+        snapshot = imported["snapshot"]
+        self.assertEqual(snapshot["rule_profile"], profile.to_dict())
+        self.assertEqual(snapshot["source"], original_source)
+        self.assertIsNone(snapshot["route_result"])
+
+    def test_console_levels_are_structured_and_bounded_under_rapid_activity(self):
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        bridge = BoardInspectionBridge(
+            device_lister=lambda: ("device-a",),
+            executor=ImmediateExecutor(),
+        )
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+        for _ in range(125):
+            bridge.command({"action": "refresh_devices"})
+        snapshot = bridge.snapshot()
+        self.assertEqual(len(snapshot["console"]), 100)
+        self.assertTrue(all(
+            {"level", "phase", "message"} <= set(entry)
+            for entry in snapshot["console"]
+        ))
+        self.assertEqual(snapshot["console"][-1]["level"], "success")
+
+        no_devices = BoardInspectionBridge(
+            device_lister=lambda: (),
+            executor=ImmediateExecutor(),
+        )
+        self.addCleanup(no_devices.close)
+        no_devices.command({"action": "refresh_devices"})
+        self.assertEqual(no_devices.snapshot()["console"][-1]["level"], "warning")
+
+    def test_snapshot_keeps_primary_workflow_with_calibration_and_debug_visibility(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+        snapshot = bridge.snapshot()
+
+        self.assertEqual(snapshot["calibration"], {"left": 0, "top": 0, "cell": 2})
+        self.assertEqual(snapshot["debug"]["source_name"], "test-device")
+        self.assertEqual(snapshot["debug"]["pending_operations"], 0)
+        for key in ("board", "rule_profile", "search", "execution", "console"):
+            self.assertIn(key, snapshot)
+
+
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
         from pad_router_webview import ASSET_ROOT
@@ -1443,6 +1655,14 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('id="approve-route"', html)
         self.assertIn('id="execute-route"', html)
         self.assertIn('id="stop-execution"', html)
+        for marker in (
+                'id="device-status"', 'id="calibration-controls"',
+                'id="calibration-left"', 'id="calibration-top"', 'id="calibration-cell"',
+                'id="apply-calibration"', 'id="auto-calibration"', 'id="profile-controls"',
+                'id="profile-file"', 'id="import-profile"', 'id="export-profile"',
+                'id="debug-controls"', 'id="debug-state"',
+        ):
+            self.assertIn(marker, html)
         client = script.read_text()
         self.assertIn("ArrowRight", client)
         self.assertIn("requestAnimationFrame", client)
@@ -1458,11 +1678,21 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('command("execute_route"', client)
         self.assertIn('command("stop_execution"', client)
         self.assertIn('command("set_protected_cell"', client)
+        for marker in (
+                'command("calibrate"', 'command("auto_calibrate"',
+                'command("import_rule_profile"', 'command("export_rule_profile"',
+                'FileReader', 'Blob', 'snapshot.debug', 'entry.level',
+        ):
+            self.assertIn(marker, client)
         self.assertNotIn("adb", client.lower())
         self.assertNotIn("solver", client.lower())
         styles = style.read_text()
+        self.assertIn("min-width: 960px", styles)
+        self.assertIn("min-height: 640px", styles)
+        self.assertIn("min-height: 140px", styles)
+        self.assertIn("@media (max-width: 1100px)", styles)
         for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
-                       ".cell-badge", ".cell-badge.locked"):
+                       ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid"):
             self.assertIn(marker, styles)
 
 

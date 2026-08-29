@@ -69,6 +69,47 @@
           </div>
         </dl>
         <p class="help-text">畫面由 Python 後端擷取與準備；瀏覽器只呈現受控的 PNG 資料。</p>
+        <p id="device-status" class="operation-status" role="status" aria-live="polite">尚未更新裝置。</p>
+        <details id="calibration-controls" class="aux-controls">
+          <summary>盤面校正</summary>
+          <div class="calibration-fields">
+            <label>左上 X
+              <input id="calibration-left" type="number" min="0" step="1" value="0">
+            </label>
+            <label>左上 Y
+              <input id="calibration-top" type="number" min="0" step="1" value="0">
+            </label>
+            <label>格寬
+              <input id="calibration-cell" type="number" min="1" step="1" value="1">
+            </label>
+          </div>
+          <div class="calibration-actions">
+            <button id="auto-calibration" type="button">自動校正</button>
+            <button id="apply-calibration" type="button" class="primary-action" disabled>套用校正</button>
+          </div>
+          <p id="calibration-status" class="operation-status" role="status" aria-live="polite">尚未校正。</p>
+        </details>
+        <details id="profile-controls" class="aux-controls">
+          <summary>規則設定相容性</summary>
+          <input id="profile-file" type="file" accept=".json,application/json" hidden>
+          <div class="profile-actions">
+            <button id="import-profile" type="button">匯入 JSON</button>
+            <button id="export-profile" type="button">匯出 JSON</button>
+          </div>
+          <p id="profile-status" class="operation-status" role="status" aria-live="polite">沿用目前規則設定格式。</p>
+        </details>
+        <details id="debug-controls" class="aux-controls">
+          <summary>除錯資訊</summary>
+          <dl id="debug-state" class="debug-grid">
+            <div><dt>來源</dt><dd id="debug-source">—</dd></div>
+            <div><dt>世代</dt><dd id="debug-generation">—</dd></div>
+            <div><dt>待處理</dt><dd id="debug-pending">—</dd></div>
+            <div><dt>搜尋世代</dt><dd id="debug-search-generation">—</dd></div>
+            <div><dt>執行階段</dt><dd id="debug-execution-phase">—</dd></div>
+            <div><dt>盤面確認</dt><dd id="debug-confirmed">—</dd></div>
+          </dl>
+          <p id="debug-status" class="operation-status">除錯資訊僅供診斷，不改變盤面或執行狀態。</p>
+        </details>
       </section>
 
       <section class="panel review-panel" aria-labelledby="board-heading">

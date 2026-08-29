@@ -669,7 +669,8 @@ class BoardInspectionController:
             }
         return {"source": source, "status": state.status}
 
-    def set_calibration(self, calibration: BoardCalibration) -> BoardInspectionState:
+    def set_calibration(self, calibration: BoardCalibration,
+                        auto_search: bool = True) -> BoardInspectionState:
         if self.state.pixels is None or self.state.width is None or self.state.height is None:
             raise ValueError("請先載入圖片或擷取裝置畫面，再校正盤面")
         if not isinstance(calibration, BoardCalibration):
@@ -682,6 +683,7 @@ class BoardInspectionController:
             self.state.source_name or "source",
             (self.state.width, self.state.height, self.state.pixels),
             calibration, detected, recognition_attempts=recognition_attempts,
+            auto_search=auto_search,
         )
 
     def calibrate(self, left: BoardCalibration | int, top: int | None = None,
@@ -1053,9 +1055,39 @@ def _verification_snapshot(report: PlayVerification | None) -> dict[str, object]
         "detected_board": _review_board(report.detected_board, None, None),
     }
 
+def _calibration_snapshot(calibration: BoardCalibration | None) -> dict[str, int] | None:
+    if calibration is None:
+        return None
+    return {
+        "left": calibration.left,
+        "top": calibration.top,
+        "cell": calibration.cell,
+    }
+
+
+def _calibration_from_payload(payload: dict[str, object]) -> BoardCalibration:
+    raw = payload.get("calibration", payload)
+    if not isinstance(raw, dict):
+        raise ValueError("校正設定必須是 JSON 物件")
+    values = {}
+    for name in ("left", "top", "cell"):
+        value = raw.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"校正 {name} 必須是整數")
+        values[name] = value
+    return BoardCalibration(**values)
+
+
 
 def _profile_from_payload(payload: dict[str, object]) -> RuleProfile:
     raw_profile = payload.get("profile")
+    if raw_profile is None:
+        raw_profile = payload.get("profile_json")
+    if isinstance(raw_profile, str):
+        try:
+            raw_profile = json.loads(raw_profile)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("規則設定 JSON 無效") from exc
     if raw_profile is not None:
         if not isinstance(raw_profile, dict):
             raise ValueError("profile 必須是 JSON 物件")
@@ -1185,6 +1217,7 @@ class BoardInspectionBridge:
             "approval_allowed": bool(state.confirmed and not state.uncertain_cells),
             "selected_cell": list(selected) if selected is not None else None,
             "protected_cell": list(protected) if protected is not None else None,
+            "calibration": _calibration_snapshot(state.calibration),
             "learning_status": state.learning_status,
             "rule_profile": profile.to_dict() if profile is not None else None,
             "route_result": _route_evaluation_snapshot(state.route_evaluation),
@@ -1251,12 +1284,32 @@ class BoardInspectionBridge:
             "devices": list(snapshot.get("devices", ())),
             "selected_cell": list(selected) if isinstance(selected, (list, tuple)) else selected,
             "protected_cell": list(protected) if isinstance(protected, (list, tuple)) else protected,
+            "calibration": (dict(snapshot["calibration"])
+                            if isinstance(snapshot.get("calibration"), dict) else None),
             "route_result": cls._copy_route(snapshot.get("route_result")),
             "search_result": cls._copy_search(snapshot.get("search_result")),
             "rule_profile": deepcopy(profile) if isinstance(profile, dict) else profile,
             "search": search,
             "execution": cls._copy_execution(snapshot.get("execution")),
+            "debug": (dict(snapshot["debug"])
+                      if isinstance(snapshot.get("debug"), dict) else {}),
             "console": [dict(item) for item in snapshot.get("console", ())],
+        }
+
+    def _debug_snapshot_locked(self) -> dict[str, object]:
+        state = self.controller.state
+        return {
+            "bridge_closed": self._closed,
+            "source_name": state.source_name,
+            "confirmed": state.confirmed,
+            "unknown_count": len(state.uncertain_cells),
+            "calibration": _calibration_snapshot(state.calibration),
+            "generation": self._generation,
+            "pending_operations": self._pending_operations,
+            "pending_interactions": self._pending_interactions,
+            "pending_searches": self._pending_searches,
+            "search_generation": self._search_generation,
+            "execution_phase": self._execution_phase,
         }
 
     def _view_locked(self) -> dict[str, object]:
@@ -1281,6 +1334,7 @@ class BoardInspectionBridge:
                 "stop_requested": self._execution_stop_requested,
                 "verification": self._execution_verification,
             },
+            "debug": self._debug_snapshot_locked(),
             "console": self._console,
         })
 
@@ -1533,7 +1587,7 @@ class BoardInspectionBridge:
                         self._selected_device = self._devices[0] if self._devices else ""
                     message = (f"已找到 {len(self._devices)} 個 Android 裝置"
                                if self._devices else "沒有可用的 Android 裝置")
-                    level = "info"
+                    level = "success" if self._devices else "warning"
                 elif phase == "capture":
                     state = self.controller.state
                     self._selected_cell = (
@@ -1548,6 +1602,14 @@ class BoardInspectionBridge:
                     self._controller_snapshot = self._review_snapshot()
                     message = str(state.status)
                     level = "success"
+                elif phase == "calibration":
+                    state = result
+                    self._selected_cell = (
+                        state.uncertain_cells[0] if state.uncertain_cells else None
+                    )
+                    self._controller_snapshot = self._review_snapshot()
+                    message = str(state.status)
+                    level = "success"
                 elif phase == "rules":
                     state = result
                     self._search_status = "idle"
@@ -1555,7 +1617,7 @@ class BoardInspectionBridge:
                     self._search_options = None
                     self._controller_snapshot = self._review_snapshot()
                     message = str(state.status)
-                    level = "info"
+                    level = "success"
                 elif phase == "search":
                     generation, search_result, options = result
                     self._search_progress = None
@@ -1646,7 +1708,10 @@ class BoardInspectionBridge:
         if not isinstance(payload, dict):
             raise ValueError("命令必須是 JSON 物件")
         action = payload.get("action", payload.get("command"))
-        if action not in {"snapshot", "events", "drain_events", "stop_execution", "cancel_execution"}:
+        if action not in {
+            "snapshot", "events", "drain_events", "stop_execution", "cancel_execution",
+            "export_rule_profile", "export_profile",
+        }:
             with self._lock:
                 if self._execution_busy:
                     self._announce("warning", "execution", "執行中；命令已拒絕")
@@ -1657,6 +1722,19 @@ class BoardInspectionBridge:
             return self.drain_events()
         if action == "refresh_devices":
             return self._submit("devices", "正在更新 Android 裝置清單", self._device_lister)
+        if action in {"export_rule_profile", "export_profile"}:
+            with self._lock:
+                profile = self.controller.state.rule_profile
+                if profile is None:
+                    raise ValueError("尚未套用規則設定")
+                profile_data = profile.to_dict()
+                self._announce("success", "rules", f"規則設定已匯出：{profile.name}")
+                return {
+                    "accepted": True,
+                    "profile": profile_data,
+                    "profile_json": profile.to_json(),
+                    "snapshot": self._view_locked(),
+                }
         if action == "select_device":
             serial = payload.get("serial")
             if not isinstance(serial, str) or not serial.strip():
@@ -1706,12 +1784,44 @@ class BoardInspectionBridge:
                     cell = self._resolve_cell(payload)
                 else:
                     cell = self._selected_cell
-            with self._lock:
                 self._invalidate_generation()
             return self._submit(
                 "review",
                 "正在更新保護格",
                 lambda: self._protect(cell),
+            )
+        if action in {"import_rule_profile", "import_profile"}:
+            profile = _profile_from_payload(payload)
+            with self._lock:
+                self._invalidate_generation()
+            return self._submit(
+                "rules",
+                f"正在匯入規則設定：{profile.name}",
+                lambda: self.controller.set_rule_profile(profile),
+            )
+        if action in {"calibrate", "set_calibration", "apply_calibration"}:
+            with self._lock:
+                self._invalidate_generation()
+            return self._submit(
+                "calibration",
+                "正在套用盤面校正",
+                lambda: self.controller.set_calibration(
+                    _calibration_from_payload(payload), auto_search=False
+                ),
+            )
+        if action in {"auto_calibrate", "infer_calibration"}:
+            with self._lock:
+                self._invalidate_generation()
+            return self._submit(
+                "calibration",
+                "正在重新自動校正盤面",
+                lambda: self.controller.set_calibration(
+                    infer_calibration(
+                        self.controller.state.width or 0,
+                        self.controller.state.height or 0,
+                    ),
+                    auto_search=False,
+                ),
             )
         if action in {"set_rule_profile", "update_rules"}:
             profile = _profile_from_payload(payload)

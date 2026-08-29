@@ -121,6 +121,12 @@ h2 {
   color: var(--muted);
 }
 
+#status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-dot {
   width: 9px;
   height: 9px;
@@ -169,6 +175,11 @@ h2 {
 .review-panel {
   display: flex;
   flex-direction: column;
+}
+
+.details-panel {
+  max-height: 320px;
+  overflow: auto;
 }
 
 .review-panel {
@@ -257,6 +268,96 @@ h2 {
 .help-text {
   margin: 10px 0 0;
   color: var(--muted);
+  font-size: 12px;
+}
+
+.operation-status {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.aux-controls {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.aux-controls > summary {
+  padding: 7px 8px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.aux-controls[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.calibration-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  padding: 8px 8px 6px;
+}
+
+.calibration-fields label {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.calibration-fields input {
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-raised);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.calibration-actions,
+.profile-actions,
+.aux-controls > .operation-status,
+.aux-controls > .debug-grid {
+  margin-left: 8px;
+  margin-right: 8px;
+}
+
+.calibration-actions,
+.profile-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.debug-grid div {
+  min-width: 0;
+  padding: 5px 6px;
+  border-radius: 5px;
+  background: var(--panel-raised);
+}
+
+.debug-grid dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.debug-grid dd {
+  margin: 1px 0 0;
+  overflow-wrap: anywhere;
   font-size: 12px;
 }
 
@@ -530,6 +631,7 @@ legend {
 
 
 .console {
+  min-height: 140px;
   overflow: auto;
   padding: 0;
 }

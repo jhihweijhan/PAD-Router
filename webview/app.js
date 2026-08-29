@@ -12,6 +12,23 @@
   const sourceName = document.querySelector("#source-name");
   const sourceSize = document.querySelector("#source-size");
   const selectedDevice = document.querySelector("#selected-device");
+  const deviceStatus = document.querySelector("#device-status");
+  const calibrationLeft = document.querySelector("#calibration-left");
+  const calibrationTop = document.querySelector("#calibration-top");
+  const calibrationCell = document.querySelector("#calibration-cell");
+  const applyCalibration = document.querySelector("#apply-calibration");
+  const autoCalibration = document.querySelector("#auto-calibration");
+  const calibrationStatus = document.querySelector("#calibration-status");
+  const profileFile = document.querySelector("#profile-file");
+  const importProfile = document.querySelector("#import-profile");
+  const exportProfile = document.querySelector("#export-profile");
+  const profileStatus = document.querySelector("#profile-status");
+  const debugSource = document.querySelector("#debug-source");
+  const debugGeneration = document.querySelector("#debug-generation");
+  const debugPending = document.querySelector("#debug-pending");
+  const debugSearchGeneration = document.querySelector("#debug-search-generation");
+  const debugExecutionPhase = document.querySelector("#debug-execution-phase");
+  const debugConfirmed = document.querySelector("#debug-confirmed");
   const busyLabel = document.querySelector("#busy-label");
   const consoleList = document.querySelector("#console-list");
   const consoleCount = document.querySelector("#console-count");
@@ -180,6 +197,13 @@
     };
   }
 
+  function latestEvent(snapshot, phase) {
+    const entries = Array.isArray(snapshot.console) ? snapshot.console : [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      if (entries[index] && entries[index].phase === phase) return entries[index];
+    }
+    return null;
+  }
   function renderSearch(snapshot, hasBoard, busy) {
     const profile = snapshot.rule_profile;
     activeProfile.textContent = profile
@@ -273,6 +297,38 @@
     }
 
     selectedDevice.textContent = selected || "尚未選取";
+    const deviceEvent = latestEvent(snapshot, "devices");
+    deviceStatus.textContent = deviceEvent
+      ? deviceEvent.message
+      : devices.length ? `目前有 ${devices.length} 個可用裝置。` : "尚未更新裝置。";
+    const calibration = snapshot.calibration;
+    if (calibration) {
+      if (document.activeElement !== calibrationLeft) calibrationLeft.value = String(calibration.left);
+      if (document.activeElement !== calibrationTop) calibrationTop.value = String(calibration.top);
+      if (document.activeElement !== calibrationCell) calibrationCell.value = String(calibration.cell);
+    }
+    const calibrationEvent = latestEvent(snapshot, "calibration");
+    calibrationStatus.textContent = calibrationEvent
+      ? calibrationEvent.message
+      : calibration ? `目前校正：${calibration.left}, ${calibration.top}, ${calibration.cell}` : "尚未校正。";
+    applyCalibration.disabled = busy || !source;
+    autoCalibration.disabled = busy || !source;
+    const profileEvent = latestEvent(snapshot, "rules");
+    profileStatus.textContent = profileEvent
+      ? profileEvent.message
+      : "沿用目前規則設定格式。";
+    importProfile.disabled = busy;
+    exportProfile.disabled = busy || !snapshot.rule_profile;
+    const debug = snapshot.debug || {};
+    debugSource.textContent = debug.source_name || "—";
+    debugGeneration.textContent = String(debug.generation === undefined ? "—" : debug.generation);
+    debugPending.textContent = String(debug.pending_operations === undefined ? "—" : debug.pending_operations);
+    debugSearchGeneration.textContent = String(
+      debug.search_generation === null || debug.search_generation === undefined
+        ? "—" : debug.search_generation,
+    );
+    debugExecutionPhase.textContent = debug.execution_phase || "idle";
+    debugConfirmed.textContent = debug.confirmed ? "是" : "否";
     if (source) {
       sourceImage.hidden = false;
       if (sourceImage.src !== source.image) sourceImage.src = source.image;
@@ -349,13 +405,21 @@
     }
 
     const entriesForConsole = Array.isArray(snapshot.console) ? snapshot.console : [];
+    const latestConsole = entriesForConsole[entriesForConsole.length - 1];
+    statusDot.style.background = busy
+      ? "var(--warning)"
+      : latestConsole && latestConsole.level === "error" ? "var(--error)" : "var(--accent)";
     consoleCount.textContent = String(entriesForConsole.length);
     const fragment = document.createDocumentFragment();
+    const levelLabels = { info: "資訊", success: "成功", warning: "警告", error: "錯誤" };
     for (const entry of entriesForConsole) {
       const item = document.createElement("li");
+      const level = entry.level || "info";
+      const levelLabel = levelLabels[level] || level;
       const phase = entry.phase ? `[${entry.phase}] ` : "";
-      item.className = entry.level || "info";
-      item.textContent = `${phase}${entry.message || ""}`;
+      item.className = level;
+      item.dataset.level = level;
+      item.textContent = `[${levelLabel}] ${phase}${entry.message || ""}`;
       fragment.append(item);
     }
     consoleList.replaceChildren(fragment);
@@ -375,14 +439,18 @@
       queueRender(reply);
     }
   }
-
   async function command(action, extra = {}) {
     try {
       const reply = await window.pywebview.api.command({ action, ...extra });
       applyReply(reply);
+      return reply;
     } catch (error) {
-      status.textContent = error.message || String(error);
+      const message = error.message || String(error);
+      status.textContent = message;
       statusDot.style.background = "var(--error)";
+      if (action.includes("calibr")) calibrationStatus.textContent = message;
+      if (action.includes("profile")) profileStatus.textContent = message;
+      return null;
     }
   }
 
@@ -393,6 +461,41 @@
     } catch (_error) {
       // The window can close while a poll is in flight.
     }
+  }
+
+  function calibrationPayload() {
+    return {
+      left: Number(calibrationLeft.value),
+      top: Number(calibrationTop.value),
+      cell: Number(calibrationCell.value),
+    };
+  }
+
+  async function downloadProfile() {
+    const reply = await command("export_rule_profile");
+    if (!reply || typeof reply.profile_json !== "string") return;
+    const blob = new Blob([reply.profile_json], { type: "application/json" });
+    const link = document.createElement("a");
+    const profileName = reply.profile && reply.profile.name
+      ? reply.profile.name : "rule-profile";
+    link.download = `${profileName.replace(/[^\w.-]+/g, "_").slice(0, 80) || "rule-profile"}.json`;
+    link.href = URL.createObjectURL(blob);
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(link.href), 0);
+    profileStatus.textContent = `已匯出：${profileName}`;
+  }
+
+  function importProfileFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => command("import_rule_profile", {
+      profile_json: String(reader.result || ""),
+    });
+    reader.onerror = () => {
+      profileStatus.textContent = "無法讀取規則設定檔。";
+      status.textContent = profileStatus.textContent;
+      statusDot.style.background = "var(--error)";
+    };
+    reader.readAsText(file);
   }
 
   function correctionValue() {
@@ -439,6 +542,17 @@
   refresh.addEventListener("click", () => command("refresh_devices"));
   device.addEventListener("change", () => command("select_device", { serial: device.value }));
   capture.addEventListener("click", () => command("capture_screen"));
+  applyCalibration.addEventListener("click", () => command("calibrate", calibrationPayload()));
+  autoCalibration.addEventListener("click", () => command("auto_calibrate"));
+  importProfile.addEventListener("click", () => profileFile.click());
+  profileFile.addEventListener("change", () => {
+    const [file] = profileFile.files || [];
+    if (!file) return;
+    profileStatus.textContent = `正在讀取：${file.name}`;
+    importProfileFile(file);
+    profileFile.value = "";
+  });
+  exportProfile.addEventListener("click", () => downloadProfile());
   window.addEventListener("pywebviewready", ready);
   if (window.pywebview && window.pywebview.api) ready();
 })();
