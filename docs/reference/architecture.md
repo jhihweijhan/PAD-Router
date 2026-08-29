@@ -44,7 +44,9 @@ flowchart LR
 - `resolve_matches`、`settle`：依橫／縱三連與既有連通規則計算 Match，`cascade` 決定是否繼續處理落下後的 Match。
 - `RuleProfile`、`LeaderCondition`、`ConditionGroup`、`ExternalCondition`：描述條件群組、外部條件與危害策略，並可序列化成 JSON。
 - `evaluate_manual_route`：驗證路徑並回傳 `RouteEvaluation`，包含 Match rounds、Combo、條件結果、危害結果及 `execution_eligible`。
-- `search_qualifying_route`：固定 seed 的隨機嘗試加條件束搜尋；候選先服從既有條件與 shape 優先，再依實際 Combo、步數與路徑穩定排序。一般條件束搜尋的同色珠距離勢能只作次級 tie-break。
+- `max_combo_layout`：列舉 5x6 的 22 種 3 格方塊鋪法並指派珠種，回傳本盤面可達的目標版型與其 Combo 數；GUI 直接顯示。
+- `_max_combo_route`：專用最大 Combo 束搜尋，節點只算首輪 Match 與剩餘珠三連距離，束寬 `max(30, attempts * 12)`。可用 `path`／`keep` 從既有路徑接續，保留已成立的 Match 格子，讓有條件的搜尋排完形狀後繼續衝 Combo。
+- `search_qualifying_route`：固定 seed 的隨機嘗試加條件束搜尋；最大 Combo 候選先依首輪直接 Combo 與直接最大 Combo 預估排序，不把落珠連鎖列入排名。既有 `combo_count` 仍保留完整 cascade 評估與顯示語意。
 - `solve`／`score`：CLI 使用的 Combo 導向束搜尋；`score` 保留 Combo 加上同色珠最近曼哈頓距離懲罰的既有語意。
 - `play`：執行 ADB 手勢，並在放手前後進行必要的安全與盤面驗證。
 

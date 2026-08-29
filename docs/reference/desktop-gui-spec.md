@@ -14,7 +14,7 @@ GUI 使用 Python Tk 建立，限制在固定 6×5 Standard Board。來源可以
 4. 若盤面含問號，依 `max_recognition_attempts`（1–5，預設 2）用同一份來源與校正重跑辨識，直到乾淨或達到上限。
 5. `unknown` 會讓 GUI 進入 review mode；使用者可回答珠種並永久保存人工樣本。Ready 狀態另有 correction mode，可選取任何已辨識格並覆寫疑似錯誤。
 6. 規則選單變更後立即建立並套用 `RuleProfile`；GUI 可載入或儲存 Profile JSON。
-7. 在確認盤面上手動畫路徑或搜尋 Candidate Route，顯示 Match、cascade、Combo、危害與條件結果。
+7. 在確認盤面上手動畫路徑或搜尋 Candidate Route，顯示 Match、cascade、既有 Combo、直接 Combo、直接最大 Combo 預估、危害與條件結果。
 8. 只有可執行候選才可按「執行路徑」。按下即代表接受目前盤面，程式先寫入低權重資料，再直接呼叫 ADB；不再跳第二次確認視窗。
 9. 保留手勢後盤面驗證；驗證失敗或資料寫入失敗時不得把流程當成成功。
 
@@ -28,7 +28,7 @@ GUI 使用 Python Tk 建立，限制在固定 6×5 Standard Board。來源可以
 
 ## 規則與搜尋
 
-`RuleProfile` 包含條件群組、外部條件與危害策略；`RouteSearchOptions` 包含嘗試次數、seed、步數界限與 cascade。搜尋保留固定 seed 可重現性，先服從條件／危害／shape 優先，再以實際 Combo、步數與路徑穩定性選擇結果。一般條件束搜尋的同色珠距離勢能只是次級 tie-break，不取代實際 Combo，也不保證全域最佳。
+`RuleProfile` 包含條件群組、外部條件與危害策略；`RouteSearchOptions` 包含嘗試次數、seed、步數界限與 cascade。GUI 的執行步數上限預設 80：最大 Combo 的瓶頸是步數而非束寬，50 步會漏掉需要長路徑才能收尾的最後一組。Combo 下限的選項到「至少 10 Combo（5x6 上限）」為止，對應 5x6 盤面 3 顆一塊交錯排列的理論上限。搜尋保留固定 seed 可重現性，先服從條件／危害／shape 優先，再以直接 Match 數、扣除指定消法後的直接最大 Combo 預估、步數與路徑穩定性選擇結果；落珠連鎖的實際 Combo 不參與這個排序。一般條件束搜尋的同色珠距離勢能只是次級 tie-break，不取代直接最大 Combo，也不保證全域最佳。
 
 ## 安全條件
 

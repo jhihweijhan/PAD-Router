@@ -2,6 +2,7 @@ import json
 import os
 import struct
 import tempfile
+import threading
 import unittest
 import zlib
 from pathlib import Path
@@ -329,6 +330,78 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(state.source_name, "test-device")
         self.assertEqual((state.width, state.height), (12, 10))
         self.assertFalse(state.confirmed)
+
+    def test_clean_png_and_capture_with_preset_profile_auto_search(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        executions = []
+
+        for name, load in (
+            ("PNG", lambda controller: controller.load_png(self.path)),
+            ("capture", lambda controller: controller.capture_device("test-device")),
+        ):
+            with self.subTest(name=name):
+                controller = BoardInspectionController(
+                    detector=lambda *_args: board, capture=lambda _serial: source,
+                    executor=lambda *_args, **_kwargs: executions.append(True),
+                )
+                controller.set_rule_profile(RuleProfile("preset"))
+
+                state = load(controller)
+
+                self.assertIsNotNone(state.route_search)
+                self.assertIs(state.route_search.candidate, state.route_evaluation)
+                self.assertEqual(state.search_options, RouteSearchOptions())
+                self.assertTrue(state.route_overlay)
+
+        self.assertEqual(executions, [])
+
+    def test_source_auto_search_skips_uncertain_board_or_missing_profile(self):
+        clean = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        no_profile = BoardInspectionController(detector=lambda *_args: clean)
+        no_profile.set_protected_cell((2, 3))
+        uncertain = BoardInspectionController(detector=lambda *_args: self.board)
+        uncertain.set_rule_profile(RuleProfile("preset"))
+
+        no_profile_state = no_profile.load_png(self.path)
+        self.assertIsNone(no_profile_state.route_search)
+        self.assertEqual(no_profile_state.protected_cell, (2, 3))
+        self.assertIsNone(uncertain.load_png(self.path).route_search)
+
+    def test_protection_researches_rejects_manual_route_and_survives_new_source(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        controller = BoardInspectionController(
+            detector=lambda *_args: board, capture=lambda _serial: source,
+        )
+        controller.set_rule_profile(RuleProfile("preset"))
+        controller.capture_device("first")
+        controller.approve_route(explicit_confirmation=True)
+        protected = controller.state.route_evaluation.route[0]
+
+        protected_state = controller.set_protected_cell(protected)
+
+        self.assertEqual(protected_state.protected_cell, protected)
+        self.assertFalse(protected_state.route_approved)
+        self.assertIsNotNone(protected_state.route_search)
+        self.assertNotIn(protected, protected_state.route_evaluation.route)
+        with self.assertRaisesRegex(ValueError, "保護"):
+            controller.evaluate_manual_route((protected,))
+
+        refreshed = controller.capture_device("second")
+        self.assertEqual(refreshed.protected_cell, protected)
+        self.assertNotIn(protected, refreshed.route_evaluation.route)
+
+        cleared = controller.set_protected_cell(None)
+        self.assertIsNone(cleared.protected_cell)
+        self.assertIsNotNone(cleared.route_search)
+
+    def test_protected_cell_rejects_invalid_coordinates(self):
+        for cell in ((-1, 0), (ROWS, 0), (0, COLS), (0,), (True, 0), "0,0"):
+            with self.subTest(cell=cell), self.assertRaises(ValueError):
+                self.controller.set_protected_cell(cell)
 
     def test_prototype_model_persists_a_human_label_and_predicts_it(self):
         feature = CellFeatures(.66, .82, .86, 0, 0, 0, 0, 0, 0, 0)
@@ -661,6 +734,221 @@ class ExecuteRouteUiTests(unittest.TestCase):
         self.assertEqual(len(errors), 2)
 
 
+class ContinuousExecutionTests(unittest.TestCase):
+    @staticmethod
+    def _controller(executor, capture_calls, protected_cell=(0, 0)):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+
+        def capture(serial):
+            capture_calls.append(serial)
+            return source
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board, capture=capture, executor=executor,
+        )
+        controller.set_rule_profile(RuleProfile("continuous"))
+        controller.set_protected_cell(protected_cell, recompute=False)
+        controller.capture_device("test-device")
+        return controller
+
+    def test_two_rounds_then_user_stop_preserves_protected_route(self):
+        stop = threading.Event()
+        capture_calls = []
+        routes = []
+
+        def executor(*args, on_verification):
+            routes.append(args[1])
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, expected, 0, True, "verified"))
+            if len(routes) == 2:
+                stop.set()
+            return True
+
+        controller = self._controller(executor, capture_calls)
+        status = controller.execute_continuously("test-device", stop)
+
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(capture_calls, ["test-device", "test-device"])
+        self.assertTrue(all((0, 0) not in route for route in routes))
+        self.assertEqual(status, "連續執行已由使用者停止")
+        self.assertEqual(controller.state.status, status)
+
+    def test_executor_failure_stops_without_capture_or_second_execution(self):
+        capture_calls = []
+        executions = []
+
+        def executor(*_args, **_kwargs):
+            executions.append(True)
+            return False
+
+        controller = self._controller(executor, capture_calls)
+        status = controller.execute_continuously("test-device", threading.Event())
+
+        self.assertEqual(executions, [True])
+        self.assertEqual(capture_calls, ["test-device"])
+        self.assertIn("執行或驗證失敗", status)
+
+    def test_failed_verification_stops_before_rescan(self):
+        capture_calls = []
+        executions = []
+
+        def executor(*args, on_verification):
+            executions.append(True)
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, args[6], 2, False,
+                                               "post_gesture_mismatch"))
+            return True
+
+        controller = self._controller(executor, capture_calls)
+        status = controller.execute_continuously("test-device", threading.Event())
+
+        self.assertEqual(executions, [True])
+        self.assertEqual(capture_calls, ["test-device"])
+        self.assertIn("執行或驗證失敗", status)
+
+    def test_capture_error_stops_without_second_execution(self):
+        capture_calls = []
+        executions = []
+
+        def executor(*args, on_verification):
+            executions.append(True)
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, expected, 0, True, "verified"))
+            return True
+
+        controller = self._controller(executor, capture_calls)
+
+        def fail_capture(_serial):
+            capture_calls.append("failed")
+            raise RuntimeError("capture failed")
+
+        controller._capture = fail_capture
+        status = controller.execute_continuously("test-device", threading.Event())
+
+        self.assertEqual(executions, [True])
+        self.assertEqual(capture_calls, ["test-device", "failed"])
+        self.assertIn("capture failed", status)
+
+    def test_uncertain_recapture_stops_without_second_execution(self):
+        capture_calls = []
+        executions = []
+
+        def executor(*args, on_verification):
+            executions.append(True)
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, expected, 0, True, "verified"))
+            return True
+
+        controller = self._controller(executor, capture_calls)
+        unknown = tuple(tuple(Orb("unknown", visual_class="unknown") for _ in range(COLS))
+                        for _ in range(ROWS))
+        controller._detector = lambda *_args: unknown
+        status = controller.execute_continuously("test-device", threading.Event())
+
+        self.assertEqual(executions, [True])
+        self.assertEqual(capture_calls, ["test-device", "test-device"])
+        self.assertIn("新盤面辨識不確定", status)
+
+    def test_noneligible_new_route_stops_without_second_execution(self):
+        capture_calls = []
+        executions = []
+
+        def executor(*args, on_verification):
+            executions.append(True)
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, expected, 0, True, "verified"))
+            return True
+
+        controller = self._controller(executor, capture_calls)
+        original_capture = controller._capture
+
+        def capture(serial):
+            controller.set_rule_profile(RuleProfile(
+                "blocked", condition_groups=(ConditionGroup.all_of((
+                    LeaderCondition.combo_minimum(99),
+                )),),
+            ))
+            return original_capture(serial)
+
+        controller._capture = capture
+        with patch("pad_router_gui.RouteSearchOptions", return_value=RouteSearchOptions(
+                attempts=1, min_steps=0, max_steps=0)):
+            status = controller.execute_continuously("test-device", threading.Event())
+
+        self.assertEqual(executions, [True])
+        self.assertEqual(capture_calls, ["test-device", "test-device"])
+        self.assertIn("新盤面沒有符合條件的路徑", status)
+
+    def test_gui_start_stop_delegates_worker_updates_through_after(self):
+        threads = []
+        callbacks = []
+        displays = []
+        calls = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                threads.append(self)
+
+            def start(self):
+                pass
+
+        state = SimpleNamespace(
+            route_evaluation=SimpleNamespace(execution_eligible=True),
+            status="ready",
+        )
+
+        def run(serial, stop_event, on_state):
+            calls.append((serial, stop_event))
+            state.status = "連續執行中"
+            on_state(state)
+            return "連續執行已由使用者停止"
+
+        app = object.__new__(BoardInspectionApp)
+        app.controller = SimpleNamespace(state=state, execute_continuously=run)
+        app.root = SimpleNamespace(after=lambda _delay, callback: callbacks.append(callback))
+        app._serial = SimpleNamespace(get=lambda: "test-device")
+        app._manual_route = []
+        app._auto_search_generation = 0
+        app._status = SimpleNamespace(set=lambda _value: None)
+        app._execute_button = SimpleNamespace(configure=lambda **_kwargs: None)
+        app._continuous_button = SimpleNamespace(configure=lambda **_kwargs: None)
+        app._display = displays.append
+        app._show_error = self.fail
+
+        with patch("pad_router_gui.threading.Thread", DeferredThread):
+            app.start_continuous_execution()
+            self.assertEqual(calls, [])
+            threads[0].target()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(displays, [])
+        app.stop_continuous_execution()
+        self.assertTrue(calls[0][1].is_set())
+        self.assertEqual(len(callbacks), 1)
+        callbacks[0]()
+        self.assertEqual(displays, [state])
+
+    def test_active_continuous_run_blocks_file_dialog_actions(self):
+        statuses = []
+        app = object.__new__(BoardInspectionApp)
+        app._continuous_stop = threading.Event()
+        app._status = SimpleNamespace(set=statuses.append)
+
+        with (patch("tkinter.filedialog.askopenfilename",
+                    side_effect=AssertionError("dialog opened")),
+              patch("tkinter.filedialog.asksaveasfilename",
+                    side_effect=AssertionError("dialog opened"))):
+            app.open_png()
+            app.save_profile()
+
+        self.assertEqual(len(statuses), 2)
+        self.assertTrue(all("先停止" in status for status in statuses))
+
+
 class RecognitionRetryControllerTests(unittest.TestCase):
     def setUp(self):
         handle, path = tempfile.mkstemp(suffix=".png")
@@ -973,6 +1261,138 @@ class ReadyRouteModeTests(unittest.TestCase):
         self.assertEqual(app._manual_route, [(0, 0)])
         self.assertTrue(app._dragging_route)
 
+    def test_route_drag_cannot_start_or_extend_through_protected_cell(self):
+        state = SimpleNamespace(uncertain_cells=(), protected_cell=(0, 1))
+        app = object.__new__(BoardInspectionApp)
+        app.controller = SimpleNamespace(state=state)
+        app._correction_mode = False
+        app._manual_route = []
+        app._dragging_route = False
+        app._selected_label = SimpleNamespace(set=lambda _value: None)
+        app._display = lambda _state: None
+        app._cell_at = lambda event: event.cell
+
+        app.route_press(SimpleNamespace(cell=(0, 1)))
+        self.assertEqual(app._manual_route, [])
+        self.assertFalse(app._dragging_route)
+
+        app.route_press(SimpleNamespace(cell=(0, 0)))
+        app.route_motion(SimpleNamespace(cell=(0, 1)))
+        self.assertEqual(app._manual_route, [(0, 0)])
+
+
+class ProtectedCellUiTests(unittest.TestCase):
+    def test_capture_installs_source_then_schedules_search_off_the_ui_thread(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        profile = RuleProfile("preset")
+        state = SimpleNamespace(
+            source_name="test-device", pixels=b"pixels", board=board, confirmed_board=board,
+            confirmed=True, uncertain_cells=(), rule_profile=profile, protected_cell=None,
+        )
+        captures = []
+        applied = []
+        callbacks = []
+        threads = []
+        result = SimpleNamespace(candidate=SimpleNamespace(route=((0, 0),)))
+
+        class DeferredThread:
+            def __init__(self, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                threads.append(self)
+
+            def start(self):
+                pass
+
+        controller = SimpleNamespace(
+            state=state,
+            capture_device=lambda serial, auto_search=True: (
+                captures.append((serial, auto_search)) or state),
+            _apply_search_result=lambda value, options: applied.append((value, options)),
+        )
+        app = object.__new__(BoardInspectionApp)
+        app.controller = controller
+        app.root = SimpleNamespace(after=lambda _delay, callback: callbacks.append(callback))
+        app._serial = SimpleNamespace(get=lambda: "test-device")
+        app._manual_route = []
+        app._auto_search_generation = 0
+        app._display = lambda _state: None
+
+        with (patch("pad_router_gui.threading.Thread", DeferredThread),
+              patch("pad_router_gui.search_qualifying_route", return_value=result) as search):
+            app.capture_device()
+            self.assertEqual(captures, [("test-device", False)])
+            self.assertEqual(len(threads), 1)
+            self.assertEqual(len(callbacks), 1)
+            search.assert_not_called()
+            self.assertEqual(applied, [])
+
+            threads[0].target()
+            search.assert_called_once()
+            self.assertEqual(applied, [])
+            self.assertEqual(len(callbacks), 1)
+
+            callbacks[0]()
+            self.assertEqual(applied, [(result, RouteSearchOptions())])
+
+            app.capture_device()
+            threads[1].target()
+            app._apply(lambda: state)  # A later manual/search/execute-style state action.
+            callbacks[1]()
+
+        self.assertEqual(applied, [(result, RouteSearchOptions())])
+
+    def test_protect_and_clear_actions_use_the_selected_coordinate(self):
+        calls = []
+        state = SimpleNamespace(board=None, uncertain_cells=(), rule_profile=None)
+        app = object.__new__(BoardInspectionApp)
+        app.controller = SimpleNamespace(
+            state=state,
+            set_protected_cell=lambda cell, recompute=True: calls.append((cell, recompute)) or state,
+        )
+        app._selected_cell = (2, 3)
+        app._manual_route = [(0, 0)]
+        app._dragging_route = True
+        app._apply = lambda action: action()
+
+        app.protect_selected_cell()
+        app.clear_protected_cell()
+
+        self.assertEqual(calls, [((2, 3), False), (None, False)])
+        self.assertEqual(app._manual_route, [])
+        self.assertFalse(app._dragging_route)
+
+    def test_protected_cell_is_marked_and_capture_button_lives_in_right_controls(self):
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+            source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+            controller = BoardInspectionController(
+                detector=lambda *_args: board, capture=lambda _serial: source,
+            )
+            app = BoardInspectionApp(root, controller)
+            controller.capture_device("test-device")
+            app._selected_cell = (0, 0)
+            app._display(controller.set_protected_cell((0, 0)))
+
+            self.assertTrue(app.board.find_withtag("protected"))
+            self.assertTrue(app.source.find_withtag("protected"))
+            self.assertIn("保護格", app._protected_label.get())
+            self.assertIn("第 1 列、第 1 行", app._protected_label.get())
+            self.assertEqual(app._capture_button.winfo_parent(), app.board.winfo_parent())
+
+            def buttons(widget):
+                return [child for child in widget.winfo_children()
+                        if child.winfo_class() == "TButton"] + [button for child in widget.winfo_children()
+                                                               for button in buttons(child)]
+
+            self.assertEqual(sum(button.cget("text") == "擷取畫面" for button in buttons(root)), 1)
+        finally:
+            root.destroy()
+
 
 class ManualRouteButtonTests(unittest.TestCase):
     def test_manual_route_button_displays_controller_state_not_evaluation(self):
@@ -1029,7 +1449,33 @@ class ScreenshotPhotoTests(unittest.TestCase):
 
 
 class ConditionColorUiTests(unittest.TestCase):
-    def test_max_combo_does_not_offer_a_colour_until_a_shape_is_selected(self):
+    def test_untyped_shape_conditions_restore_as_untyped_controls(self):
+        self.assertEqual(
+            BoardInspectionApp._condition_selection(LeaderCondition.shape("l")),
+            ("L 型", "不指定"),
+        )
+        self.assertEqual(
+            BoardInspectionApp._condition_selection(LeaderCondition.connected_orb_count(4, exact=True)),
+            ("4 顆消除", "不指定"),
+        )
+
+    def test_shape_can_be_left_untyped_from_the_gui(self):
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = BoardInspectionApp(root)
+            app._condition_choices[0].set("十字型")
+
+            self.assertIn("不指定", app._condition_color_boxes[0].cget("values"))
+            self.assertEqual(app._condition_colors[0].get(), "不指定")
+            self.assertEqual(app.controller.state.rule_profile.condition_groups[0].conditions[0].value,
+                             "cross")
+        finally:
+            root.destroy()
+
+    def test_shape_defaults_to_untyped_but_keeps_the_colour_choice_available(self):
         import tkinter as tk
 
         root = tk.Tk()
@@ -1039,7 +1485,7 @@ class ConditionColorUiTests(unittest.TestCase):
             self.assertEqual(app._condition_colors[0].get(), "不指定")
             self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "disabled")
             app._condition_choices[0].set("十字型")
-            self.assertEqual(app._condition_colors[0].get(), "火")
+            self.assertEqual(app._condition_colors[0].get(), "不指定")
             self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "readonly")
             app._condition_choices[0].set("不限（以最大 Combo 為主）")
             self.assertEqual(app._condition_colors[0].get(), "不指定")
@@ -1105,6 +1551,14 @@ class AutoProfileUiTests(unittest.TestCase):
 
 
 class RuleProfileSelectionTests(unittest.TestCase):
+    def test_untyped_shape_and_four_orb_choices_use_no_orb_type(self):
+        profile = rule_profile_from_selections(
+            (("L 型", "不指定"), ("4 顆消除", "不指定")),
+            "全部符合", "避免危害珠", "無"
+        )
+
+        self.assertEqual([item.value for item in profile.condition_groups[0].conditions], ["l", None])
+
     def test_fixed_choices_build_combined_conditions_without_json_input(self):
         profile = rule_profile_from_selections(
             (("至少 5 Combo", "火"), ("十字型", "暗"), ("4 顆消除", "水")),

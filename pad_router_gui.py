@@ -11,9 +11,11 @@ from __future__ import annotations
 import binascii
 import json
 import math
+import queue
 import subprocess
 import struct
 import tempfile
+import threading
 import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,9 +34,11 @@ from pad_router import (
     PlayVerification,
     RouteEvaluation,
     RouteSearchOptions,
+    max_combo_layout,
     RouteSearchResult,
     RuleProfile,
     _cell_features,
+    _validate_protected_cell,
     detect_board_pixels,
     evaluate_manual_route,
     load_rule_profile,
@@ -86,7 +90,9 @@ class OrbPrototypeModel:
     @staticmethod
     def _distance(left: list[float], right: list[float]) -> float:
         hue = min(abs(left[0] - right[0]), 1.0 - abs(left[0] - right[0]))
-        weights = (1.4, 0.45, 0.75, 0.35, 0.25, 0.25, 0.25, 0.25, 0.25, 0.4)
+        # Saturation/value stay near zero weight: the '+' flash moves them by
+        # 0.25 between captures, which put every learned sample out of range.
+        weights = (1.4, 0.15, 0.15, 0.35, 0.25, 0.25, 0.25, 0.25, 0.25, 0.4)
         distance = sum(weight * abs(a - b) for weight, a, b in zip(
             weights, (hue, *left[1:]), (0.0, *right[1:])
         ))
@@ -94,8 +100,8 @@ class OrbPrototypeModel:
                 and left[10] >= 0 and right[10] >= 0):
             center_hue = min(abs(left[10] - right[10]), 1.0 - abs(left[10] - right[10]))
             distance += (0.5 * center_hue
-                         + 0.2 * abs(left[11] - right[11])
-                         + 0.2 * abs(left[12] - right[12]))
+                         + 0.05 * abs(left[11] - right[11])
+                         + 0.05 * abs(left[12] - right[12]))
         if (len(left) == len(right) and len(left) > 18
                 and len(left[13:]) == len(right[13:])):
             distance += 0.8 * sum(abs(a - b) for a, b in zip(left[13:], right[13:])) / len(left[13:])
@@ -218,6 +224,10 @@ CONDITION_PRESETS = {
     "至少 3 Combo": (LeaderCondition.combo_minimum(3),),
     "至少 5 Combo": (LeaderCondition.combo_minimum(5),),
     "至少 7 Combo": (LeaderCondition.combo_minimum(7),),
+    # 上限依 pazuma「最大火力配置：コンボ」的 2 色盤面表，5x6 在 15-15 分佈時為 10 Combo。
+    "至少 8 Combo": (LeaderCondition.combo_minimum(8),),
+    "至少 9 Combo": (LeaderCondition.combo_minimum(9),),
+    "至少 10 Combo（5x6 上限）": (LeaderCondition.combo_minimum(10),),
     "消除火珠": (LeaderCondition.attribute("fire"),),
     "消除水珠": (LeaderCondition.attribute("water"),),
     "消除木珠": (LeaderCondition.attribute("wood"),),
@@ -237,7 +247,7 @@ SHAPE_PRESETS = {
 }
 COLORED_PRESETS = tuple(SHAPE_PRESETS) + ("4 顆消除",)
 CONDITION_OPTIONS = tuple(CONDITION_PRESETS) + COLORED_PRESETS
-CONDITION_COLORS = tuple(ORB_LABELS[name] for name in NAMES.values())
+CONDITION_COLORS = ("不指定",) + tuple(ORB_LABELS[name] for name in NAMES.values())
 NO_CONDITION = "不限（以最大 Combo 為主）"
 GROUP_OPERATORS = {"全部符合": "all", "任一符合": "any"}
 HAZARD_POLICIES = {"避免危害珠": "avoid", "允許危害珠": "allow"}
@@ -262,10 +272,11 @@ def rule_profile_from_selections(condition_selections: Iterable[tuple[str, str] 
             selections.append((label, color))
     conditions: list[LeaderCondition] = []
     for label, color in selections:
+        orb_type = None if color == "不指定" else ORB_KINDS[color]
         if label in SHAPE_PRESETS:
-            conditions.append(LeaderCondition.shape(SHAPE_PRESETS[label], orb_type=ORB_KINDS[color]))
+            conditions.append(LeaderCondition.shape(SHAPE_PRESETS[label], orb_type=orb_type))
         elif label == "4 顆消除":
-            conditions.append(LeaderCondition.connected_orb_count(4, ORB_KINDS[color], exact=True))
+            conditions.append(LeaderCondition.connected_orb_count(4, orb_type, exact=True))
         else:
             conditions.extend(CONDITION_PRESETS[label])
     groups = (ConditionGroup(conditions, GROUP_OPERATORS[operator_label]),) if conditions else ()
@@ -491,6 +502,7 @@ class BoardInspectionState:
     route_overlay: tuple[dict[str, object], ...] = ()
     search_options: RouteSearchOptions | None = None
     learning_status: str = "尚未學習資料"
+    protected_cell: tuple[int, int] | None = None
 
     @property
     def source_path(self) -> str | None:
@@ -574,7 +586,8 @@ class BoardInspectionController:
             return
         self._model.learn(orb, feature, human=True, cell=(row, col))
 
-    def _with_source(self, source: Screenshot, source_name: str) -> BoardInspectionState:
+    def _with_source(self, source: Screenshot, source_name: str,
+                     auto_search: bool = True) -> BoardInspectionState:
         width, height, pixels = source
         if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
             raise ValueError("截圖必須包含 width×height 個 BGRA 像素")
@@ -584,11 +597,12 @@ class BoardInspectionController:
             width, height, pixels, calibration.to_grid()
         )
         return self._replace_source(source_name, source, calibration, detected, learned,
-                                    recognition_attempts)
+                                    recognition_attempts, auto_search)
 
     def _replace_source(self, source_name: str, source: Screenshot,
                         calibration: BoardCalibration, detected: Board, learned: str = "",
-                        recognition_attempts: int = 1) -> BoardInspectionState:
+                        recognition_attempts: int = 1,
+                        auto_search: bool = True) -> BoardInspectionState:
         uncertain = _uncertain_cells(detected)
         status = (f"已載入 {source_name}；有 {len(uncertain)} 格需要手動修正"
                   if uncertain else f"已載入 {source_name}；辨識完成")
@@ -602,9 +616,11 @@ class BoardInspectionController:
         state = BoardInspectionState(source_name, source[0], source[1], source[2], calibration,
                                      detected, detected, detected if not uncertain else None, not uncertain,
                                      uncertain, (), status, learning_status=learned or "目前畫面尚未學習")
-        if self.state.rule_profile is not None:
-            state = replace(state, rule_profile=self.state.rule_profile)
+        state = replace(state, rule_profile=self.state.rule_profile,
+                        protected_cell=self.state.protected_cell)
         self.state = self._with_overlay(state)
+        if auto_search and not uncertain and self.state.rule_profile is not None:
+            self.search_qualifying_route()
         return self.state
 
     def _with_overlay(self, state: BoardInspectionState) -> BoardInspectionState:
@@ -625,16 +641,16 @@ class BoardInspectionController:
         return tuple({"cell": cell, "step": index, "x": grid.point(*cell)[0], "y": grid.point(*cell)[1]}
                      for index, cell in enumerate(result.route, 1))
 
-    def load_png(self, path: str | Path) -> BoardInspectionState:
+    def load_png(self, path: str | Path, auto_search: bool = True) -> BoardInspectionState:
         if Path(path).suffix.lower() != ".png":
             raise ValueError("僅支援 PNG 圖片")
-        return self._with_source(decode_png(path), str(path))
+        return self._with_source(decode_png(path), str(path), auto_search)
 
-    def capture_device(self, serial: str) -> BoardInspectionState:
+    def capture_device(self, serial: str, auto_search: bool = True) -> BoardInspectionState:
         serial = serial.strip()
         if not serial:
             raise ValueError("請選擇裝置")
-        return self._with_source(self._capture(serial), serial)
+        return self._with_source(self._capture(serial), serial, auto_search)
 
     def set_calibration(self, calibration: BoardCalibration) -> BoardInspectionState:
         if self.state.pixels is None or self.state.width is None or self.state.height is None:
@@ -703,6 +719,17 @@ class BoardInspectionController:
                              status=f"已套用規則設定：{profile.name}")
         return self.state
 
+    def set_protected_cell(self, cell: tuple[int, int] | None,
+                           recompute: bool = True) -> BoardInspectionState:
+        cell = _validate_protected_cell(cell)
+        self.state = replace(self.state, protected_cell=cell)
+        self.invalidate_route("已清除保護格" if cell is None else
+                              f"已保護第 {cell[0] + 1} 列、第 {cell[1] + 1} 行")
+        if (recompute and self.state.board is not None and not self.state.uncertain_cells
+                and self.state.rule_profile is not None):
+            self.search_qualifying_route()
+        return self.state
+
     def save_rule_profile(self, path: str | Path, profile: RuleProfile | None = None) -> None:
         profile = profile or self.state.rule_profile
         if profile is None:
@@ -720,7 +747,10 @@ class BoardInspectionController:
         profile = profile or self.state.rule_profile
         if profile is None:
             raise ValueError("請先套用規則設定，再評估路徑")
-        result = evaluate_manual_route(board, path, profile, confirmed=self.state.confirmed, cascade=cascade)
+        route = tuple(path)
+        if self.state.protected_cell in route:
+            raise ValueError("路徑不可碰觸保護格")
+        result = evaluate_manual_route(board, route, profile, confirmed=self.state.confirmed, cascade=cascade)
         self.state = replace(self.state, route_evaluation=result, route_approved=False,
                              verification=None,
                              route_search=None, route_overlay=self._route_overlay(result), search_options=None,
@@ -735,14 +765,19 @@ class BoardInspectionController:
         if profile is None:
             raise ValueError("請先套用規則設定，再搜尋路徑")
         options = options if options is not None else RouteSearchOptions()
-        result = search_qualifying_route(board, profile, options, confirmed=self.state.confirmed)
+        result = search_qualifying_route(board, profile, options, confirmed=self.state.confirmed,
+                                         protected_cell=self.state.protected_cell)
+        self._apply_search_result(result, options)
+        return result
+
+    def _apply_search_result(self, result: RouteSearchResult,
+                             options: RouteSearchOptions) -> None:
         candidate = result.candidate
         self.state = replace(self.state, route_search=result, route_evaluation=candidate,
                              route_approved=False, verification=None, route_overlay=self._route_overlay(candidate),
                              search_options=options,
                              status=("搜尋完成：找到符合條件的路徑" if candidate and candidate.qualifying
                                      else "搜尋完成：沒有符合條件的路徑"))
-        return result
 
     def search_route(self, options: RouteSearchOptions | None = None) -> RouteSearchResult:
         return self.search_qualifying_route(options)
@@ -823,6 +858,40 @@ class BoardInspectionController:
                              search_options=None, status=status)
         return succeeded
 
+    def execute_continuously(self, serial: str, stop_event: threading.Event,
+                             on_state: Callable[[BoardInspectionState], None] | None = None) -> str:
+        """Execute, release, recapture, and replan until stopped or unsafe."""
+        def publish(status: str) -> str:
+            self.state = replace(self.state, status=status)
+            if on_state is not None:
+                on_state(self.state)
+            return status
+
+        try:
+            self.accept_current_board()
+            publish("連續執行中：準備執行目前路徑")
+            while True:
+                if stop_event.is_set():
+                    return publish("連續執行已由使用者停止")
+                route = self.state.route_evaluation
+                if route is None or not route.execution_eligible:
+                    return publish("連續執行已停止：沒有可執行且符合條件的路徑")
+                if not self.execute_route(serial, explicit_confirmation=True):
+                    return publish("連續執行已因執行或驗證失敗停止")
+                if on_state is not None:
+                    on_state(self.state)
+                if stop_event.is_set():
+                    return publish("連續執行已由使用者停止")
+                state = self.capture_device(serial, auto_search=True)
+                if state.uncertain_cells:
+                    return publish("連續執行已停止：新盤面辨識不確定")
+                route = state.route_evaluation
+                if route is None or not route.execution_eligible:
+                    return publish("連續執行已停止：新盤面沒有符合條件的路徑")
+                publish("連續執行中：已擷取新盤面並規劃下一條路徑")
+        except Exception as exc:
+            return publish(f"連續執行因錯誤停止：{exc}")
+
 
 def _fit_scale(width: int, height: int, available_width: int,
                available_height: int) -> tuple[float, int, int]:
@@ -879,22 +948,27 @@ class BoardInspectionApp:
         self._locked = tk.BooleanVar()
         self._serial = tk.StringVar()
         self._selected_label = tk.StringVar(value="尚未選取珠子")
+        self._protected_label = tk.StringVar(value="保護格：無")
         self._condition_choices = [tk.StringVar(value=NO_CONDITION) for _ in range(3)]
         self._condition_colors = [tk.StringVar(value="不指定") for _ in range(3)]
         self._condition_operator = tk.StringVar(value="全部符合")
         self._hazard_policy = tk.StringVar(value="避免危害珠")
         self._external_condition = tk.StringVar(value="無")
         self._search_attempts = tk.StringVar(value="50")
-        self._search_steps = tk.StringVar(value="50")
+        self._search_steps = tk.StringVar(value="80")
         self._search_seed = tk.StringVar(value="0")
         self._cascade = tk.StringVar(value="計入落珠連鎖")
         self._recognition_attempts = tk.StringVar(value=str(self.controller.max_recognition_attempts))
         self._profile_label = tk.StringVar(value="尚未套用規則設定")
         self._evaluation = tk.StringVar(value="尚未評估路徑")
+        self._layout = tk.StringVar(value="")
         self._verification = tk.StringVar(value="尚無手勢後驗證結果")
         self._learning = tk.StringVar(value=self.controller.state.learning_status)
         self._status = tk.StringVar(value=self.controller.state.status)
         self._syncing_controls = False
+        self._auto_search_generation = 0
+        self._continuous_stop: threading.Event | None = None
+        self._continuous_updates = None
         self._build()
         if self.controller.state.rule_profile is None:
             self._apply_profile_from_controls()
@@ -910,7 +984,6 @@ class BoardInspectionApp:
         self._serial_box = ttk.Combobox(controls, width=18, textvariable=self._serial, state="readonly")
         self._serial_box.pack(side="left")
         ttk.Button(controls, text="更新裝置", command=self.refresh_devices).pack(side="left", padx=4)
-        ttk.Button(controls, text="擷取畫面", command=self.capture_device).pack(side="left", padx=4)
         ttk.Button(controls, text="重新自動校正", command=self.auto_calibration).pack(side="left", padx=(12, 4))
 
         body = ttk.Frame(self.root, padding=(8, 0, 8, 8))
@@ -926,6 +999,8 @@ class BoardInspectionApp:
 
         board_frame = ttk.LabelFrame(body, text="可編輯盤面", padding=8)
         board_frame.pack(side="right", fill="y")
+        self._capture_button = ttk.Button(board_frame, text="擷取畫面", command=self.capture_device)
+        self._capture_button.pack(fill="x", pady=(0, 4))
         self.board = tk.Canvas(board_frame, width=390, height=330, background="#111111",
                                highlightthickness=2, takefocus=True)
         self.board.pack()
@@ -934,6 +1009,13 @@ class BoardInspectionApp:
         self.board.bind("<ButtonRelease-1>", self.route_release)
         self.board.bind("<Key>", self.answer_key)
         ttk.Label(board_frame, textvariable=self._selected_label).pack(pady=(8, 2))
+        protected_buttons = ttk.Frame(board_frame)
+        protected_buttons.pack(fill="x")
+        ttk.Button(protected_buttons, text="保護所選格", command=self.protect_selected_cell).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(protected_buttons, text="清除保護格", command=self.clear_protected_cell).pack(
+            side="left", fill="x", expand=True, padx=(2, 0))
+        ttk.Label(board_frame, textvariable=self._protected_label).pack(anchor="w", pady=(2, 0))
         self._review_frame = ttk.LabelFrame(board_frame, text="回答模型無法判斷的珠子", padding=6)
         self._review_frame.pack(fill="x", pady=(4, 0))
         self._review_message = tk.StringVar(value="載入盤面後，這裡會顯示需要回答的珠子。")
@@ -959,6 +1041,11 @@ class BoardInspectionApp:
         self._execute_button = ttk.Button(board_frame, text="執行路徑", command=self.execute_route,
                                           state="disabled")
         self._execute_button.pack(fill="x", pady=(4, 0))
+        self._continuous_button = ttk.Button(
+            board_frame, text="開始連續執行", command=self.toggle_continuous_execution,
+            state="disabled",
+        )
+        self._continuous_button.pack(fill="x", pady=(0, 4))
         profile_frame = ttk.LabelFrame(board_frame, text="規則設定", padding=6)
         profile_frame.pack(fill="x", pady=(10, 0))
         ttk.Label(profile_frame, text="消珠條件（預設不限＝最大 Combo；形狀才選色珠）：").pack(anchor="w")
@@ -1018,11 +1105,13 @@ class BoardInspectionApp:
         ttk.Button(profile_buttons, text="載入 JSON", command=self.load_profile).pack(side="left", expand=True, fill="x")
         ttk.Button(profile_buttons, text="儲存 JSON", command=self.save_profile).pack(side="left", expand=True, fill="x", padx=(2, 0))
         ttk.Label(board_frame, textvariable=self._evaluation, wraplength=370, justify="left").pack(anchor="w", pady=(10, 0))
+        ttk.Label(board_frame, textvariable=self._layout, wraplength=370, justify="left",
+                  font=("TkFixedFont",)).pack(anchor="w", pady=(6, 0))
         ttk.Label(board_frame, textvariable=self._verification, wraplength=370, justify="left").pack(anchor="w", pady=(8, 0))
         ttk.Label(self.root, textvariable=self._status, anchor="w", relief="sunken").pack(fill="x", side="bottom")
 
     def _recognition_attempts_changed(self, *_args) -> None:
-        if self._syncing_controls:
+        if self._syncing_controls or self._continuous_owns_controller():
             return
         try:
             self.controller.max_recognition_attempts = int(self._recognition_attempts.get())
@@ -1040,11 +1129,16 @@ class BoardInspectionApp:
             if shape in SHAPE_PRESETS.values() and orb_type is not None:
                 label = next(label for label, value in SHAPE_PRESETS.items() if value == shape)
                 return label, orb_type
+        if condition.kind == "shape" and condition.value in SHAPE_PRESETS.values():
+            label = next(label for label, value in SHAPE_PRESETS.items() if value == condition.value)
+            return label, "不指定"
         if (condition.kind == "connected_orb_count" and condition.minimum == 4
                 and condition.exact):
             color = ORB_LABELS.get(str(condition.value))
             if color is not None:
                 return "4 顆消除", color
+            if condition.value is None:
+                return "4 顆消除", "不指定"
         return None
 
     @classmethod
@@ -1125,6 +1219,9 @@ class BoardInspectionApp:
 
 
     def _show_error(self, message: str):
+        if self._continuous_owns_controller():
+            self._status.set(message)
+            return
         from tkinter import messagebox
         messagebox.showerror("PAD Router 錯誤", message, parent=self.root)
 
@@ -1146,10 +1243,22 @@ class BoardInspectionApp:
         ) or "無"
         hazard = {"none": "無", "allowed": "允許", "required": "依條件消除", "blocked": "已阻擋"}.get(
             result.hazard_outcome, result.hazard_outcome)
-        return (f"消除：{matches} | 落珠：{result.cascades} | Combo：{result.combo_count}\n"
+        direct_estimate = result.direct_combo_estimate if result.direct_combo_estimate is not None else "無直接解"
+        return (f"消除：{matches} | 落珠：{result.cascades} | Combo：{result.combo_count} | "
+                f"直接：{result.direct_combo_count}／預估：{direct_estimate}\n"
                 f"條件群組：{groups}\n條件：{conditions}\n"
                 f"危害珠：{hazard} | 符合條件：{'是' if result.qualifying else '否'} | "
                 f"可執行：{'是' if result.execution_eligible else '否'}")
+
+    @staticmethod
+    def _format_layout(board, result: RouteEvaluation | None) -> str:
+        """Show the reference-style block layout this Board's orbs can still reach."""
+        if board is None or result is None:
+            return ""
+        goal, layout = max_combo_layout(board)
+        rows = "\n".join("".join(orb_display(orb) if orb is not None else "．" for orb in row)
+                         for row in layout)
+        return f"目標版型（此排法可成立 {goal} Combo，路徑已排出 {result.direct_combo_count}）：\n{rows}"
 
     @staticmethod
     def _format_board(board) -> str:
@@ -1171,6 +1280,10 @@ class BoardInspectionApp:
     def _display(self, state: BoardInspectionState):
         self._status.set(state.status)
         self._learning.set(state.learning_status)
+        self._protected_label.set(
+            "保護格：無" if state.protected_cell is None else
+            f"保護格：第 {state.protected_cell[0] + 1} 列、第 {state.protected_cell[1] + 1} 行"
+        )
         if state.rule_profile is not None:
             self._sync_profile_controls(state.rule_profile)
             self._profile_label.set(f"已套用：{state.rule_profile.name}")
@@ -1188,10 +1301,17 @@ class BoardInspectionApp:
             self._syncing_controls = syncing
         result = state.route_evaluation
         self._evaluation.set(self._format_evaluation(result))
+        self._layout.set(self._format_layout(state.board, result))
         self._verification.set(self._format_verification(state.verification))
-        self._execute_button.configure(
-            state="normal" if result is not None and result.execution_eligible else "disabled"
-        )
+        eligible = result is not None and result.execution_eligible
+        active = self._continuous_owns_controller()
+        self._execute_button.configure(state="normal" if eligible and not active else "disabled")
+        continuous_button = getattr(self, "_continuous_button", None)
+        if continuous_button is not None:
+            continuous_button.configure(
+                text="停止連續執行" if active else "開始連續執行",
+                state="normal" if active or eligible else "disabled",
+            )
         correction_mode = getattr(self, "_correction_mode", False)
         if state.uncertain_cells:
             if correction_mode:
@@ -1251,8 +1371,12 @@ class BoardInspectionApp:
             for item in state.overlay:
                 x, y = item["x"] * scale, item["y"] * scale
                 uncertain = (item["cell"] in state.uncertain_cells)
+                protected = item["cell"] == state.protected_cell
                 self.source.create_oval(x - radius, y - radius, x + radius, y + radius,
-                                        outline="#ff4444" if uncertain else "#61dafb", width=3)
+                                        outline="#ff9900" if protected else
+                                        ("#ff4444" if uncertain else "#61dafb"),
+                                        width=5 if protected else 3,
+                                        tags=("protected",) if protected else ())
                 self.source.create_text(x, y, text="?" if uncertain else item["label"], fill="white",
                                         font=("TkDefaultFont", 12, "bold"))
             route_points = tuple((item["x"] * scale, item["y"] * scale) for item in state.route_overlay)
@@ -1282,6 +1406,9 @@ class BoardInspectionApp:
                 color = colors.get(getattr(orb, "kind", ""), "#555555")
                 if self._selected_cell == (row, col):
                     self.board.create_rectangle(x0 + 1, y0 + 1, x0 + size - 1, y0 + size - 1, outline="#ffffff", width=3)
+                if state.protected_cell == (row, col):
+                    self.board.create_rectangle(x0 + 2, y0 + 2, x0 + size - 2, y0 + size - 2,
+                                                outline="#ff9900", width=5, tags=("protected",))
                 self.board.create_oval(x0 + 5, y0 + 5, x0 + size - 5, y0 + size - 5,
                                        fill=color, outline="#ff4444" if (row, col) in state.uncertain_cells else "#dddddd", width=2)
                 self.board.create_text(x0 + size // 2, y0 + size // 2, text=orb_display(orb), fill="white",
@@ -1306,21 +1433,84 @@ class BoardInspectionApp:
             self._display(state)
 
     def _apply(self, action):
+        if self._continuous_owns_controller():
+            self._status.set("連續執行中；請先停止再變更路徑或設定")
+            return None
+        self._cancel_auto_search()
         try:
-            self._display(action())
+            state = action()
+            self._display(state)
+            return state
         except (OSError, RuntimeError, ValueError, TypeError, zlib.error) as exc:
             self._show_error(str(exc))
 
+    def _cancel_auto_search(self):
+        self._auto_search_generation = getattr(self, "_auto_search_generation", 0) + 1
+
+    def _continuous_owns_controller(self) -> bool:
+        return getattr(self, "_continuous_stop", None) is not None
+
+    @staticmethod
+    def _auto_search_key(state):
+        return (state.source_name, state.pixels, state.board, state.confirmed,
+                state.rule_profile, state.protected_cell)
+
+    def _schedule_auto_search(self, state):
+        if (self._continuous_owns_controller() or state.board is None
+                or state.uncertain_cells or state.rule_profile is None):
+            return
+        self._cancel_auto_search()
+        generation = self._auto_search_generation
+        key = self._auto_search_key(state)
+        options = RouteSearchOptions()
+        results = queue.SimpleQueue()
+
+        def search():
+            try:
+                results.put((search_qualifying_route(
+                    state.confirmed_board or state.board, state.rule_profile, options,
+                    confirmed=state.confirmed, protected_cell=state.protected_cell,
+                ), None))
+            except Exception as exc:  # Report pure-search failures on the Tk thread.
+                results.put((None, exc))
+
+        def finish():
+            if generation != self._auto_search_generation:
+                return
+            try:
+                result, error = results.get_nowait()
+            except queue.Empty:
+                self.root.after(10, finish)
+                return
+            if error is not None:
+                self._show_error(str(error))
+                return
+            if key != self._auto_search_key(self.controller.state):
+                return
+            self.controller._apply_search_result(result, options)
+            self._display(self.controller.state)
+
+        threading.Thread(target=search, daemon=True).start()
+        self.root.after(0, finish)
+
     def open_png(self):
+        if self._continuous_owns_controller():
+            self._status.set("連續執行中；請先停止再開啟圖片")
+            return
         from tkinter import filedialog
         path = filedialog.askopenfilename(parent=self.root, filetypes=(("PNG 圖片", "*.png"),))
         if path:
             self._manual_route.clear()
-            self._apply(lambda: self.controller.load_png(path))
+            state = self._apply(lambda: self.controller.load_png(path, auto_search=False))
+            if state is not None:
+                self._schedule_auto_search(state)
 
     def capture_device(self):
         self._manual_route.clear()
-        self._apply(lambda: self.controller.capture_device(self._serial.get()))
+        state = self._apply(lambda: self.controller.capture_device(
+            self._serial.get(), auto_search=False))
+        if state is not None:
+            self._schedule_auto_search(state)
 
     def refresh_devices(self):
         try:
@@ -1347,6 +1537,7 @@ class BoardInspectionApp:
             self._correction_mode = True
         else:
             return "break"
+        self._cancel_auto_search()
         self._manual_route.clear()
         self._dragging_route = False
         self._display(state)
@@ -1365,9 +1556,12 @@ class BoardInspectionApp:
         return "break"
 
     def route_press(self, event):
+        if self._continuous_owns_controller():
+            return "break"
         cell = self._cell_at(event)
         if cell is None:
             return "break"
+        self._cancel_auto_search()
         self._selected_cell = cell
         self._selected_label.set(f"第 {cell[0] + 1} 列、第 {cell[1] + 1} 行")
         if getattr(self, "_correction_mode", False) or self.controller.state.uncertain_cells:
@@ -1378,17 +1572,25 @@ class BoardInspectionApp:
                 board.focus_set()
             self._display(self.controller.state)
             return "break"
+        if cell == getattr(self.controller.state, "protected_cell", None):
+            self._manual_route.clear()
+            self._dragging_route = False
+            self._display(self.controller.state)
+            return "break"
         self._manual_route[:] = [cell]
         self._dragging_route = True
         self._display(self.controller.state)
         return "break"
 
     def route_motion(self, event):
+        if self._continuous_owns_controller():
+            return "break"
         if getattr(self, "_correction_mode", False) or not self._dragging_route:
             self._dragging_route = False
             return "break"
         cell = self._cell_at(event)
-        if cell is None or cell in self._manual_route:
+        if (cell is None or cell in self._manual_route
+                or cell == getattr(self.controller.state, "protected_cell", None)):
             return "break"
         previous = self._manual_route[-1]
         if abs(previous[0] - cell[0]) + abs(previous[1] - cell[1]) != 1:
@@ -1398,6 +1600,9 @@ class BoardInspectionApp:
         return "break"
 
     def route_release(self, event):
+        if self._continuous_owns_controller():
+            self._dragging_route = False
+            return "break"
         if not self._dragging_route:
             return "break"
         self._dragging_route = False
@@ -1444,7 +1649,29 @@ class BoardInspectionApp:
     def correct_selected(self):
         self.answer_selected(ORB_KINDS[self._selected_orb.get()])
 
+    def protect_selected_cell(self):
+        if self._selected_cell is None:
+            self._show_error("請先選取要保護的盤面座標")
+            return
+        self._manual_route.clear()
+        self._dragging_route = False
+        state = self._apply(lambda: self.controller.set_protected_cell(
+            self._selected_cell, recompute=False))
+        if state is not None:
+            self._schedule_auto_search(state)
+
+    def clear_protected_cell(self):
+        self._manual_route.clear()
+        self._dragging_route = False
+        state = self._apply(lambda: self.controller.set_protected_cell(None, recompute=False))
+        if state is not None:
+            self._schedule_auto_search(state)
+
     def confirm_board(self):
+        if self._continuous_owns_controller():
+            self._status.set("連續執行中；請先停止再變更盤面")
+            return
+        self._cancel_auto_search()
         try:
             self.controller.confirm_board()
             self._manual_route.clear()
@@ -1453,6 +1680,9 @@ class BoardInspectionApp:
             self._show_error(str(exc))
 
     def execute_route(self):
+        if self._continuous_owns_controller():
+            self._status.set("連續執行中；請先停止")
+            return
         state = self.controller.state
         if state.route_evaluation is None or not state.route_evaluation.execution_eligible:
             self._show_error("僅能執行已確認盤面上、符合條件的路徑")
@@ -1473,6 +1703,68 @@ class BoardInspectionApp:
 
         self._apply(execute)
 
+    def toggle_continuous_execution(self):
+        if self._continuous_owns_controller():
+            self.stop_continuous_execution()
+        else:
+            self.start_continuous_execution()
+
+    def start_continuous_execution(self):
+        state = self.controller.state
+        route = state.route_evaluation
+        if route is None or not route.execution_eligible:
+            self._show_error("僅能連續執行已確認盤面上、符合條件的路徑")
+            return
+        serial = self._serial.get().strip()
+        if not serial:
+            self._show_error("請先按「更新裝置」並選擇裝置")
+            return
+
+        self._cancel_auto_search()
+        self._manual_route.clear()
+        stop_event = threading.Event()
+        updates = queue.SimpleQueue()
+        self._continuous_stop = stop_event
+        self._continuous_updates = updates
+        self._execute_button.configure(state="disabled")
+        self._continuous_button.configure(text="停止連續執行", state="normal")
+        self._status.set("連續執行中：準備執行目前路徑")
+
+        def run():
+            status = self.controller.execute_continuously(
+                serial, stop_event, lambda updated: updates.put(("state", updated)),
+            )
+            updates.put(("done", status))
+
+        threading.Thread(target=run, daemon=True).start()
+        self.root.after(0, lambda: self._poll_continuous_execution(stop_event, updates))
+
+    def stop_continuous_execution(self):
+        stop_event = getattr(self, "_continuous_stop", None)
+        if stop_event is None:
+            return
+        stop_event.set()
+        self._continuous_button.configure(text="正在安全停止…", state="disabled")
+        self._status.set("連續執行正在安全停止；目前手勢完成後不再執行下一輪")
+
+    def _poll_continuous_execution(self, stop_event, updates):
+        if stop_event is not getattr(self, "_continuous_stop", None):
+            return
+        try:
+            kind, value = updates.get_nowait()
+        except queue.Empty:
+            self.root.after(10, lambda: self._poll_continuous_execution(stop_event, updates))
+            return
+        if kind == "state":
+            self._manual_route.clear()
+            self._display(value)
+            self.root.after(0, lambda: self._poll_continuous_execution(stop_event, updates))
+            return
+        self._continuous_stop = None
+        self._continuous_updates = None
+        self._display(self.controller.state)
+        self._status.set(value)
+
 
     def search_route(self):
         self._manual_route.clear()
@@ -1488,11 +1780,15 @@ class BoardInspectionApp:
 
 
     def load_profile(self):
+        if self._continuous_owns_controller():
+            self._status.set("連續執行中；請先停止再載入設定")
+            return
         from tkinter import filedialog
         path = filedialog.askopenfilename(parent=self.root,
                                           filetypes=(("規則設定 JSON", "*.json"), ("JSON", "*.json")))
         if not path:
             return
+        self._cancel_auto_search()
         try:
             self._manual_route.clear()
             self._display(self.controller.load_rule_profile(path))
@@ -1500,6 +1796,9 @@ class BoardInspectionApp:
             self._show_error(str(exc))
 
     def save_profile(self):
+        if self._continuous_owns_controller():
+            self._status.set("連續執行中；請先停止再儲存設定")
+            return
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".json",
                                             filetypes=(("規則設定 JSON", "*.json"), ("JSON", "*.json")))

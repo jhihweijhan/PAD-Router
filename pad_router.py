@@ -7,6 +7,7 @@ import argparse
 import colorsys
 import functools
 import heapq
+from itertools import product
 import json
 import math
 from pathlib import Path
@@ -17,11 +18,15 @@ import statistics
 import subprocess
 import time
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable
 
 
 ROWS, COLS = 5, 6
+# Block plans kept per cover before the leftover orbs decide the real Combo count.
+_LAYOUT_PLANS = 6
+# Shaping steps searched with the full per-node evaluation before the Combo pass.
+CONDITION_SEARCH_STEPS = 40
 DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 # Calibrated from the current SM-A1560 screenshot. Raw Android RGBA_8888 is
 # little-endian BGRA, hence these values are sampled after swapping R and B.
@@ -445,6 +450,8 @@ class RouteEvaluation:
     condition_results: tuple[ConditionResult, ...]
     group_results: tuple[ConditionGroupResult, ...]
     combo_count: int
+    direct_combo_count: int
+    direct_combo_estimate: int | None
     hazard_outcome: str
     qualifying: bool
     confirmed: bool
@@ -611,6 +618,16 @@ def _shape_matches(cells: tuple[tuple[int, int], ...], shape: str) -> bool:
                    sum(point[1] == col for point in points) >= 3 and
                    (row, col) in points for row in rows for col in cols)
     return False
+def _is_shape_condition(condition: LeaderCondition) -> bool:
+    return condition.kind == "shape" or (
+        condition.kind == "connected_orb_count" and condition.minimum == 4 and condition.exact
+    )
+
+
+def _is_untyped_shape_condition(condition: LeaderCondition) -> bool:
+    if condition.kind == "shape":
+        return _shape_spec(condition.value)[1] is None
+    return _is_shape_condition(condition) and _normalise_orb_type(condition.value) is None
 
 
 def _threshold(condition: LeaderCondition, default: int = 1) -> int:
@@ -646,7 +663,12 @@ def _condition_matches(condition: LeaderCondition, rounds: tuple[MatchRound, ...
         candidates = [match for match in matches if target is None or _match_type(match) == target]
         observed = max((len(match.cells) for match in candidates), default=0) if kind == "connected_orb_count" else len(candidates)
         expected = _threshold(condition)
-        satisfied = observed == expected if condition.exact else observed >= expected
+        if condition.exact and kind == "connected_orb_count" and target is None:
+            satisfied = any(len(match.cells) == expected for match in candidates)
+        elif condition.exact:
+            satisfied = observed == expected
+        else:
+            satisfied = observed >= expected
         comparator = "exactly" if condition.exact else "at least"
         message = f"{observed}; need {comparator} {expected}"
     elif kind == "enhanced_orb":
@@ -679,6 +701,84 @@ def _condition_requires_hazard(condition: LeaderCondition, hazard_types: set[str
     if condition.kind not in {"attribute", "match_count", "connected_orb_count", "enhanced_orb", "required_orbs", "simultaneous_attributes"}:
         return False
     return bool(hazard_types & set(_orb_types(condition.value)))
+
+
+def _direct_combo_estimate(expected: tuple[tuple[object, ...], ...], profile: RuleProfile,
+                           matches: tuple[ResolvedMatch, ...]) -> int | None:
+    """Return the best direct-only Combo target after reserving condition Matches."""
+    direct_round = MatchRound(1, matches, expected)
+    groups: list[tuple[ConditionGroup, tuple[ConditionResult, ...]]] = []
+    required_hazards: set[str] = set()
+    for group in profile.condition_groups:
+        if not group.enabled:
+            continue
+        results = tuple(_condition_matches(condition, (direct_round,)) for condition in group.conditions)
+        satisfied = all(result.satisfied for result in results) if group.operator == "all" else any(result.satisfied for result in results)
+        if not satisfied:
+            return None
+        groups.append((group, results))
+        required_hazards.update(
+            hazard for result in results if result.satisfied
+            for hazard in HAZARDS if _condition_requires_hazard(result.condition, {hazard})
+        )
+    if not groups:
+        reserved = ()
+    else:
+        choices = []
+        for mask in range(1 << len(matches)):
+            reserved = tuple(match for index, match in enumerate(matches) if mask & (1 << index))
+            round_ = MatchRound(1, reserved, expected)
+            evidence_options = []
+            for group, full_results in groups:
+                subset_results = tuple(
+                    _condition_matches(result.condition, (round_,)).satisfied for result in full_results
+                )
+                if group.operator == "all":
+                    if not all(subset_results):
+                        break
+                    evidence_options.append((full_results,))
+                else:
+                    valid = tuple(
+                        result for result, subset_satisfied in zip(full_results, subset_results)
+                        if result.satisfied and subset_satisfied
+                    )
+                    if not valid:
+                        break
+                    evidence_options.append(tuple((result,) for result in valid))
+            else:
+                selected_hazards = [
+                    {
+                        hazard for results in evidence for result in results if result.satisfied
+                        for hazard in HAZARDS if _condition_requires_hazard(result.condition, {hazard})
+                    }
+                    for evidence in product(*evidence_options)
+                ]
+                for evidence_hazards in selected_hazards:
+                    removed = {cell for match in reserved for cell in match.cells}
+                    allowed_hazards = set(HAZARDS) if profile.hazard_policy == "allow" else evidence_hazards
+                    available = Counter(
+                        key for row, values in enumerate(expected) for col, value in enumerate(values)
+                        if (row, col) not in removed
+                        for key in (orb_match_key(value),)
+                        if key is not None and (key not in HAZARDS or key in allowed_hazards)
+                    )
+                    score = len(reserved) + sum(count // 3 for count in available.values())
+                    choices.append((score, tuple(match.cells for match in reserved), reserved, allowed_hazards))
+        if not choices:
+            return None
+        best_score = max(score for score, _cells, _reserved, _hazards in choices)
+        _score, _cells, reserved, required_hazards = min(
+            (item for item in choices if item[0] == best_score), key=lambda item: item[1]
+        )
+    removed = {cell for match in reserved for cell in match.cells}
+    allowed_hazards = set(HAZARDS) if profile.hazard_policy == "allow" else required_hazards
+    available = Counter(
+        key for row, values in enumerate(expected) for col, value in enumerate(values)
+        if (row, col) not in removed
+        for key in (orb_match_key(value),)
+        if key is not None and (key not in HAZARDS or key in allowed_hazards)
+    )
+    return len(reserved) + sum(count // 3 for count in available.values())
 
 
 def evaluate_manual_route(
@@ -759,8 +859,10 @@ def _evaluate_expected_route(
     else:
         diagnostic = "Team Condition passed; Route is eligible for confirmation"
         status = "qualifying"
+    direct_matches = rounds[0].matches if rounds else ()
     return RouteEvaluation(route, expected, rounds, tuple(condition_results), tuple(group_results),
-                           sum(len(item.matches) for item in rounds), hazard_outcome, qualifies,
+                           sum(len(item.matches) for item in rounds), len(direct_matches),
+                           _direct_combo_estimate(expected, profile, direct_matches), hazard_outcome, qualifies,
                            bool(confirmed), bool(confirmed and qualifies), status, diagnostic)
 
 
@@ -771,7 +873,7 @@ class RouteSearchOptions:
     attempts: int = 100
     seed: int = 0
     min_steps: int = 1
-    max_steps: int = 50
+    max_steps: int = 80
     cascade: bool = True
 
     def __post_init__(self) -> None:
@@ -783,6 +885,216 @@ class RouteSearchOptions:
             raise ValueError("Minimum search steps must be a non-negative integer")
         if isinstance(self.max_steps, bool) or not isinstance(self.max_steps, int) or self.max_steps < self.min_steps:
             raise ValueError("Maximum search steps must be at least the minimum")
+
+
+def _leftover_triple_distance(board: tuple[tuple[object, ...], ...],
+                              matched: set[tuple[int, int]],
+                              allowed_hazards: bool) -> int:
+    """Return how far the orbs a direct clear leaves behind are from more Matches.
+
+    Combos need straight triples, so the orbs of each Match key are walked in a
+    snake order and charged the span of every whole triple they could still form.
+    Leftovers beyond the last full triple cost nothing: they cannot become a
+    Combo, so dragging them around must not look like progress.
+    """
+    positions: dict[int | str, list[tuple[int, int]]] = {}
+    for row, values in enumerate(board):
+        for col, orb in enumerate(values):
+            key = orb_match_key(orb)
+            if key is None or (row, col) in matched or (key in HAZARDS and not allowed_hazards):
+                continue
+            positions.setdefault(key, []).append((row, col))
+    total = 0
+    for orbs in positions.values():
+        snake = sorted(orbs, key=lambda cell: (cell[0], cell[1] if cell[0] % 2 == 0 else -cell[1]))
+        for index in range(0, len(snake) - len(snake) % 3, 3):
+            first, middle, last = snake[index:index + 3]
+            total += (abs(first[0] - middle[0]) + abs(first[1] - middle[1])
+                      + abs(middle[0] - last[0]) + abs(middle[1] - last[1]))
+    return total
+
+
+def _max_combo_route(board: tuple[tuple[object, ...], ...], options: "RouteSearchOptions",
+                     protected_cell: tuple[int, int] | None, allowed_hazards: bool,
+                     path: tuple[tuple[int, int], ...] = (),
+                     keep: dict[tuple[int, int], object] | None = None,
+                     ) -> tuple[tuple[int, int], ...] | None:
+    """Beam-search the drag that lands the most direct Matches on the Board.
+
+    Scoring a node by its first-round Matches alone — no cascade, no
+    ``RouteEvaluation`` — keeps it cheap enough to widen the beam, which is what
+    actually stops a route from leaving matchable orbs behind.
+
+    ``path`` continues an already-planned drag whose Board is ``board``, and
+    ``keep`` maps the cells a satisfied condition occupies to their Match key.
+    Together they let a Route that already forms the requested shape carry on
+    collecting Combos without trading the shape away.
+    """
+    width = max(ROWS * COLS, options.attempts * 12)
+    keep = keep or {}
+    beam = ([(board, path[-1], path)] if path else
+            [(board, start, (start,))
+             for start in ((row, col) for row in range(ROWS) for col in range(COLS))
+             if start != protected_cell])
+    best: tuple[int, int, int, tuple[tuple[int, int], ...]] | None = None
+    for depth in range(len(path) or 1, options.max_steps + 1):
+        scored: dict[tuple[object, tuple[int, int]], tuple[int, int, int, tuple[tuple[int, int], ...]]] = {}
+        for current, cursor, current_path in beam:
+            previous = current_path[-2] if len(current_path) > 1 else None
+            for dr, dc in DIRECTIONS:
+                next_cursor = cursor[0] + dr, cursor[1] + dc
+                if (not (0 <= next_cursor[0] < ROWS and 0 <= next_cursor[1] < COLS)
+                        or next_cursor in (previous, protected_cell)):
+                    continue
+                next_board = moved(current, cursor, next_cursor)
+                if (next_board, next_cursor) in scored:
+                    continue
+                matches = _find_resolved_matches(next_board, 1)
+                cells = {cell for match in matches for cell in match.cells}
+                penalty = _leftover_triple_distance(next_board, cells, allowed_hazards)
+                intact = all(orb_match_key(next_board[row][col]) == key
+                             for (row, col), key in keep.items())
+                next_path = current_path + (next_cursor,)
+                scored[next_board, next_cursor] = -intact, -len(matches), penalty, next_path
+                blocked = not allowed_hazards and any(_match_type(match) in HAZARDS for match in matches)
+                if depth >= max(1, options.min_steps) and intact and not blocked:
+                    candidate = -len(matches), penalty, depth, next_path
+                    if best is None or candidate < best:
+                        best = candidate
+        if not scored:
+            break
+        beam = [(next_board, cursor, next_path)
+                for (next_board, cursor), (_intact, _combos, _penalty, next_path)
+                in sorted(scored.items(), key=lambda item: item[1][:3])[:width]]
+    return best[3] if best else None
+
+
+@functools.cache
+def _block_tilings() -> tuple[tuple[tuple[tuple[tuple[int, int], ...], ...],
+                                    tuple[tuple[int, ...], ...]], ...]:
+    """Return every way to cover the Board with straight 3-orb blocks.
+
+    A maximum-Combo Board is exactly such a cover, and a 5x6 Board admits only
+    22 of them, so the whole family of reference layouts can simply be listed.
+    Each entry pairs the blocks with, per block, the indices it touches.
+    """
+    cells = tuple((row, col) for row in range(ROWS) for col in range(COLS))
+    covers: list[tuple[tuple[tuple[int, int], ...], ...]] = []
+
+    def extend(used: frozenset[tuple[int, int]], blocks: tuple[tuple[tuple[int, int], ...], ...]) -> None:
+        remaining = [cell for cell in cells if cell not in used]
+        if not remaining:
+            covers.append(blocks)
+            return
+        row, col = remaining[0]
+        for dr, dc in ((0, 1), (1, 0)):
+            block = tuple((row + dr * step, col + dc * step) for step in range(3))
+            if (block[-1][0] < ROWS and block[-1][1] < COLS
+                    and not used.intersection(block)):
+                extend(used.union(block), blocks + (block,))
+
+    extend(frozenset(), ())
+    return tuple(
+        (blocks, tuple(
+            tuple(other for other in range(len(blocks)) if other != index
+                  and any(abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1
+                          for a in blocks[index] for b in blocks[other]))
+            for index in range(len(blocks))))
+        for blocks in covers
+    )
+
+
+def _fill_layout(layout: list[list[object]], leftovers: Counter) -> tuple[tuple[object, ...], ...]:
+    """Drop the orbs no block claimed into the empty cells, avoiding same-key neighbours.
+
+    A leftover orb parked beside a planned block joins it, and one parked
+    between two blocks of the same key merges them into a single Combo, so the
+    fill is what decides whether a plan's blocks survive as separate Matches.
+    """
+    remaining = +leftovers
+    for row in range(ROWS):
+        for col in range(COLS):
+            if layout[row][col] is not None or not remaining:
+                continue
+            touching = {layout[r][c] for r, c in
+                        ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1))
+                        if 0 <= r < ROWS and 0 <= c < COLS and layout[r][c] is not None}
+            key = next((candidate for candidate, _ in remaining.most_common()
+                        if candidate not in touching), remaining.most_common(1)[0][0])
+            layout[row][col] = key
+            remaining[key] -= 1
+            remaining += Counter()
+    return tuple(tuple(row) for row in layout)
+
+
+@functools.lru_cache(maxsize=8)
+def max_combo_layout(board: tuple[tuple[object, ...], ...]) -> tuple[int, tuple[tuple[object, ...], ...]]:
+    """Return the reference-style block layout with the most Combos this Board's orbs reach.
+
+    Every one of the 22 covers is tried with every legal key assignment: a key
+    may fill at most ``count // 3`` blocks and never two touching ones.  The
+    best plans are then completed with the orbs no block claimed and scored by
+    the Matches the finished Board actually holds, so the number is one a real
+    arrangement reaches rather than an inventory ceiling that leftovers would
+    quietly merge away.
+    """
+    _validate_board(board)
+    keys = [[orb_match_key(orb) for orb in row] for row in board]
+    counts = Counter(key for row in keys for key in row if key is not None)
+    caps = {key: count // 3 for key, count in counts.items() if count >= 3}
+    order = sorted(caps, key=lambda key: (-caps[key], str(key))) + [None]
+    plans: list[tuple[int, int, int, tuple[object, ...]]] = []
+
+    def offer(rank: tuple[int, int], cover: int, chosen: tuple[object, ...]) -> None:
+        plans.append((rank[0], rank[1], cover, chosen))
+        plans.sort(key=lambda plan: plan[:2])
+        del plans[_LAYOUT_PLANS:]
+
+    def beaten(rank: tuple[int, int]) -> bool:
+        return len(plans) == _LAYOUT_PLANS and rank >= plans[-1][:2]
+
+    for cover, (blocks, neighbours) in enumerate(_block_tilings()):
+        agreement = [{key: (sum(keys[row][col] == key for row, col in block) if key is not None else 0)
+                      for key in order} for block in blocks]
+        chosen: list[object] = [None] * len(blocks)
+        budget = dict(caps)
+
+        def assign(index: int, used: int, score: int) -> None:
+            left = len(blocks) - index
+            if beaten((-(used + left), -(score + 3 * left))):
+                return
+            if index == len(blocks):
+                offer((-used, -score), cover, tuple(chosen))
+                return
+            for key in order:
+                if key is not None:
+                    if not budget[key] or any(chosen[other] == key for other in neighbours[index]):
+                        continue
+                    budget[key] -= 1
+                chosen[index] = key
+                assign(index + 1, used + (key is not None), score + agreement[index][key])
+                chosen[index] = None
+                if key is not None:
+                    budget[key] += 1
+
+        assign(0, 0, 0)
+
+    best = (-1, 0, board)
+    for _used, score, cover, plan in plans:
+        blocks = _block_tilings()[cover][0]
+        layout: list[list[object]] = [[None] * COLS for _ in range(ROWS)]
+        leftovers = Counter(counts)
+        for block, key in zip(blocks, plan):
+            if key is None:
+                continue
+            leftovers[key] -= 3
+            for row, col in block:
+                layout[row][col] = key
+        filled = _fill_layout(layout, leftovers)
+        combos = len(_find_resolved_matches(filled, 1))
+        if (combos, -score) > best[:2]:
+            best = (combos, -score, filled)
+    return best[0], best[2]
 
 
 @dataclass(frozen=True)
@@ -812,35 +1124,52 @@ class RouteSearchResult:
 def search_qualifying_route(
     board: tuple[tuple[object, ...], ...], profile: RuleProfile,
     options: RouteSearchOptions | None = None, confirmed: bool = False,
+    protected_cell: tuple[int, int] | None = None,
 ) -> RouteSearchResult:
     """Search seeded Route candidates, returning the best qualifier or diagnosis."""
     if options is None:
         options = RouteSearchOptions()
     if not isinstance(options, RouteSearchOptions):
         raise TypeError("options must be a RouteSearchOptions")
+    protected_cell = _validate_protected_cell(protected_cell)
     generator = random.Random(options.seed)
-    def rank(result: RouteEvaluation) -> tuple[int, int, tuple[tuple[int, int], ...]]:
-        return -result.combo_count, len(result.route) - 1, result.route
+    def shape_preference(result: RouteEvaluation) -> int:
+        return sum(1 for item in result.condition_results
+                   if isinstance(item.condition, LeaderCondition)
+                   and item.satisfied and _is_untyped_shape_condition(item.condition))
+
+    def rank(result: RouteEvaluation) -> tuple[int, int, int, tuple[tuple[int, int], ...]]:
+        assert result.direct_combo_estimate is not None
+        return (-shape_preference(result), -result.direct_combo_count, -result.direct_combo_estimate,
+                len(result.route) - 1, result.route)
+
+    def diagnostic_rank(result: RouteEvaluation) -> tuple[int, int, int, tuple[tuple[int, int], ...]]:
+        estimate = result.direct_combo_estimate if result.direct_combo_estimate is not None else -1
+        return (-shape_preference(result), -result.direct_combo_count, -estimate,
+                len(result.route) - 1, result.route)
 
     best_qualifying: RouteEvaluation | None = None
     best_diagnostic: RouteEvaluation | None = None
 
     def record(result: RouteEvaluation) -> None:
         nonlocal best_qualifying, best_diagnostic
-        if result.qualifying:
+        if result.qualifying and result.direct_combo_estimate is not None:
             if best_qualifying is None or rank(result) < rank(best_qualifying):
                 best_qualifying = result
-        elif best_diagnostic is None or rank(result) < rank(best_diagnostic):
+        elif best_diagnostic is None or diagnostic_rank(result) < diagnostic_rank(best_diagnostic):
             best_diagnostic = result
 
     for _attempt in range(options.attempts):
         target_steps = generator.randint(options.min_steps, options.max_steps)
-        route = [(generator.randrange(ROWS), generator.randrange(COLS))]
+        route = ([(generator.randrange(ROWS), generator.randrange(COLS))]
+                 if protected_cell is None else
+                 [generator.choice(tuple((row, col) for row in range(ROWS) for col in range(COLS)
+                                         if (row, col) != protected_cell))])
         for _step in range(target_steps):
             previous = route[-2] if len(route) > 1 else None
             choices = [(route[-1][0] + dr, route[-1][1] + dc) for dr, dc in DIRECTIONS
                        if 0 <= route[-1][0] + dr < ROWS and 0 <= route[-1][1] + dc < COLS
-                       and (route[-1][0] + dr, route[-1][1] + dc) != previous]
+                       and (route[-1][0] + dr, route[-1][1] + dc) not in (previous, protected_cell)]
             if not choices:
                 break
             route.append(generator.choice(choices))
@@ -850,17 +1179,27 @@ def search_qualifying_route(
     # Shape progress already supplies a domain-specific secondary signal; keep
     # the generic potential for ordinary condition searches only.
     use_combo_distance = not any(
-        condition.kind == "shape"
+        _is_shape_condition(condition)
         for group in profile.condition_groups if group.enabled
         for condition in group.conditions
     )
 
-    if profile.condition_groups:
+    if options.max_steps and not any(group.enabled for group in profile.condition_groups):
+        route = _max_combo_route(board, options, protected_cell, profile.hazard_policy == "allow")
+        if route is not None:
+            record(_evaluate_expected_route(route, expected_board_after_path(board, route),
+                                            profile, confirmed, options.cascade))
+    elif options.max_steps:
+        # Conditions are searched with the expensive per-node evaluation, so the
+        # shaping pass keeps its own ceiling; the cheap Combo pass below spends
+        # whatever steps are left over.
+        shape_steps = min(options.max_steps, CONDITION_SEARCH_STEPS)
         beam_width = max(ROWS * COLS, options.attempts * 24)
-        starts = [(row, col) for row in range(ROWS) for col in range(COLS)]
+        starts = [(row, col) for row in range(ROWS) for col in range(COLS)
+                  if (row, col) != protected_cell]
         generator.shuffle(starts)
         beam = [Node(0, board, start, (start,), 0) for start in starts]
-        for depth in range(1, options.max_steps + 1):
+        for depth in range(1, shape_steps + 1):
             candidates: dict[tuple[object, tuple[int, int], tuple[int, int]],
                              tuple[tuple[object, ...], tuple[object, ...], Node, RouteEvaluation]] = {}
             for node in beam:
@@ -868,28 +1207,31 @@ def search_qualifying_route(
                 for dr, dc in DIRECTIONS:
                     next_cursor = node.cursor[0] + dr, node.cursor[1] + dc
                     if (not (0 <= next_cursor[0] < ROWS and 0 <= next_cursor[1] < COLS)
-                            or next_cursor == previous):
+                            or next_cursor in (previous, protected_cell)):
                         continue
                     next_board = moved(node.board, node.cursor, next_cursor)
                     combo_distance = _combo_distance_penalty(next_board) if use_combo_distance else 0
                     next_node = Node(0, next_board, next_cursor, node.path + (next_cursor,), 0)
                     result = _evaluate_expected_route(next_node.path, next_board, profile,
                                                       confirmed, options.cascade)
-                    next_node = Node(-result.combo_count, next_board, next_cursor,
-                                     next_node.path, result.combo_count)
+                    estimate = result.direct_combo_estimate if result.direct_combo_estimate is not None else -1
+                    next_node = Node(-result.direct_combo_count, next_board, next_cursor,
+                                     next_node.path, result.direct_combo_count)
                     group_count = sum(group.satisfied for group in result.group_results)
                     condition_count = sum(item.satisfied for item in result.condition_results
                                           if not item.identifier.startswith("external:"))
                     shape_progress = max((_shape_search_progress(next_board, item.condition)
                                           for item in result.condition_results
-                                          if item.condition.kind == "shape"), default=0)
+                                          if isinstance(item.condition, LeaderCondition)
+                                          and _is_shape_condition(item.condition)), default=0)
                     row_distances = (_full_row_target_distance(next_board, item.condition)
-                                     for item in result.condition_results if item.condition.kind == "shape")
+                                     for item in result.condition_results if isinstance(item.condition, LeaderCondition)
+                                     and item.condition.kind == "shape")
                     row_distance = min((distance for distance in row_distances if distance is not None), default=0)
                     condition_rank = (-int(result.team_condition_satisfied), -group_count,
-                                      -condition_count, row_distance, -shape_progress, -result.combo_count,
-                                      combo_distance, next_node.path)
-                    combo_rank = (-result.combo_count, -int(result.team_condition_satisfied),
+                                      -condition_count, row_distance, -shape_progress, -result.direct_combo_count,
+                                      -estimate, combo_distance, next_node.path)
+                    combo_rank = (-result.direct_combo_count, -estimate, -int(result.team_condition_satisfied),
                                   row_distance, -shape_progress, -group_count, -condition_count,
                                   combo_distance, next_node.path)
                     key = next_board, next_cursor, node.cursor
@@ -915,14 +1257,81 @@ def search_qualifying_route(
             if depth >= max(1, options.min_steps):
                 for _condition_rank, _combo_rank, _node, result in selected:
                     record(result)
+        if best_qualifying is not None and len(best_qualifying.route) - 1 < options.max_steps:
+            settled = best_qualifying.expected_board
+            keep = {cell: orb_match_key(settled[cell[0]][cell[1]])
+                    for match in (best_qualifying.rounds[0].matches if best_qualifying.rounds else ())
+                    for cell in match.cells}
+            extended = _max_combo_route(settled, options, protected_cell,
+                                        profile.hazard_policy == "allow", best_qualifying.route, keep)
+            if extended is not None:
+                record(_evaluate_expected_route(extended, expected_board_after_path(board, extended),
+                                                profile, confirmed, options.cascade))
     return RouteSearchResult(best_qualifying, best_diagnostic, options.attempts, options.seed)
 
 
+def _validate_protected_cell(cell: tuple[int, int] | None) -> tuple[int, int] | None:
+    if cell is not None and (not isinstance(cell, tuple) or len(cell) != 2
+                             or any(type(value) is not int for value in cell)
+                             or not (0 <= cell[0] < ROWS and 0 <= cell[1] < COLS)):
+        raise ValueError("protected_cell must be inside the 5x6 Standard Board")
+    return cell
+
+
 def _shape_search_progress(board: tuple[tuple[object, ...], ...], condition: LeaderCondition) -> int:
-    """Return the number of selected Orbs nearest to a configured shape."""
     shape, target = _shape_spec(condition.value)
+    if condition.kind == "connected_orb_count":
+        target = _normalise_orb_type(condition.value)
+        expected = _threshold(condition)
+        if expected != 4 or not condition.exact:
+            return 0
+        candidates = (match for match in _find_resolved_matches(board, 1)
+                      if target is None or _match_type(match) == target)
+        sizes = tuple(len(match.cells) for match in candidates)
+        if any(size == expected for size in sizes):
+            return expected
+        return max((min(size, expected - 1) for size in sizes), default=0)
     if shape not in {"full_row", "row_6", "six_row"}:
-        return 0
+        if shape not in {"cross", "l", "l_shape"}:
+            return 0
+
+        values = tuple(tuple(_normalise_orb_type(orb) for orb in row) for row in board)
+        colours = {target} if target is not None else {
+            value for row in values for value in row if value is not None
+        }
+
+        def template_progress(points: set[tuple[int, int]]) -> int:
+            return max(
+                sum(values[row][col] == colour for row, col in points)
+                for colour in colours
+            ) if colours else 0
+
+        if shape == "cross":
+            return max(
+                template_progress({
+                    (center_row, center_col), (center_row - 1, center_col),
+                    (center_row + 1, center_col), (center_row, center_col - 1),
+                    (center_row, center_col + 1),
+                })
+                for center_row in range(1, ROWS - 1)
+                for center_col in range(1, COLS - 1)
+            )
+
+        directions = ((-1, 0), (1, 0), (0, -1), (0, 1))
+        return max(
+            template_progress({
+                (row, col),
+                (row + first[0], col + first[1]),
+                (row + 2 * first[0], col + 2 * first[1]),
+                (row + second[0], col + second[1]),
+                (row + 2 * second[0], col + 2 * second[1]),
+            })
+            for row in range(ROWS) for col in range(COLS)
+            for first in directions for second in directions
+            if first[0] * second[0] + first[1] * second[1] == 0
+            and 0 <= row + 2 * first[0] < ROWS and 0 <= col + 2 * first[1] < COLS
+            and 0 <= row + 2 * second[0] < ROWS and 0 <= col + 2 * second[1] < COLS
+        )
     if target is not None:
         return max(sum(_normalise_orb_type(orb) == target for orb in row) for row in board)
     return max(max(Counter(_normalise_orb_type(orb) for orb in row).values(), default=0) for row in board)
@@ -1174,7 +1583,10 @@ def _cell_features(
 
     marker_yellow = sum(yellow(sample) for sample in marker)
     all_yellow = sum(yellow(sample) for sample in marker_samples)
-    plus = 1.0 if marker_yellow >= 8 and all_yellow <= marker_yellow * 3 else 0.0
+    # Scale with the sampled box: a fixed count only held at the calibrated
+    # 180px cell and dropped every '+' on smaller captures.
+    plus = 1.0 if (marker_yellow >= max(3, len(marker) * 0.08)
+                   and all_yellow <= marker_yellow * 3) else 0.0
     return CellFeatures(hue, saturation, value, dark, white, orange, purple, blue, green,
                          max(0.0, plus), center_hue, center_saturation, center_value,
                          center_pattern)
@@ -1184,9 +1596,10 @@ def _hazard_kind(features: CellFeatures) -> str | None:
     """Recognize the distinctive glyph/palette of the three board hazards."""
     if features.orange >= 0.025 and features.dark >= 0.18 and features.green >= 0.06:
         return "bomb"
-    # Hearts are also bright purple in this capture path.  A poison skull has
-    # a distinctly larger white glyph; keep normal hearts out of this branch.
-    if features.white >= 0.18 and features.purple >= 0.08:
+    # A poison skull is a dark glyph on a magenta ring whose hue sits past
+    # every normal orb.  White-pixel share cannot separate it: the '+' flash
+    # animation whitens normal orbs *more* than a skull ever is.
+    if features.dark >= 0.25 and _hue_distance(features.hue, 0.92) <= 0.05:
         return "poison"
     # Live jammer glyphs are dark with only a small blue-eye region.
     if features.dark >= 0.25 and features.blue >= 0.06 and features.white < 0.20:
@@ -1197,10 +1610,13 @@ def _hazard_kind(features: CellFeatures) -> str | None:
 def _normal_color(features: CellFeatures) -> int | None:
     if features.saturation < 0.20 or features.value < 0.08:
         return None
+    # Hue only. The '+' flash swings saturation and value by up to 0.25 between
+    # two captures of the same board while hue moves under 0.04, so weighting
+    # them turned lit orbs into 'unknown' or into a neighbouring colour.
     distances = sorted(
         (1.4 * _hue_distance(features.hue, prototype[0])
-         + 0.45 * abs(features.saturation - prototype[1])
-         + 0.75 * abs(features.value - prototype[2]), color, prototype[3])
+         + 0.15 * abs(features.saturation - prototype[1])
+         + 0.15 * abs(features.value - prototype[2]), color, prototype[3])
         for color, prototype in ORB_PROTOTYPES.items()
     )
     best, color, limit = distances[0]
@@ -1209,15 +1625,15 @@ def _normal_color(features: CellFeatures) -> int | None:
         return None
     if color in (5, 6) and runner_color in (5, 6) and runner_up - best < 0.15:
         center_hue = getattr(features, "center_hue", None)
-        center_saturation = getattr(features, "center_saturation", 0.0)
-        center_value = getattr(features, "center_value", 0.0)
-        if center_hue is None or center_saturation < 0.25 or center_value < 0.25:
-            return None
-        heart_distance = _hue_distance(center_hue, 0.76)
-        dark_distance = _hue_distance(center_hue, 0.94)
-        if min(heart_distance, dark_distance) > 0.06 or abs(heart_distance - dark_distance) < 0.02:
-            return None
-        return 6 if heart_distance < dark_distance else 5
+        if (center_hue is not None and getattr(features, "center_saturation", 0.0) >= 0.25
+                and getattr(features, "center_value", 0.0) >= 0.25):
+            heart_distance = _hue_distance(center_hue, 0.76)
+            dark_distance = _hue_distance(center_hue, 0.94)
+            if (min(heart_distance, dark_distance) <= 0.06
+                    and abs(heart_distance - dark_distance) >= 0.02):
+                return 6 if heart_distance < dark_distance else 5
+        # A hard flash can wash the glyph out of the centre crop; the palette
+        # hue still separates dark from heart, so fall back to its verdict.
     return color if runner_up - best >= NORMAL_MIN_MARGIN else None
 
 
@@ -1515,7 +1931,21 @@ def self_check() -> None:
     heart_feature = CellFeatures(0.768, 0.57, 0.90, 0, 0, 0, 0, 0, 0, 0)
     dark_feature = CellFeatures(0.858, 0.58, 0.70, 0, 0, 0, 0, 0, 0, 0)
     assert _normal_color(heart_feature) == 6 and _normal_color(dark_feature) == 5
-    assert _normal_color(CellFeatures(0.735, 0.70, 0.86, 0, 0, 0, 0, 0, 0, 0)) is None
+    assert _normal_color(CellFeatures(0.715, 0.70, 0.86, 0, 0, 0, 0, 0, 0, 0)) is None
+    # Live values for one dark and one water orb across three captures of the
+    # same board: the '+' flash swings saturation/value but not hue, so all
+    # three must land on the same colour and none may look like a hazard.
+    flashing = [CellFeatures(0.855, 0.39, 0.98, 0.09, 0.25, 0, 0.39, 0.10, 0, 1, 0.920, 0.41, 0.89),
+                CellFeatures(0.852, 0.49, 0.89, 0.10, 0.13, 0, 0.48, 0.10, 0, 1, 0.920, 0.51, 0.78),
+                CellFeatures(0.856, 0.40, 0.98, 0.09, 0.24, 0, 0.40, 0.10, 0, 1, 0.851, 0.40, 0.90)]
+    assert [_normal_color(item) for item in flashing] == [5, 5, 5]
+    assert [_hazard_kind(item) for item in flashing] == [None, None, None]
+    washed_water = [CellFeatures(0.024, 0.67, 0.73, 0, 0.19, 0.287, 0, 0.11, 0, 1, 0.087, 0.69, 0.96),
+                    CellFeatures(0.014, 0.44, 0.94, 0, 0.25, 0.159, 0, 0.11, 0, 1, 0.147, 0.39, 0.99)]
+    assert [_normal_color(item) for item in washed_water] == [2, 2]
+    # A real poison skull: dark glyph, magenta ring, and *less* white than the
+    # flashing orbs above, which is why white share cannot identify it.
+    assert _hazard_kind(CellFeatures(0.921, 0.48, 0.76, 0.33, 0.16, 0, 0.49, 0.09, 0, 0)) == "poison"
     # Regression values from the live board: hearts must remain normal while
     # the dark jammer with small blue eyes remains a matchable jammer.
     assert _hazard_kind(CellFeatures(0, 0, 0, 0, 0.161, 0, 0.626, 0.006, 0, 0)) is None
@@ -1574,8 +2004,8 @@ def self_check() -> None:
     patch(0, 1, (-45, -10, -25, 10), (220, 40, 100))  # shading/outlier on water
     for col in range(6):
         paint(2, col, (5, 10, 45))  # jammer
-        paint(3, col, (150, 20, 180))  # poison base
-        patch(3, col, (-20, -20, 20, 20), (245, 245, 245))  # skull glyph
+        paint(3, col, (153, 61, 105))  # poison ring, hue 0.92
+        patch(3, col, (-30, -30, 30, 30), (12, 4, 12))  # dark skull glyph
         paint(4, col, (5, 50, 30))  # bomb body
         patch(4, col, (-15, -50, 15, -25), (255, 130, 20))  # fuse
     detected = detect_board_pixels(width, height, bytes(pixels), grid)

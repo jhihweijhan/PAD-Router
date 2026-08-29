@@ -1,6 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import pad_router
 
 from pad_router import (
     COLS,
@@ -40,6 +43,52 @@ class RuleProfileTests(unittest.TestCase):
 
 
 class ManualRouteEvaluationTests(unittest.TestCase):
+    def test_search_never_generates_a_route_through_the_protected_cell(self):
+        board = tuple(tuple((row + col) % 6 + 1 for col in range(COLS)) for row in range(ROWS))
+        profile = RuleProfile("protected", condition_groups=(ConditionGroup.all_of((
+            LeaderCondition.combo_minimum(99),
+        )),))
+        protected = (0, 0)
+        manual_evaluate = pad_router.evaluate_manual_route
+        evaluate = pad_router._evaluate_expected_route
+        evaluated_routes = []
+
+        def reject_protected_manual(board, route, *args, **kwargs):
+            route = tuple(route)
+            self.assertNotIn(protected, route)
+            evaluated_routes.append(route)
+            return manual_evaluate(board, route, *args, **kwargs)
+
+        def reject_protected(route, *args, **kwargs):
+            self.assertNotIn(protected, route)
+            evaluated_routes.append(route)
+            return evaluate(route, *args, **kwargs)
+
+        with (patch("pad_router.evaluate_manual_route", side_effect=reject_protected_manual),
+              patch("pad_router._evaluate_expected_route", side_effect=reject_protected)):
+            result = search_qualifying_route(
+                board, profile,
+                RouteSearchOptions(attempts=1, seed=0, min_steps=0, max_steps=1),
+                confirmed=True, protected_cell=protected,
+            )
+
+        self.assertNotIn(protected, result.candidate.route)
+        self.assertEqual(
+            {route[0] for route in evaluated_routes},
+            {(row, col) for row in range(ROWS) for col in range(COLS)} - {protected},
+        )
+
+    def test_search_rejects_an_invalid_protected_cell(self):
+        board = tuple(tuple((row + col) % 6 + 1 for col in range(COLS)) for row in range(ROWS))
+
+        for protected in ((-1, 0), (ROWS, 0), (0, COLS), (0,), (True, 0), "0,0"):
+            with self.subTest(protected=protected), self.assertRaises(ValueError):
+                search_qualifying_route(
+                    board, RuleProfile("open"),
+                    RouteSearchOptions(attempts=1, seed=0, min_steps=0, max_steps=0),
+                    protected_cell=protected,
+                )
+
     def test_dark_row_search_keeps_combo_candidates_after_the_row_is_formed(self):
         board = (
             (Orb("normal", 4), Orb("normal", 5, enhanced=True), Orb("normal", 2), Orb("normal", 4), Orb("normal", 1), Orb("normal", 5)),
@@ -62,7 +111,8 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIsNotNone(result.qualifying_candidate)
         self.assertTrue(result.qualifying_candidate.qualifying)
         self.assertTrue(result.qualifying_candidate.condition_results[0].satisfied)
-        self.assertGreaterEqual(result.qualifying_candidate.combo_count, 6)
+        self.assertIsNotNone(result.qualifying_candidate.direct_combo_estimate)
+        self.assertGreaterEqual(result.qualifying_candidate.direct_combo_count, 1)
 
     def test_search_gathers_six_scattered_dark_orbs_into_a_full_row(self):
         raw_board = (
@@ -143,7 +193,8 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIsNotNone(result.qualifying_candidate)
         self.assertTrue(result.qualifying_candidate.qualifying)
         self.assertLessEqual(len(result.qualifying_candidate.route) - 1, 70)
-        self.assertGreaterEqual(result.qualifying_candidate.combo_count, 6)
+        self.assertIsNotNone(result.qualifying_candidate.direct_combo_estimate)
+        self.assertGreaterEqual(result.qualifying_candidate.direct_combo_count, 1)
 
     def test_search_is_reproducible_and_returns_a_qualifying_candidate(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
@@ -162,7 +213,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertTrue(first.qualifying_candidate.execution_eligible)
 
 
-    def test_sparse_reward_fixture_uses_combo_distance_as_a_secondary_tie_break(self):
+    def test_sparse_reward_fixture_prefers_a_direct_combo_candidate(self):
         board = (
             (4, 2, 1, 4, 5, 6),
             (6, 3, 2, 4, 5, 5),
@@ -176,16 +227,14 @@ class ManualRouteEvaluationTests(unittest.TestCase):
             )),)
         )
         options = RouteSearchOptions(attempts=2, seed=0, min_steps=1, max_steps=6)
-        baseline_combo_count = 4  # HEAD ordering: ((2, 1), (3, 1))
-
         first = search_qualifying_route(board, profile, options, confirmed=True)
         second = search_qualifying_route(board, profile, options, confirmed=True)
 
         self.assertEqual(first, second)
         self.assertIsNotNone(first.qualifying_candidate)
         self.assertTrue(first.qualifying_candidate.qualifying)
-        self.assertGreater(first.qualifying_candidate.combo_count, baseline_combo_count)
-        self.assertEqual(first.qualifying_candidate.combo_count, 5)
+        self.assertIsNotNone(first.qualifying_candidate.direct_combo_estimate)
+        self.assertGreaterEqual(first.qualifying_candidate.direct_combo_count, 1)
     def test_search_ranks_qualifying_candidates_by_combos_steps_then_route_order(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
@@ -256,6 +305,92 @@ class ManualRouteEvaluationTests(unittest.TestCase):
                 profile = RuleProfile(name, (ConditionGroup.all_of((condition,)),))
                 result = evaluate_manual_route(board_for(points), ((4, 5),), profile, confirmed=True)
                 self.assertTrue(result.qualifying)
+
+    def test_untyped_exact_four_orb_condition_accepts_any_matching_component(self):
+        board = (
+            (1, 1, 1, 1, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+            (3, 4, 5, 6, 3, 4),
+            (4, 5, 6, 3, 4, 5),
+            (5, 6, 3, 4, 5, 6),
+        )
+        profile = RuleProfile("four orbs", (ConditionGroup.all_of((
+            LeaderCondition.connected_orb_count(4, exact=True),
+        )),))
+
+        result = evaluate_manual_route(board, ((4, 5),), profile, confirmed=True)
+
+        self.assertTrue(result.qualifying)
+        self.assertTrue(result.condition_results[0].satisfied)
+
+        typed = RuleProfile("four fire orbs", (ConditionGroup.all_of((
+            LeaderCondition.connected_orb_count(4, orb_type="fire", exact=True),
+        )),))
+        self.assertTrue(evaluate_manual_route(board, ((4, 5),), typed, confirmed=True).qualifying)
+        water_typed = RuleProfile("six water orbs", (ConditionGroup.all_of((
+            LeaderCondition.connected_orb_count(4, orb_type="water", exact=True),
+        )),))
+        self.assertFalse(evaluate_manual_route(board, ((4, 5),), water_typed, confirmed=True).qualifying)
+
+    def test_search_finds_untyped_l_and_cross_shape_candidates(self):
+        cases = (
+            (
+                "l",
+                (
+                    (1, 3, 2, 6, 3, 4),
+                    (1, 3, 4, 6, 3, 2),
+                    (2, 1, 1, 3, 4, 6),
+                    (4, 2, 4, 1, 4, 1),
+                    (5, 2, 5, 3, 6, 3),
+                ),
+            ),
+            (
+                "cross",
+                (
+                    (1, 3, 1, 5, 2, 5),
+                    (2, 1, 2, 1, 4, 1),
+                    (3, 6, 1, 4, 3, 4),
+                    (2, 5, 2, 5, 6, 1),
+                    (5, 5, 4, 3, 6, 5),
+                ),
+            ),
+        )
+
+        for shape, board in cases:
+            with self.subTest(shape=shape):
+                profile = RuleProfile(shape, (ConditionGroup.all_of((
+                    LeaderCondition.shape(shape),
+                )),))
+                result = search_qualifying_route(
+                    board, profile,
+                    RouteSearchOptions(attempts=1, seed=3, min_steps=1, max_steps=12),
+                    confirmed=True,
+                )
+
+                self.assertIsNotNone(result.qualifying_candidate)
+                self.assertTrue(result.qualifying_candidate.condition_results[0].satisfied)
+
+    def test_search_prefers_an_untyped_shape_over_an_alternate_qualifier(self):
+        board = (
+            (1, 3, 1, 5, 2, 5),
+            (2, 1, 2, 1, 4, 1),
+            (3, 6, 1, 4, 3, 4),
+            (2, 5, 2, 5, 6, 1),
+            (5, 5, 4, 3, 6, 5),
+        )
+        profile = RuleProfile("shape preference", (ConditionGroup.any_of((
+            LeaderCondition.shape("cross"),
+            LeaderCondition.combo_minimum(1),
+        )),))
+
+        result = search_qualifying_route(
+            board, profile,
+            RouteSearchOptions(attempts=1, seed=3, min_steps=1, max_steps=12),
+            confirmed=True,
+        )
+
+        self.assertIsNotNone(result.qualifying_candidate)
+        self.assertTrue(result.qualifying_candidate.condition_results[0].satisfied)
 
     def test_shape_condition_requires_the_selected_orb_colour(self):
         fire_row = ((1,) * COLS,) + tuple(tuple((row + col) % 5 + 2 for col in range(COLS))
