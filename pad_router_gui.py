@@ -1078,12 +1078,15 @@ def _profile_from_payload(payload: dict[str, object]) -> RuleProfile:
 
 def _search_options_from_payload(payload: dict[str, object]) -> RouteSearchOptions:
     try:
+        cascade = payload.get("cascade", True)
+        if not isinstance(cascade, bool):
+            raise ValueError("cascade 必須是 JSON boolean")
         return RouteSearchOptions(
             attempts=int(payload.get("attempts", 50)),
             seed=int(payload.get("seed", 0)),
             min_steps=int(payload.get("min_steps", 0)),
             max_steps=int(payload.get("max_steps", 80)),
-            cascade=bool(payload.get("cascade", True)),
+            cascade=cascade,
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"搜尋設定無效：{exc}") from exc
@@ -1094,17 +1097,28 @@ class BoardInspectionBridge:
 
     def __init__(self, controller: BoardInspectionController | None = None,
                  device_lister: Callable[[], Iterable[str]] | None = None,
-                 executor: Executor | None = None):
+                 executor: Executor | None = None,
+                 search_executor: Executor | None = None):
         self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
         self._device_lister = device_lister or _list_adb_devices
         self._lock = threading.RLock()
         self._executor = executor if executor is not None else ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="pad-router"
         )
+        self._search_executor = (
+            search_executor if search_executor is not None else
+            (executor if executor is not None else ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pad-router-search"
+            ))
+        )
         self._future: Future | None = None
+        self._interaction_future: Future | None = None
+        self._search_future: Future | None = None
         self._closed = False
         self._busy = False
         self._pending_operations = 0
+        self._pending_interactions = 0
+        self._pending_searches = 0
         self._generation = 0
         self._search_cancel: threading.Event | None = None
         self._search_generation: int | None = None
@@ -1213,6 +1227,7 @@ class BoardInspectionBridge:
             "devices": self._devices,
             "selected_device": self._selected_device or None,
             "busy": self._busy,
+            "search_busy": self._pending_searches > 0,
             "search": {
                 "status": self._search_status,
                 "progress": self._search_progress,
@@ -1323,10 +1338,21 @@ class BoardInspectionBridge:
         with self._lock:
             if self._closed:
                 raise RuntimeError("後端已關閉")
+            is_search = phase == "search"
             self._pending_operations += 1
-            self._busy = True
+            if is_search:
+                self._pending_searches += 1
+            else:
+                self._pending_interactions += 1
+            self._busy = self._pending_interactions > 0
             self._announce("info", phase, started)
-            self._future = self._executor.submit(self._run, phase, operation)
+            executor = self._search_executor if is_search else self._executor
+            future = executor.submit(self._run, phase, operation)
+            self._future = future
+            if is_search:
+                self._search_future = future
+            else:
+                self._interaction_future = future
             return {"accepted": True, "snapshot": self._view_locked()}
 
     def _run(self, phase: str, operation: Callable[[], object]) -> None:
@@ -1404,15 +1430,22 @@ class BoardInspectionBridge:
                     message = str(result)
                     level = "success"
                 self._pending_operations -= 1
-                self._busy = self._pending_operations > 0
+                if phase == "search":
+                    self._pending_searches = max(0, self._pending_searches - 1)
+                else:
+                    self._pending_interactions = max(0, self._pending_interactions - 1)
+                self._busy = self._pending_interactions > 0
                 self._announce(level, phase, message)
         except Exception as exc:
             with self._lock:
                 self._pending_operations = max(0, self._pending_operations - 1)
-                self._busy = self._pending_operations > 0
                 if phase == "search":
+                    self._pending_searches = max(0, self._pending_searches - 1)
                     self._search_status = "failed"
                     self._search_progress = None
+                else:
+                    self._pending_interactions = max(0, self._pending_interactions - 1)
+                self._busy = self._pending_interactions > 0
                 self._announce("error", phase, str(exc))
 
     def _resolve_cell(self, payload: dict[str, object], *, selected: bool = False) -> tuple[int, int]:
@@ -1561,8 +1594,11 @@ class BoardInspectionBridge:
 
     def wait_for_idle(self, timeout: float | None = None) -> None:
         with self._lock:
-            future = self._future
-        if future is not None:
+            futures = tuple(
+                future for future in (self._interaction_future, self._search_future, self._future)
+                if future is not None
+            )
+        for future in dict.fromkeys(futures):
             future.result(timeout=timeout)
 
     def close(self) -> None:
@@ -1570,8 +1606,10 @@ class BoardInspectionBridge:
             if self._closed:
                 return
             self._closed = True
-            executor = self._executor
-        executor.shutdown(wait=False, cancel_futures=True)
+            executors = ((self._executor,) if self._search_executor is self._executor
+                         else (self._executor, self._search_executor))
+        for executor in executors:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _photo_from_screenshot(screenshot_data: Screenshot, tk_module,
