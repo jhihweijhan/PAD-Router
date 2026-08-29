@@ -1772,35 +1772,44 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.addCleanup(bridge.close)
         bridge.drain_events()
 
-        started = bridge.command({"action": "capture_screen", "serial": "test-device"})
-        self.assertTrue(started["accepted"])
-        self.assertFalse(started["snapshot"]["busy"])
-        self.assertEqual(search_executor.pending, [])
-        interaction_executor.run_next()
-
-        pending = bridge.snapshot()
-        self.assertEqual(pending["search"]["status"], "running")
-        self.assertEqual(pending["search"]["options"]["attempts"], 30)
-        self.assertEqual(len(search_executor.pending), 1)
-
         def fake_search(_board, _profile, options, **_kwargs):
             search_calls.append(options)
             return RouteSearchResult(None, None, 1, options.attempts)
 
         with patch("pad_router_gui.search_qualifying_route", side_effect=fake_search):
-            search_executor.run_next()
-            explicit = bridge.command({
-                "action": "search_route",
-                "attempts": 7,
-                "max_steps": 0,
-                "seed": 42,
-                "cascade": False,
+            started = bridge.command({
+                "action": "capture_screen",
+                "serial": "test-device",
+                "search": {
+                    "attempts": 7,
+                    "max_steps": 0,
+                    "seed": 42,
+                    "cascade": False,
+                },
             })
-            self.assertTrue(explicit["accepted"])
-            self.assertEqual(explicit["snapshot"]["search"]["options"]["attempts"], 7)
+            self.assertTrue(started["accepted"])
+            self.assertFalse(started["snapshot"]["busy"])
+            self.assertEqual(search_executor.pending, [])
+            interaction_executor.run_next()
+
+            pending = bridge.snapshot()
+            self.assertEqual(pending["search"]["status"], "running")
+            self.assertEqual(pending["search"]["options"]["attempts"], 7)
+            self.assertEqual(len(search_executor.pending), 1)
             search_executor.run_next()
 
-        self.assertEqual([options.attempts for options in search_calls], [30, 7])
+            fallback = bridge.command({"action": "capture_screen", "serial": "test-device"})
+            self.assertTrue(fallback["accepted"])
+            self.assertFalse(fallback["snapshot"]["busy"])
+            interaction_executor.run_next()
+
+            pending = bridge.snapshot()
+            self.assertEqual(pending["search"]["status"], "running")
+            self.assertEqual(pending["search"]["options"]["attempts"], 30)
+            self.assertEqual(len(search_executor.pending), 1)
+            search_executor.run_next()
+
+        self.assertEqual([options.attempts for options in search_calls], [7, 30])
 
     def test_route_preview_keeps_authoritative_overlay_and_drag_only_board_state(self):
         board = tuple(tuple(Orb("normal", (row * COLS + col) % 6 + 1)
@@ -1903,6 +1912,7 @@ class WebviewAssetTests(unittest.TestCase):
                 'command("calibrate"', 'command("auto_calibrate"',
                 'command("import_rule_profile"', 'command("export_rule_profile"',
                 'FileReader', 'Blob', 'snapshot.debug', 'entry.level',
+                'capture_screen", { search: searchPayload() }',
                 'route_overlay', 'route_preview', 'projected_combo',
                 'createElementNS', 'preview-cell',
         ):

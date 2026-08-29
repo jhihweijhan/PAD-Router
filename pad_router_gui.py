@@ -1184,13 +1184,14 @@ def _profile_from_payload(payload: dict[str, object]) -> RuleProfile:
         raise ValueError(f"規則設定無效：{exc}") from exc
 
 
-def _search_options_from_payload(payload: dict[str, object]) -> RouteSearchOptions:
+def _search_options_from_payload(payload: dict[str, object],
+                                  default_attempts: int = 50) -> RouteSearchOptions:
     try:
         cascade = payload.get("cascade", True)
         if not isinstance(cascade, bool):
             raise ValueError("cascade 必須是 JSON boolean")
         return RouteSearchOptions(
-            attempts=int(payload.get("attempts", 50)),
+            attempts=int(payload.get("attempts", default_attempts)),
             seed=int(payload.get("seed", 0)),
             min_steps=int(payload.get("min_steps", 0)),
             max_steps=int(payload.get("max_steps", 80)),
@@ -1198,6 +1199,16 @@ def _search_options_from_payload(payload: dict[str, object]) -> RouteSearchOptio
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"搜尋設定無效：{exc}") from exc
+
+def _capture_search_options(payload: dict[str, object]) -> RouteSearchOptions:
+    raw = payload.get("search")
+    if raw is None:
+        if not any(key in payload for key in ("attempts", "seed", "min_steps", "max_steps", "cascade")):
+            return RouteSearchOptions(attempts=30)
+        raw = payload
+    if not isinstance(raw, dict):
+        raise ValueError("capture 的 search 必須是 JSON 物件")
+    return _search_options_from_payload(raw, default_attempts=30)
 
 
 class BoardInspectionBridge:
@@ -1733,7 +1744,11 @@ class BoardInspectionBridge:
                                if self._devices else "沒有可用的 Android 裝置")
                     level = "success" if self._devices else "warning"
                 elif phase == "capture":
-                    state = self.controller.state
+                    if (isinstance(result, tuple) and len(result) == 2
+                            and isinstance(result[0], BoardInspectionState)):
+                        state, search_options = result
+                    else:
+                        state, search_options = self.controller.state, RouteSearchOptions(attempts=30)
                     self._invalidate_generation()
                     self._selected_cell = (
                         state.uncertain_cells[0] if state.uncertain_cells else None
@@ -1742,7 +1757,7 @@ class BoardInspectionBridge:
                     message = str(self._controller_snapshot["status"])
                     level = "success"
                     if state.board is not None and state.rule_profile is not None:
-                        self._start_search(RouteSearchOptions(attempts=30))
+                        self._start_search(search_options)
                 elif phase == "review":
                     state, selected = result
                     self._selected_cell = selected
@@ -2021,6 +2036,7 @@ class BoardInspectionBridge:
             return self._stop_execution()
 
         if action in {"capture", "capture_device", "capture_screen"}:
+            search_options = _capture_search_options(payload)
             serial = payload.get("serial")
             with self._lock:
                 serial = self._selected_device if serial is None else serial
@@ -2031,7 +2047,10 @@ class BoardInspectionBridge:
             return self._submit(
                 "capture",
                 f"正在擷取裝置畫面：{serial}",
-                lambda: self.controller.capture_device(serial, auto_search=False),
+                lambda: (
+                    self.controller.capture_device(serial, auto_search=False),
+                    search_options,
+                ),
             )
         raise ValueError(f"不支援的命令：{action}")
 

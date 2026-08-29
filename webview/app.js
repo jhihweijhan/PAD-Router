@@ -638,7 +638,7 @@
   stopExecution.addEventListener("click", () => command("stop_execution"));
   refresh.addEventListener("click", () => command("refresh_devices"));
   device.addEventListener("change", () => command("select_device", { serial: device.value }));
-  capture.addEventListener("click", () => command("capture_screen"));
+  capture.addEventListener("click", () => command("capture_screen", { search: searchPayload() }));
   applyCalibration.addEventListener("click", () => command("calibrate", calibrationPayload()));
   autoCalibration.addEventListener("click", () => command("auto_calibrate"));
   importProfile.addEventListener("click", () => profileFile.click());
