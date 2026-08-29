@@ -111,6 +111,165 @@
           <button id="clear-protect" type="button" disabled>清除保護</button>
         </div>
         <p id="execution-gate" class="execution-gate">尚未載入盤面。</p>
+
+      <details id="planning-controls" class="planning-controls">
+        <summary>規則與路徑搜尋</summary>
+        <div class="rule-fields">
+          <label>條件 1
+            <select data-condition>
+              <option>不限（以最大 Combo 為主）</option>
+              <option>至少 3 Combo</option>
+              <option>至少 5 Combo</option>
+              <option>至少 7 Combo</option>
+              <option>至少 8 Combo</option>
+              <option>至少 9 Combo</option>
+              <option>至少 10 Combo（5x6 上限）</option>
+              <option>消除火珠</option>
+              <option>消除水珠</option>
+              <option>消除木珠</option>
+              <option>消除光珠</option>
+              <option>消除暗珠</option>
+              <option>消除心珠</option>
+              <option>同色連 5 顆以上</option>
+              <option>強化珠至少消除 1 顆</option>
+              <option>色珠一橫列</option>
+              <option>9 顆正方形</option>
+              <option>十字型</option>
+              <option>L 型</option>
+              <option>T 型</option>
+              <option>4 顆消除</option>
+            </select>
+            <select data-color aria-label="條件 1 顏色">
+              <option>不指定</option>
+              <option>火</option>
+              <option>水</option>
+              <option>木</option>
+              <option>光</option>
+              <option>暗</option>
+              <option>心</option>
+            </select>
+          </label>
+          <label>條件 2
+            <select data-condition>
+              <option>不限（以最大 Combo 為主）</option>
+              <option>至少 3 Combo</option>
+              <option>至少 5 Combo</option>
+              <option>至少 7 Combo</option>
+              <option>至少 8 Combo</option>
+              <option>至少 9 Combo</option>
+              <option>至少 10 Combo（5x6 上限）</option>
+              <option>消除火珠</option>
+              <option>消除水珠</option>
+              <option>消除木珠</option>
+              <option>消除光珠</option>
+              <option>消除暗珠</option>
+              <option>消除心珠</option>
+              <option>同色連 5 顆以上</option>
+              <option>強化珠至少消除 1 顆</option>
+              <option>色珠一橫列</option>
+              <option>9 顆正方形</option>
+              <option>十字型</option>
+              <option>L 型</option>
+              <option>T 型</option>
+              <option>4 顆消除</option>
+            </select>
+            <select data-color aria-label="條件 2 顏色">
+              <option>不指定</option>
+              <option>火</option>
+              <option>水</option>
+              <option>木</option>
+              <option>光</option>
+              <option>暗</option>
+              <option>心</option>
+            </select>
+          </label>
+          <label>條件 3
+            <select data-condition>
+              <option>不限（以最大 Combo 為主）</option>
+              <option>至少 3 Combo</option>
+              <option>至少 5 Combo</option>
+              <option>至少 7 Combo</option>
+              <option>至少 8 Combo</option>
+              <option>至少 9 Combo</option>
+              <option>至少 10 Combo（5x6 上限）</option>
+              <option>消除火珠</option>
+              <option>消除水珠</option>
+              <option>消除木珠</option>
+              <option>消除光珠</option>
+              <option>消除暗珠</option>
+              <option>消除心珠</option>
+              <option>同色連 5 顆以上</option>
+              <option>強化珠至少消除 1 顆</option>
+              <option>色珠一橫列</option>
+              <option>9 顆正方形</option>
+              <option>十字型</option>
+              <option>L 型</option>
+              <option>T 型</option>
+              <option>4 顆消除</option>
+            </select>
+            <select data-color aria-label="條件 3 顏色">
+              <option>不指定</option>
+              <option>火</option>
+              <option>水</option>
+              <option>木</option>
+              <option>光</option>
+              <option>暗</option>
+              <option>心</option>
+            </select>
+          </label>
+          <label>條件關係
+            <select id="condition-operator">
+              <option>全部符合</option>
+              <option>任一符合</option>
+            </select>
+          </label>
+          <label>危害珠策略
+            <select id="hazard-policy">
+              <option>避免危害珠</option>
+              <option>允許危害珠</option>
+            </select>
+          </label>
+          <label>外部條件
+            <select id="external-condition">
+              <option>無</option>
+              <option>HP 條件已確認</option>
+              <option>HP 條件未確認</option>
+              <option>技能條件已確認</option>
+              <option>技能條件未確認</option>
+            </select>
+          </label>
+        </div>
+        <div class="search-fields">
+          <label>嘗試
+            <select id="search-attempts">
+              <option>5</option><option selected>10</option><option>25</option><option>50</option>
+            </select>
+          </label>
+          <label>步數
+            <select id="search-steps">
+              <option>30</option><option>50</option><option selected>80</option><option>100</option>
+            </select>
+          </label>
+          <label>種子
+            <select id="search-seed">
+              <option selected>0</option><option>1</option><option>42</option><option>2026</option>
+            </select>
+          </label>
+          <label>結算
+            <select id="search-cascade">
+              <option value="true" selected>計入落珠連鎖</option>
+              <option value="false">只計直接消除</option>
+            </select>
+          </label>
+        </div>
+        <div class="search-actions">
+          <button id="start-search" type="button" disabled>搜尋符合路徑</button>
+          <button id="cancel-search" type="button" disabled>取消搜尋</button>
+        </div>
+        <p id="active-profile" class="planning-status">尚未套用規則</p>
+        <p id="search-progress" class="planning-status" role="status" aria-live="polite">搜尋尚未開始。</p>
+        <div id="search-result" class="result-card" hidden></div>
+      </details>
       </section>
     </aside>
   </main>

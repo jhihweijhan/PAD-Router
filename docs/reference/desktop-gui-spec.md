@@ -4,9 +4,9 @@
 
 ## 範圍
 
-目前完整桌面入口 `pad_router.py --gui` 仍使用既有 Tk 盤面流程，直到 cutover #14。Issue #9/#10 的 capture/review workspace 以明確的 `pad_router.py --webview` flag 啟動固定 GTK backend 的離線 pywebview，從相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript；不載入遠端資產。
+目前完整桌面入口 `pad_router.py --gui` 仍使用既有 Tk 盤面流程，直到 cutover #14。Issue #9–#11 的 capture/review/rules/search workspace 以明確的 `pad_router.py --webview` flag 啟動固定 GTK backend 的離線 pywebview，從相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript；不載入遠端資產。
 
-Issue #9/#10 的工作區垂直切片負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、persistent status/console 與 5×6 board review。`BoardInspectionBridge` 將 board cells、unknown count、selection、protected/enhanced/locked markers 序列化；修正 unknown 會前往下一格並立即更新數量。
+Issue #9–#11 的工作區垂直切片負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、persistent status/console、5×6 board review、規則設定與背景路徑搜尋。`BoardInspectionBridge` 以 board/rule generation 丟棄 stale candidates，透過 core callback 回報 attempts、conditions 或 max_combo 的真實進度，並支援 cooperative cancellation。
 
 來源截圖在既有 Tk Canvas 或 webview workspace 依可視區域顯示，辨識與校正仍使用原始 BGRA 像素、`BoardCalibration` 與 `BoardInspectionController`。Browser review 只更新受控 DTO，不修改 source image；含 unknown 時仍不可確認或執行。
 

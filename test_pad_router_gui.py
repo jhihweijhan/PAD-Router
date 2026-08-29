@@ -11,7 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, Grid, LeaderCondition, Orb, PlayVerification,
-                        RouteSearchOptions, RuleProfile, _cell_features, _normal_color, detect_board_pixels,
+                        RouteSearchOptions, RouteSearchResult, RuleProfile, _cell_features, _normal_color, detect_board_pixels,
+                        search_qualifying_route,
                         expected_board_after_path)
 
 
@@ -844,6 +845,265 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["phase"], "review")
         json.dumps(events)
+    def test_rule_intent_updates_active_profile_and_invalidates_candidate(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("old"))
+        controller.evaluate_manual_route(((0, 0),))
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+
+        with patch("pad_router_gui._screenshot_image") as encode:
+            updated = bridge.command({
+                "action": "set_rule_profile",
+                "conditions": [{"label": "至少 3 Combo", "color": "不指定"}],
+                "operator": "全部符合",
+                "hazard_policy": "避免危害珠",
+                "external": "無",
+            })
+            encode.assert_not_called()
+        snapshot = updated["snapshot"]
+        self.assertEqual(snapshot["rule_profile"]["name"], "至少 3 Combo")
+        self.assertIsNone(snapshot["route_result"])
+        self.assertIsNone(snapshot["search"]["result"])
+        self.assertFalse(snapshot["busy"])
+
+    def test_search_can_be_cancelled_without_publishing_result(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        executor = DeferredExecutor()
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("search"))
+        bridge = BoardInspectionBridge(controller=controller, executor=executor)
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+        search_calls = []
+
+        def fake_search(*_args, on_progress=None, cancel=None, **_kwargs):
+            search_calls.append(True)
+            on_progress("attempts", 0, 1)
+            on_progress("attempts", 1, 1)
+            return RouteSearchResult(None, None, 1, 0, cancelled=bool(cancel and cancel()))
+
+        with patch("pad_router_gui.search_qualifying_route", side_effect=fake_search):
+            started = bridge.command({
+                "action": "search_route",
+                "attempts": 1,
+                "max_steps": 0,
+                "seed": 0,
+                "cascade": True,
+            })
+            self.assertTrue(started["accepted"])
+            self.assertEqual(started["snapshot"]["search"]["status"], "running")
+            self.assertEqual(search_calls, [])
+            cancelling = bridge.command({"action": "cancel_search"})
+            self.assertEqual(cancelling["search"]["status"], "cancelling")
+            executor.run_next()
+        self.assertEqual(search_calls, [True])
+
+        snapshot = bridge.snapshot()
+        self.assertEqual(snapshot["search"]["status"], "cancelled")
+        self.assertIsNone(snapshot["search"]["result"])
+        self.assertEqual(len(snapshot["console"]), 4)
+        self.assertFalse(snapshot["busy"])
+    def test_unknown_board_search_exposes_only_non_executable_preview(self):
+        unknown = Orb("unknown", visual_class="unknown")
+        board = ((unknown,) + tuple(Orb("normal", 1) for _ in range(COLS - 1)),) + tuple(
+            tuple(Orb("normal", 1) for _ in range(COLS))
+            for _ in range(ROWS - 1)
+        )
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        bridge = BoardInspectionBridge(
+            controller=BoardInspectionController(
+                detector=lambda *_args: board,
+                capture=lambda _serial: source,
+            ),
+            executor=ImmediateExecutor(),
+        )
+        self.addCleanup(bridge.close)
+        bridge.command({"action": "capture_screen", "serial": "test-device"})
+
+        with patch("pad_router_gui._screenshot_image") as encode:
+            result = bridge.command({
+                "action": "search_route",
+                "attempts": 1,
+                "min_steps": 0,
+                "max_steps": 0,
+                "seed": 0,
+                "cascade": True,
+            })
+            encode.assert_not_called()
+        snapshot = result["snapshot"]
+        self.assertEqual(snapshot["search"]["status"], "complete")
+        self.assertIsNotNone(snapshot["search"]["result"])
+        candidate = (snapshot["search"]["result"]["diagnostic_candidate"]
+                     or snapshot["search"]["result"]["qualifying_candidate"])
+        self.assertIsNotNone(candidate)
+        self.assertFalse(candidate["execution_eligible"])
+        self.assertFalse(candidate["confirmed"])
+        self.assertFalse(snapshot["approval_allowed"])
+        self.assertFalse(snapshot["route_result"]["execution_eligible"])
+        json.dumps(snapshot)
+
+    def test_stale_search_result_cannot_overwrite_new_rule_generation(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        executor = DeferredExecutor()
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("old"))
+        bridge = BoardInspectionBridge(controller=controller, executor=executor)
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+        old_result = search_qualifying_route(
+            board, RuleProfile("old"),
+            RouteSearchOptions(attempts=1, min_steps=0, max_steps=0),
+            confirmed=True,
+        )
+        self.assertIsNotNone(old_result.candidate)
+
+        with patch("pad_router_gui.search_qualifying_route", return_value=old_result):
+            started = bridge.command({
+                "action": "search_route",
+                "attempts": 1,
+                "max_steps": 0,
+                "seed": 0,
+                "cascade": True,
+            })
+            self.assertTrue(started["accepted"])
+            changed = bridge.command({
+                "action": "set_rule_profile",
+                "conditions": [{"label": "至少 3 Combo", "color": "不指定"}],
+                "operator": "全部符合",
+                "hazard_policy": "避免危害珠",
+                "external": "無",
+            })
+            self.assertTrue(changed["accepted"])
+            executor.run_next()
+            stale = bridge.snapshot()
+            self.assertEqual(stale["search"]["status"], "stale")
+            self.assertIsNone(stale["route_result"])
+            executor.run_next()
+
+        current = bridge.snapshot()
+        self.assertEqual(current["rule_profile"]["name"], "至少 3 Combo")
+        self.assertIsNone(current["route_result"])
+    def test_stale_search_result_cannot_overwrite_new_board_generation(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        executor = DeferredExecutor()
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("first-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("old"))
+        bridge = BoardInspectionBridge(controller=controller, executor=executor)
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+        old_result = search_qualifying_route(
+            board, RuleProfile("old"),
+            RouteSearchOptions(attempts=1, min_steps=0, max_steps=0),
+            confirmed=True,
+        )
+        self.assertIsNotNone(old_result.candidate)
+
+        with patch("pad_router_gui.search_qualifying_route", return_value=old_result):
+            bridge.command({
+                "action": "search_route",
+                "attempts": 1,
+                "max_steps": 0,
+                "seed": 0,
+                "cascade": True,
+            })
+            bridge.command({"action": "capture_screen", "serial": "second-device"})
+            executor.run_next()
+            stale = bridge.snapshot()
+            self.assertEqual(stale["search"]["status"], "stale")
+            self.assertIsNone(stale["route_result"])
+            executor.run_next()
+
+        current = bridge.snapshot()
+        self.assertEqual(current["source"]["name"], "second-device")
+        self.assertIsNone(current["route_result"])
 
 
 class WebviewAssetTests(unittest.TestCase):
@@ -863,6 +1123,9 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertNotIn("://", html + style.read_text() + script.read_text())
         self.assertIn('id="board-grid"', html)
         self.assertIn('data-orb="fire"', html)
+        self.assertIn('id="planning-controls"', html)
+        self.assertIn('id="start-search"', html)
+        self.assertIn('id="cancel-search"', html)
         client = script.read_text()
         self.assertIn("ArrowRight", client)
         self.assertIn("requestAnimationFrame", client)
@@ -871,6 +1134,9 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('command("select_cell"', client)
         self.assertIn('command("correct_cell"', client)
         self.assertIn('className = "cell-badge plus"', client)
+        self.assertIn('command("set_rule_profile"', client)
+        self.assertIn('command("search_route"', client)
+        self.assertIn('command("cancel_search"', client)
         self.assertIn('command("set_protected_cell"', client)
         self.assertNotIn("adb", client.lower())
         self.assertNotIn("solver", client.lower())

@@ -235,6 +235,8 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertTrue(first.qualifying_candidate.qualifying)
         self.assertIsNotNone(first.qualifying_candidate.direct_combo_estimate)
         self.assertGreaterEqual(first.qualifying_candidate.direct_combo_count, 1)
+
+
     def test_search_ranks_qualifying_candidates_by_combos_steps_then_route_order(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
@@ -572,6 +574,65 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIsNone(controller.state.route_evaluation)
         self.assertFalse(controller.state.route_approved)
 
+
+class SearchProgressTests(unittest.TestCase):
+    def test_search_reports_phases_and_supports_cooperative_cancellation(self):
+        board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
+                 (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
+                 (6, 3, 4, 5, 6, 3))
+        progress = []
+
+        result = search_qualifying_route(
+            board,
+            RuleProfile("progress"),
+            RouteSearchOptions(attempts=1, min_steps=0, max_steps=0),
+            confirmed=True,
+            on_progress=lambda phase, completed, total: progress.append((phase, completed, total)),
+            cancel=lambda: True,
+        )
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(progress, [("attempts", 0, 1)])
+
+    def test_search_reports_real_phase_progress_until_completion(self):
+        board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
+                 (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
+                 (6, 3, 4, 5, 6, 3))
+        progress = []
+
+        result = search_qualifying_route(
+            board,
+            RuleProfile("progress"),
+            RouteSearchOptions(attempts=1, min_steps=0, max_steps=1),
+            confirmed=True,
+            on_progress=lambda phase, completed, total: progress.append((phase, completed, total)),
+        )
+
+        self.assertFalse(result.cancelled)
+        self.assertEqual(progress[0], ("attempts", 0, 1))
+        self.assertEqual(progress[-1], ("complete", 1, 1))
+        self.assertIn(("max_combo", 0, 1), progress)
+        self.assertIn(("max_combo", 1, 1), progress)
+
+    def test_condition_search_reports_real_depth_progress(self):
+        board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
+                 (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
+                 (6, 3, 4, 5, 6, 3))
+        progress = []
+        result = search_qualifying_route(
+            board,
+            RuleProfile("condition", condition_groups=(ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(1),
+            )),)),
+            RouteSearchOptions(attempts=1, min_steps=0, max_steps=1),
+            confirmed=True,
+            on_progress=lambda phase, completed, total: progress.append((phase, completed, total)),
+        )
+
+        self.assertFalse(result.cancelled)
+        self.assertIn(("conditions", 0, 1), progress)
+        self.assertIn(("conditions", 1, 1), progress)
+        self.assertEqual(progress[-1], ("complete", 1, 1))
 
 if __name__ == "__main__":
     unittest.main()

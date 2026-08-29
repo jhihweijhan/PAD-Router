@@ -18,6 +18,7 @@ import struct
 import tempfile
 import threading
 import zlib
+from copy import deepcopy
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -989,6 +990,105 @@ def _review_board(board: Board | None, selected: tuple[int, int] | None,
     return cells
 
 
+def _route_evaluation_snapshot(result: RouteEvaluation | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    return {
+        "route": [list(cell) for cell in result.route],
+        "qualifying": result.qualifying,
+        "confirmed": result.confirmed,
+        "execution_eligible": result.execution_eligible,
+        "diagnostic_status": result.diagnostic_status,
+        "diagnostic": result.diagnostic,
+        "combo_count": result.combo_count,
+        "direct_combo_count": result.direct_combo_count,
+        "direct_combo_estimate": result.direct_combo_estimate,
+        "cascades": result.cascades,
+        "hazard_outcome": result.hazard_outcome,
+        "conditions": [
+            {
+                "identifier": item.identifier,
+                "satisfied": item.satisfied,
+                "message": item.message,
+            }
+            for item in result.condition_results
+        ],
+    }
+
+
+def _route_search_snapshot(result: RouteSearchResult | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    return {
+        "qualifying_candidate": _route_evaluation_snapshot(result.qualifying_candidate),
+        "diagnostic_candidate": _route_evaluation_snapshot(result.diagnostic_candidate),
+        "selected": ("qualifying" if result.qualifying_candidate is not None else
+                     "diagnostic" if result.diagnostic_candidate is not None else None),
+        "cancelled": result.cancelled,
+        "attempts": result.attempts,
+        "seed": result.seed,
+    }
+
+
+def _search_options_snapshot(options: RouteSearchOptions | None) -> dict[str, object] | None:
+    if options is None:
+        return None
+    return {
+        "attempts": options.attempts,
+        "seed": options.seed,
+        "min_steps": options.min_steps,
+        "max_steps": options.max_steps,
+        "cascade": options.cascade,
+    }
+
+
+def _profile_from_payload(payload: dict[str, object]) -> RuleProfile:
+    raw_profile = payload.get("profile")
+    if raw_profile is not None:
+        if not isinstance(raw_profile, dict):
+            raise ValueError("profile 必須是 JSON 物件")
+        try:
+            return RuleProfile.from_dict(raw_profile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"規則設定無效：{exc}") from exc
+
+    raw_conditions = payload.get("conditions", ())
+    if not isinstance(raw_conditions, (list, tuple)):
+        raise ValueError("conditions 必須是陣列")
+    selections: list[tuple[str, str]] = []
+    for item in raw_conditions:
+        if isinstance(item, dict):
+            label = item.get("label", NO_CONDITION)
+            color = item.get("color", "不指定")
+        else:
+            label, color = item, "不指定"
+        if not isinstance(label, str) or not isinstance(color, str):
+            raise ValueError("規則條件必須包含文字 label/color")
+        selections.append((label, color))
+    try:
+        return rule_profile_from_selections(
+            selections,
+            str(payload.get("operator", "全部符合")),
+            str(payload.get("hazard_policy", "避免危害珠")),
+            str(payload.get("external", "無")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"規則設定無效：{exc}") from exc
+
+
+def _search_options_from_payload(payload: dict[str, object]) -> RouteSearchOptions:
+    try:
+        return RouteSearchOptions(
+            attempts=int(payload.get("attempts", 50)),
+            seed=int(payload.get("seed", 0)),
+            min_steps=int(payload.get("min_steps", 0)),
+            max_steps=int(payload.get("max_steps", 80)),
+            cascade=bool(payload.get("cascade", True)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"搜尋設定無效：{exc}") from exc
+
+
 class BoardInspectionBridge:
     """Serialized, JSON-safe backend surface for the local webview."""
 
@@ -1005,9 +1105,20 @@ class BoardInspectionBridge:
         self._closed = False
         self._busy = False
         self._pending_operations = 0
+        self._generation = 0
+        self._search_cancel: threading.Event | None = None
+        self._search_generation: int | None = None
+        self._invalid_search_generations: set[int] = set()
+        self._cancelled_search_generations: set[int] = set()
+        self._search_status = "idle"
+        self._search_progress: dict[str, object] | None = None
+        self._search_options: RouteSearchOptions | None = None
         self._devices: tuple[str, ...] = ()
         self._selected_device = ""
         state = self.controller.state
+        if state.rule_profile is None:
+            self.controller.set_rule_profile(RuleProfile("最大 Combo"))
+            state = self.controller.state
         self._selected_cell: tuple[int, int] | None = (
             state.uncertain_cells[0] if state.uncertain_cells else None
         )
@@ -1025,6 +1136,7 @@ class BoardInspectionBridge:
             base = {**cached, "status": state.status}
         selected = self._selected_cell if state.board is not None else None
         protected = state.protected_cell
+        profile = state.rule_profile
         return {
             **base,
             "board": _review_board(state.board, selected, protected),
@@ -1034,10 +1146,33 @@ class BoardInspectionBridge:
             "selected_cell": list(selected) if selected is not None else None,
             "protected_cell": list(protected) if protected is not None else None,
             "learning_status": state.learning_status,
+            "rule_profile": profile.to_dict() if profile is not None else None,
+            "route_result": _route_evaluation_snapshot(state.route_evaluation),
+            "search_result": _route_search_snapshot(state.route_search),
         }
 
     @staticmethod
-    def _copy_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+    def _copy_route(result: object) -> object:
+        if not isinstance(result, dict):
+            return result
+        return {
+            **result,
+            "route": [list(cell) for cell in result.get("route", ())],
+            "conditions": [dict(item) for item in result.get("conditions", ())],
+        }
+
+    @classmethod
+    def _copy_search(cls, result: object) -> object:
+        if not isinstance(result, dict):
+            return result
+        return {
+            **result,
+            "qualifying_candidate": cls._copy_route(result.get("qualifying_candidate")),
+            "diagnostic_candidate": cls._copy_route(result.get("diagnostic_candidate")),
+        }
+
+    @classmethod
+    def _copy_snapshot(cls, snapshot: dict[str, object]) -> dict[str, object]:
         source = snapshot.get("source")
         board = []
         for cell in snapshot.get("board", ()):
@@ -1047,6 +1182,17 @@ class BoardInspectionBridge:
             board.append(copied)
         selected = snapshot.get("selected_cell")
         protected = snapshot.get("protected_cell")
+        profile = snapshot.get("rule_profile")
+        search = snapshot.get("search")
+        if isinstance(search, dict):
+            progress = search.get("progress")
+            options = search.get("options")
+            search = {
+                **search,
+                "progress": dict(progress) if isinstance(progress, dict) else progress,
+                "options": dict(options) if isinstance(options, dict) else options,
+                "result": cls._copy_search(search.get("result")),
+            }
         return {
             **snapshot,
             "source": dict(source) if isinstance(source, dict) else None,
@@ -1054,6 +1200,10 @@ class BoardInspectionBridge:
             "devices": list(snapshot.get("devices", ())),
             "selected_cell": list(selected) if isinstance(selected, (list, tuple)) else selected,
             "protected_cell": list(protected) if isinstance(protected, (list, tuple)) else protected,
+            "route_result": cls._copy_route(snapshot.get("route_result")),
+            "search_result": cls._copy_search(snapshot.get("search_result")),
+            "rule_profile": deepcopy(profile) if isinstance(profile, dict) else profile,
+            "search": search,
             "console": [dict(item) for item in snapshot.get("console", ())],
         }
 
@@ -1063,6 +1213,13 @@ class BoardInspectionBridge:
             "devices": self._devices,
             "selected_device": self._selected_device or None,
             "busy": self._busy,
+            "search": {
+                "status": self._search_status,
+                "progress": self._search_progress,
+                "options": _search_options_snapshot(self._search_options),
+                "generation": self._generation,
+                "result": self._controller_snapshot.get("search_result"),
+            },
             "console": self._console,
         })
 
@@ -1097,6 +1254,70 @@ class BoardInspectionBridge:
             }
             self._pending_update = None
             return [event]
+
+    def _invalidate_generation(self) -> None:
+        self._generation += 1
+        if hasattr(self, "_controller_snapshot"):
+            self._controller_snapshot = {
+                **self._controller_snapshot,
+                "route_result": None,
+                "search_result": None,
+            }
+        if self._search_cancel is not None:
+            self._search_cancel.set()
+            if self._search_generation is not None:
+                self._invalid_search_generations.add(self._search_generation)
+        self._search_cancel = None
+        self._search_generation = None
+        self._search_status = "idle"
+        self._search_progress = None
+        self._search_options = None
+
+    def _begin_search(self, options: RouteSearchOptions) -> tuple[int, threading.Event]:
+        if self._search_cancel is not None and self._search_generation is not None:
+            self._search_cancel.set()
+            self._invalid_search_generations.add(self._search_generation)
+        self._generation += 1
+        generation = self._generation
+        cancel = threading.Event()
+        self._search_cancel = cancel
+        self._search_generation = generation
+        self._search_status = "running"
+        self._search_progress = None
+        self._search_options = options
+        return generation, cancel
+
+    def _search_progress_update(self, generation: int, phase: str,
+                                completed: int, total: int) -> None:
+        with self._lock:
+            if generation != self._generation or self._search_generation != generation:
+                return
+            self._search_progress = {
+                "phase": phase,
+                "completed": completed,
+                "total": total,
+            }
+            self._pending_update = {
+                "type": "snapshot",
+                "level": "info",
+                "phase": "search",
+                "message": f"搜尋 {phase}：{completed}/{total}",
+                "snapshot": self._view_locked(),
+            }
+
+    def _search_operation(self, generation: int, board: Board, profile: RuleProfile,
+                          options: RouteSearchOptions, confirmed: bool,
+                          protected: tuple[int, int] | None,
+                          cancel: threading.Event) -> tuple[int, RouteSearchResult, RouteSearchOptions]:
+        result = search_qualifying_route(
+            board, profile, options, confirmed=confirmed, protected_cell=protected,
+            on_progress=lambda phase, completed, total: self._search_progress_update(
+                generation, phase, completed, total
+            ),
+            cancel=cancel.is_set,
+        )
+        return generation, result, options
+
 
     def _submit(self, phase: str, started: str, operation: Callable[[], object]) -> dict[str, object]:
         with self._lock:
@@ -1133,6 +1354,52 @@ class BoardInspectionBridge:
                     self._controller_snapshot = self._review_snapshot()
                     message = str(state.status)
                     level = "success"
+                elif phase == "rules":
+                    state = result
+                    self._search_status = "idle"
+                    self._search_progress = None
+                    self._search_options = None
+                    self._controller_snapshot = self._review_snapshot()
+                    message = str(state.status)
+                    level = "info"
+                elif phase == "search":
+                    generation, search_result, options = result
+                    self._search_progress = None
+                    if generation != self._generation:
+                        newer_active = (
+                            self._search_generation is not None
+                            and self._search_generation != generation
+                        )
+                        if generation in self._cancelled_search_generations:
+                            self._cancelled_search_generations.discard(generation)
+                            if not newer_active:
+                                self._search_status = "cancelled"
+                            message = "搜尋已取消"
+                        else:
+                            self._invalid_search_generations.discard(generation)
+                            if not newer_active:
+                                self._search_status = "stale"
+                            message = "搜尋結果已失效，未套用"
+                        if self._search_generation == generation:
+                            self._search_cancel = None
+                            self._search_generation = None
+                        level = "info"
+                    elif search_result.cancelled:
+                        self._search_status = "cancelled"
+                        self._search_cancel = None
+                        self._search_generation = None
+                        message = "搜尋已取消"
+                        level = "info"
+                    else:
+                        self.controller._apply_search_result(search_result, options)
+                        self._search_status = "complete"
+                        self._search_cancel = None
+                        self._search_generation = None
+                        self._controller_snapshot = self._review_snapshot()
+                        message = ("搜尋完成：找到符合條件的路徑"
+                                   if search_result.qualifying
+                                   else "搜尋完成：保留診斷預覽")
+                        level = "success" if search_result.qualifying else "warning"
                 else:
                     message = str(result)
                     level = "success"
@@ -1143,6 +1410,9 @@ class BoardInspectionBridge:
             with self._lock:
                 self._pending_operations = max(0, self._pending_operations - 1)
                 self._busy = self._pending_operations > 0
+                if phase == "search":
+                    self._search_status = "failed"
+                    self._search_progress = None
                 self._announce("error", phase, str(exc))
 
     def _resolve_cell(self, payload: dict[str, object], *, selected: bool = False) -> tuple[int, int]:
@@ -1206,6 +1476,8 @@ class BoardInspectionBridge:
         if action in {"correct", "correct_cell"}:
             with self._lock:
                 cell = self._resolve_cell(payload, selected=True)
+            with self._lock:
+                self._invalidate_generation()
             return self._submit(
                 "review",
                 f"正在修正第 {cell[0] + 1} 列、第 {cell[1] + 1} 行",
@@ -1219,18 +1491,67 @@ class BoardInspectionBridge:
                     cell = self._resolve_cell(payload)
                 else:
                     cell = self._selected_cell
+            with self._lock:
+                self._invalidate_generation()
             return self._submit(
                 "review",
                 "正在更新保護格",
                 lambda: self._protect(cell),
             )
+        if action in {"set_rule_profile", "update_rules"}:
+            profile = _profile_from_payload(payload)
+            with self._lock:
+                self._invalidate_generation()
+            return self._submit(
+                "rules",
+                "正在套用規則設定",
+                lambda: self.controller.set_rule_profile(profile),
+            )
+        if action in {"search", "search_route", "start_search"}:
+            options = _search_options_from_payload(payload)
+            with self._lock:
+                state = self.controller.state
+                if state.board is None:
+                    raise ValueError("請先擷取裝置畫面，再搜尋路徑")
+                if state.rule_profile is None:
+                    raise ValueError("請先套用規則設定，再搜尋路徑")
+                board = state.confirmed_board or state.board
+                profile = state.rule_profile
+                confirmed = state.confirmed
+                protected = state.protected_cell
+                generation, cancel = self._begin_search(options)
+                self.controller.invalidate_route("正在搜尋；先前候選已失效")
+                self._controller_snapshot = self._review_snapshot()
+            return self._submit(
+                "search",
+                "正在搜尋符合規則的路徑",
+                lambda: self._search_operation(
+                    generation, board, profile, options, confirmed, protected, cancel
+                ),
+            )
+        if action in {"cancel_search", "stop_search"}:
+            with self._lock:
+                if self._search_cancel is None or self._search_generation is None:
+                    return self._view_locked()
+                generation = self._search_generation
+                self._search_cancel.set()
+                self._cancelled_search_generations.add(generation)
+                self._generation += 1
+                self._search_cancel = None
+                self._search_generation = None
+                self._search_status = "cancelling"
+                self._search_progress = None
+                self._announce("info", "search", "正在取消搜尋")
+                return self._view_locked()
+
         if action in {"capture", "capture_device", "capture_screen"}:
             serial = payload.get("serial")
             with self._lock:
                 serial = self._selected_device if serial is None else serial
-            if not isinstance(serial, str) or not serial.strip():
-                raise ValueError("請先更新並選擇 Android 裝置")
-            serial = serial.strip()
+                if not isinstance(serial, str) or not serial.strip():
+                    raise ValueError("請先更新並選擇 Android 裝置")
+                serial = serial.strip()
+                self._invalidate_generation()
             return self._submit(
                 "capture",
                 f"正在擷取裝置畫面：{serial}",

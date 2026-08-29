@@ -26,6 +26,21 @@
   const correct = document.querySelector("#correct");
   const protect = document.querySelector("#protect");
   const clearProtect = document.querySelector("#clear-protect");
+  const planningControls = document.querySelector("#planning-controls");
+  const conditionBoxes = planningControls.querySelectorAll("[data-condition]");
+  const colorBoxes = planningControls.querySelectorAll("[data-color]");
+  const conditionOperator = document.querySelector("#condition-operator");
+  const hazardPolicy = document.querySelector("#hazard-policy");
+  const externalCondition = document.querySelector("#external-condition");
+  const searchAttempts = document.querySelector("#search-attempts");
+  const searchSteps = document.querySelector("#search-steps");
+  const searchSeed = document.querySelector("#search-seed");
+  const searchCascade = document.querySelector("#search-cascade");
+  const startSearch = document.querySelector("#start-search");
+  const cancelSearch = document.querySelector("#cancel-search");
+  const activeProfile = document.querySelector("#active-profile");
+  const searchProgress = document.querySelector("#search-progress");
+  const searchResult = document.querySelector("#search-result");
 
   let pendingSnapshot = null;
   let renderFrame = null;
@@ -140,6 +155,77 @@
     locked.disabled = busy || !hasSelection || hazard;
   }
 
+  function planningPayload() {
+    return {
+      conditions: Array.from(conditionBoxes).map((box, index) => ({
+        label: box.value,
+        color: colorBoxes[index].value,
+      })),
+      operator: conditionOperator.value,
+      hazard_policy: hazardPolicy.value,
+      external: externalCondition.value,
+    };
+  }
+
+  function searchPayload() {
+    return {
+      attempts: Number(searchAttempts.value),
+      max_steps: Number(searchSteps.value),
+      seed: Number(searchSeed.value),
+      cascade: searchCascade.value === "true",
+    };
+  }
+
+  function renderSearch(snapshot, hasBoard, busy) {
+    const profile = snapshot.rule_profile;
+    activeProfile.textContent = profile
+      ? `目前規則：${profile.name}`
+      : "尚未套用規則";
+    const search = snapshot.search || {};
+    const searching = search.status === "running" || search.status === "cancelling";
+    startSearch.disabled = busy || !hasBoard || !profile || searching;
+    cancelSearch.disabled = search.status !== "running";
+    const progress = search.progress;
+    if (search.status === "running") {
+      searchProgress.textContent = progress
+        ? `搜尋階段：${progress.phase}（${progress.completed}/${progress.total}）`
+        : "搜尋已開始，等待後端階段…";
+    } else if (search.status === "cancelling") {
+      searchProgress.textContent = "正在取消搜尋；等待目前後端階段安全結束。";
+    } else if (search.status === "cancelled") {
+      searchProgress.textContent = "搜尋已取消。";
+    } else if (search.status === "stale") {
+      searchProgress.textContent = "舊搜尋結果已失效，未套用。";
+    } else if (search.status === "failed") {
+      searchProgress.textContent = "搜尋失敗；請查看事件主控台。";
+    } else if (search.status === "complete") {
+      searchProgress.textContent = "搜尋完成。";
+    } else {
+      searchProgress.textContent = "搜尋尚未開始。";
+    }
+
+    const result = search.result;
+    const selected = result && result.selected;
+    const candidate = selected === "qualifying"
+      ? result.qualifying_candidate
+      : selected === "diagnostic" ? result.diagnostic_candidate : null;
+    if (!candidate) {
+      searchResult.hidden = true;
+      searchResult.textContent = "";
+      return;
+    }
+    searchResult.hidden = false;
+    const executable = Boolean(candidate.execution_eligible);
+    searchResult.className = `result-card ${executable ? "qualifying" : "diagnostic"}`;
+    const label = executable
+      ? "符合條件候選（可進入後續 Python 安全流程）"
+      : "診斷預覽（不可核准或執行）";
+    const route = Array.isArray(candidate.route)
+      ? candidate.route.map((cell) => cellText(cell)).join(" → ")
+      : "無路徑";
+    searchResult.textContent = `${label}\n${candidate.diagnostic || candidate.diagnostic_status || ""}\n${route}`;
+  }
+
   function renderSnapshot(snapshot) {
     currentSnapshot = snapshot;
     const busy = Boolean(snapshot.busy);
@@ -222,6 +308,7 @@
     enhanced.checked = Boolean(selectedEntry && selectedEntry.enhanced);
     locked.checked = Boolean(selectedEntry && selectedEntry.locked);
     syncOrbFlags(hasSelection, busy);
+    renderSearch(snapshot, hasBoard, busy);
 
     const entriesForConsole = Array.isArray(snapshot.console) ? snapshot.console : [];
     consoleCount.textContent = String(entriesForConsole.length);
@@ -299,6 +386,12 @@
     if (cellParts(cell)) command("set_protected_cell", { cell });
   });
   clearProtect.addEventListener("click", () => command("set_protected_cell", { cell: null }));
+  const updateProfile = () => command("set_rule_profile", planningPayload());
+  for (const control of [...conditionBoxes, ...colorBoxes, conditionOperator, hazardPolicy, externalCondition]) {
+    control.addEventListener("change", updateProfile);
+  }
+  startSearch.addEventListener("click", () => command("search_route", searchPayload()));
+  cancelSearch.addEventListener("click", () => command("cancel_search"));
   refresh.addEventListener("click", () => command("refresh_devices"));
   device.addEventListener("change", () => command("select_device", { serial: device.value }));
   capture.addEventListener("click", () => command("capture_screen"));

@@ -47,7 +47,7 @@ flowchart LR
 - `evaluate_manual_route`：驗證路徑並回傳 `RouteEvaluation`，包含 Match rounds、Combo、條件結果、危害結果及 `execution_eligible`。
 - `max_combo_layout`：列舉 5x6 的 22 種 3 格方塊鋪法並指派珠種，回傳本盤面可達的目標版型與其 Combo 數；GUI 直接顯示。
 - `_max_combo_route`：專用最大 Combo 束搜尋，節點只算首輪 Match 與剩餘珠三連距離，束寬 `max(30, attempts * 12)`。可用 `path`／`keep` 從既有路徑接續，保留已成立的 Match 格子，讓有條件的搜尋排完形狀後繼續衝 Combo。
-- `search_qualifying_route`：固定 seed 的隨機嘗試加條件束搜尋；最大 Combo 候選先依首輪直接 Combo 與直接最大 Combo 預估排序，不把落珠連鎖列入排名。既有 `combo_count` 仍保留完整 cascade 評估與顯示語意。
+- `search_qualifying_route`：固定 seed 的隨機嘗試加條件束搜尋；支援 callback 回報實際 attempts/conditions/max_combo 階段與 cooperative cancellation，取消結果會標記 `RouteSearchResult.cancelled`。最大 Combo 候選先依首輪直接 Combo 與直接最大 Combo 預估排序，不把落珠連鎖列入排名。
 - `solve`／`score`：CLI 使用的 Combo 導向束搜尋；`score` 保留 Combo 加上同色珠最近曼哈頓距離懲罰的既有語意。
 - `play`：執行 ADB 手勢，並在放手前後進行必要的安全與盤面驗證。
 
@@ -55,14 +55,14 @@ flowchart LR
 
 - `OrbPrototypeModel`：不訓練的 CPU nearest-prototype 學習資料，保存 human／implicit cell feature；正式檔寫在同目錄暫存檔後以 `Path.replace()` 原子替換。
 - `BoardInspectionController`：保存 GUI 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行；`snapshot()` 只回傳 JSON-safe status 與一次編碼的 PNG，不暴露 raw pixels。
-- `BoardInspectionBridge`：以單一 worker serialise device refresh/capture/review intent，保存受控 source/board snapshot 與 persistent console；selection、unknown count、protected/enhanced/locked markers 與 correction events 都是 JSON-safe DTO，pending snapshot event 只保留最新值。
+- `BoardInspectionBridge`：以單一 worker serialise device refresh/capture/review/rules/search intent，保存受控 source/board/planning snapshot 與 persistent console；selection、unknown count、protected/enhanced/locked markers、rule profile、search progress/results 與 correction events 都是 JSON-safe DTO，pending updates 只保留最新值。
 - `BoardInspectionApp`：既有 Tk widget 與三種清楚的操作模式，供後續切片保留。
 
 ### `pad_router_webview.py` 與 `webview/`
 
 - pywebview 僅載入 repository 相鄰的 `index.html`、`style.css` 與 `app.js`；不請求外部網路資產。完整 Tk `--gui` 仍是預設入口，直到 cutover #14。
 - 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪。
-- 目前 workspace 提供裝置清單、選取、截圖、5×6 review、未知／疑似珠子修正、保護格與強化／鎖定標記；規則、搜尋與執行仍由後續切片處理。
+- 目前 workspace 提供裝置清單、選取、截圖、5×6 review、未知／疑似珠子修正、保護格、強化／鎖定標記、規則設定、背景搜尋、取消與診斷／候選預覽；執行仍由後續切片處理。
 
 ## 狀態與安全不變量
 
@@ -71,6 +71,7 @@ flowchart LR
 3. GUI 按下「執行路徑」代表接受目前盤面，會先將目前盤面以低權重 implicit sample 學習；寫入失敗時不送 ADB。
 4. Human Annotation 優先於低權重 implicit sample；重新標記同一格的相同 feature 會取代舊樣本。
 5. `RuleProfile` 與 `RouteSearchOptions` 互相獨立；規則設定變更會清除舊路徑評估，重試次數不寫入 Rule Profile JSON。
+6. Bridge 的 board/rule generation 變更會使搜尋 cooperative-cancel；只有仍符合 generation 的結果才可套用，舊結果只會進 console，不會覆寫 current state。
 
 ## 不是目前實作的內容
 

@@ -918,6 +918,8 @@ def _max_combo_route(board: tuple[tuple[object, ...], ...], options: "RouteSearc
                      protected_cell: tuple[int, int] | None, allowed_hazards: bool,
                      path: tuple[tuple[int, int], ...] = (),
                      keep: dict[tuple[int, int], object] | None = None,
+                     on_progress: Callable[[str, int, int], None] | None = None,
+                     cancel: Callable[[], bool] | None = None,
                      ) -> tuple[tuple[int, int], ...] | None:
     """Beam-search the drag that lands the most direct Matches on the Board.
 
@@ -938,8 +940,12 @@ def _max_combo_route(board: tuple[tuple[object, ...], ...], options: "RouteSearc
              if start != protected_cell])
     best: tuple[int, int, int, tuple[tuple[int, int], ...]] | None = None
     for depth in range(len(path) or 1, options.max_steps + 1):
+        if cancel is not None and cancel():
+            return None
         scored: dict[tuple[object, tuple[int, int]], tuple[int, int, int, tuple[tuple[int, int], ...]]] = {}
         for current, cursor, current_path in beam:
+            if cancel is not None and cancel():
+                return None
             previous = current_path[-2] if len(current_path) > 1 else None
             for dr, dc in DIRECTIONS:
                 next_cursor = cursor[0] + dr, cursor[1] + dc
@@ -966,6 +972,8 @@ def _max_combo_route(board: tuple[tuple[object, ...], ...], options: "RouteSearc
         beam = [(next_board, cursor, next_path)
                 for (next_board, cursor), (_intact, _combos, _penalty, next_path)
                 in sorted(scored.items(), key=lambda item: item[1][:3])[:width]]
+        if on_progress is not None:
+            on_progress("max_combo", depth, options.max_steps)
     return best[3] if best else None
 
 
@@ -1103,6 +1111,7 @@ class RouteSearchResult:
     diagnostic_candidate: RouteEvaluation | None
     attempts: int
     seed: int
+    cancelled: bool = False
 
     @property
     def candidate(self) -> RouteEvaluation | None:
@@ -1125,6 +1134,8 @@ def search_qualifying_route(
     board: tuple[tuple[object, ...], ...], profile: RuleProfile,
     options: RouteSearchOptions | None = None, confirmed: bool = False,
     protected_cell: tuple[int, int] | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> RouteSearchResult:
     """Search seeded Route candidates, returning the best qualifier or diagnosis."""
     if options is None:
@@ -1150,6 +1161,23 @@ def search_qualifying_route(
 
     best_qualifying: RouteEvaluation | None = None
     best_diagnostic: RouteEvaluation | None = None
+    cancelled = False
+
+    def stopped() -> bool:
+        nonlocal cancelled
+        if cancel is not None and cancel():
+            cancelled = True
+        return cancelled
+
+    def report(phase: str, completed: int, total: int) -> None:
+        if on_progress is not None:
+            on_progress(phase, completed, total)
+
+    def finish() -> RouteSearchResult:
+        return RouteSearchResult(best_qualifying, best_diagnostic, options.attempts,
+                                 options.seed, cancelled=cancelled)
+
+    report("attempts", 0, options.attempts)
 
     def record(result: RouteEvaluation) -> None:
         nonlocal best_qualifying, best_diagnostic
@@ -1160,12 +1188,16 @@ def search_qualifying_route(
             best_diagnostic = result
 
     for _attempt in range(options.attempts):
+        if stopped():
+            return finish()
         target_steps = generator.randint(options.min_steps, options.max_steps)
         route = ([(generator.randrange(ROWS), generator.randrange(COLS))]
                  if protected_cell is None else
                  [generator.choice(tuple((row, col) for row in range(ROWS) for col in range(COLS)
                                          if (row, col) != protected_cell))])
         for _step in range(target_steps):
+            if stopped():
+                return finish()
             previous = route[-2] if len(route) > 1 else None
             choices = [(route[-1][0] + dr, route[-1][1] + dc) for dr, dc in DIRECTIONS
                        if 0 <= route[-1][0] + dr < ROWS and 0 <= route[-1][1] + dc < COLS
@@ -1175,6 +1207,7 @@ def search_qualifying_route(
             route.append(generator.choice(choices))
         result = evaluate_manual_route(board, route, profile, confirmed=confirmed, cascade=options.cascade)
         record(result)
+        report("attempts", _attempt + 1, options.attempts)
 
     # Shape progress already supplies a domain-specific secondary signal; keep
     # the generic potential for ordinary condition searches only.
@@ -1185,7 +1218,13 @@ def search_qualifying_route(
     )
 
     if options.max_steps and not any(group.enabled for group in profile.condition_groups):
-        route = _max_combo_route(board, options, protected_cell, profile.hazard_policy == "allow")
+        report("max_combo", 0, options.max_steps)
+        route = _max_combo_route(
+            board, options, protected_cell, profile.hazard_policy == "allow",
+            on_progress=report, cancel=stopped,
+        )
+        if stopped():
+            return finish()
         if route is not None:
             record(_evaluate_expected_route(route, expected_board_after_path(board, route),
                                             profile, confirmed, options.cascade))
@@ -1194,15 +1233,20 @@ def search_qualifying_route(
         # shaping pass keeps its own ceiling; the cheap Combo pass below spends
         # whatever steps are left over.
         shape_steps = min(options.max_steps, CONDITION_SEARCH_STEPS)
+        report("conditions", 0, shape_steps)
         beam_width = max(ROWS * COLS, options.attempts * 24)
         starts = [(row, col) for row in range(ROWS) for col in range(COLS)
                   if (row, col) != protected_cell]
         generator.shuffle(starts)
         beam = [Node(0, board, start, (start,), 0) for start in starts]
         for depth in range(1, shape_steps + 1):
+            if stopped():
+                return finish()
             candidates: dict[tuple[object, tuple[int, int], tuple[int, int]],
                              tuple[tuple[object, ...], tuple[object, ...], Node, RouteEvaluation]] = {}
             for node in beam:
+                if stopped():
+                    return finish()
                 previous = node.path[-2] if len(node.path) > 1 else None
                 for dr, dc in DIRECTIONS:
                     next_cursor = node.cursor[0] + dr, node.cursor[1] + dc
@@ -1257,17 +1301,23 @@ def search_qualifying_route(
             if depth >= max(1, options.min_steps):
                 for _condition_rank, _combo_rank, _node, result in selected:
                     record(result)
+            report("conditions", depth, shape_steps)
         if best_qualifying is not None and len(best_qualifying.route) - 1 < options.max_steps:
             settled = best_qualifying.expected_board
             keep = {cell: orb_match_key(settled[cell[0]][cell[1]])
                     for match in (best_qualifying.rounds[0].matches if best_qualifying.rounds else ())
                     for cell in match.cells}
-            extended = _max_combo_route(settled, options, protected_cell,
-                                        profile.hazard_policy == "allow", best_qualifying.route, keep)
+            extended = _max_combo_route(
+                settled, options, protected_cell, profile.hazard_policy == "allow",
+                best_qualifying.route, keep, on_progress=report, cancel=stopped,
+            )
+            if stopped():
+                return finish()
             if extended is not None:
                 record(_evaluate_expected_route(extended, expected_board_after_path(board, extended),
                                                 profile, confirmed, options.cascade))
-    return RouteSearchResult(best_qualifying, best_diagnostic, options.attempts, options.seed)
+    report("complete", 1, 1)
+    return finish()
 
 
 def _validate_protected_cell(cell: tuple[int, int] | None) -> tuple[int, int] | None:
