@@ -20,9 +20,9 @@ uv run python -c "import gi; gi.require_version('Gtk', '3.0'); gi.require_versio
 
 ## Native launch verification
 
-The documented native launch was attempted on the current host with `uv run python pad_router.py --gui`; it exits before creating a window because the GTK backend is unavailable and reports: `Ubuntu GTK backend is unavailable; install python3-gi, gir1.2-gtk-3.0, gir1.2-webkit2-4.1, then run uv venv --system-site-packages --allow-existing and uv sync`. This is an environment prerequisite blocker, not an application fallback; native launch is not claimed as smoke-tested here, while local-asset browser smoke and all Python safety tests remain runnable.
+`uv run python -c "from importlib.metadata import version; import webview; import gi; gi.require_version('Gtk', '3.0'); gi.require_version('WebKit2', '4.1')"` passed with pywebview 5.4, GTK 3.24.52, and WebKit2 2.52.3. The real documented command `uv run python pad_router.py --gui` launched successfully and emitted `PAD Router GTK webview workspace started`; a real GTK pywebview probe using a deterministic 5×6 board then confirmed repository-adjacent `file://<repo>/webview/index.html`, local `style.css` and `app.js`, visible status and console, 30 board cells, and a fully visible board grid.
 
-Follow-up prerequisite inspection confirmed `pywebview 5.4` imports, while `gi.require_version("WebKit2", "4.1")` fails with `ValueError: Namespace WebKit2 not available`. `sudo apt-get install --yes gir1.2-webkit2-4.1` requested a password and timed out after 300 seconds; `pkexec apt-get install --yes gir1.2-webkit2-4.1` produced no terminal output and timed out after 120 seconds, so package installation and the real GTK window smoke remain externally blocked.
+Native probe metrics passed at 1100×720, 1366×768, 1440×900, and 1920×1080: `status_visible=true`, `console_visible=true`, `console_within_viewport=true`, `board_cells=30`, `board_grid_fully_visible=true`, and document heights exactly matched 720, 768, 900, and 1080. The probe uses no ADB device; this validates the real GTK/webview presentation and packaged local assets, while controller/bridge safety and device behavior remain covered by the automated suite.
 
 ## 執行入口
 
