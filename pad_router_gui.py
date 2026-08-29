@@ -1796,6 +1796,8 @@ class BoardInspectionBridge:
         with self._lock:
             if self._closed:
                 return
+            if self._execution_busy:
+                self._stop_execution()
             self._closed = True
             executors = []
             for executor in (self._executor, self._search_executor, self._execution_executor):

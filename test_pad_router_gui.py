@@ -1353,6 +1353,73 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertEqual(result["execution"]["phase"], "stopped")
         self.assertEqual(result["execution"]["verification"]["status"], "verified")
         self.assertTrue(result["execution"]["stop_requested"])
+    def test_close_requests_execution_stop_before_executor_shutdown(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        model = OrbPrototypeModel()
+        gestures = []
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+                self.shutdown_called = False
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.shutdown_called = True
+
+        def execute(*_args, **_kwargs):
+            gestures.append(True)
+            return True
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+            executor=execute,
+            model=model,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0),))
+        execution_executor = DeferredExecutor()
+        bridge = BoardInspectionBridge(
+            controller=controller,
+            executor=ImmediateExecutor(),
+            execution_executor=execution_executor,
+        )
+        bridge.command({"action": "approve_route"})
+        started = bridge.command({"action": "execute_route", "serial": "test-device"})
+        self.assertTrue(started["snapshot"]["execution"]["busy"])
+
+        bridge.close()
+
+        closed = bridge.snapshot()
+        self.assertTrue(closed["execution"]["stop_requested"])
+        self.assertTrue(execution_executor.shutdown_called)
+        with self.assertRaisesRegex(ValueError, "執行中"):
+            bridge.command({"action": "select_cell", "cell": [0, 0]})
+        execution_executor.run_next()
+        result = bridge.snapshot()
+        self.assertEqual(result["execution"]["status"], "stopped")
+        self.assertEqual(gestures, [])
+
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
         from pad_router_webview import ASSET_ROOT
