@@ -4,13 +4,13 @@
 
 ## 系統邊界
 
-PAD Router 把 6×5 盤面資料流分成兩個入口與一個 presentation bridge：
+PAD Router 把 6×5 盤面資料流分成核心、控制橋接與一個桌面 web presentation：
 
 - `pad_router.py`：純 Python 核心，負責盤面規則、Combo／cascade 計算、路徑評估、束搜尋、CLI 與 ADB 手勢驗證。
-- `pad_router_gui.py`：`BoardInspectionController`、既有 Tk GUI 與 `BoardInspectionBridge`；controller 負責來源／辨識，bridge 只暴露序列化 intent 與 snapshot。
-- `pad_router_webview.py`：只有明確 `--webview` flag 才啟動固定 GTK backend 的離線 pywebview；`webview/` 只包含本機 HTML、CSS、vanilla JavaScript。
+- `pad_router_gui.py`：`BoardInspectionController` 與 `BoardInspectionBridge`；controller 負責來源／辨識，bridge 只暴露序列化 intent 與 snapshot，不載入桌面 widget toolkit。
+- `pad_router_webview.py`：`--gui` 啟動固定 GTK backend 的離線 pywebview；`--webview` 是相容別名。`webview/` 只包含本機 HTML、CSS、vanilla JavaScript。
 
-程式核心只使用 Python 標準函式庫；webview presentation 依賴固定版本 `pywebview==5.4` 與 Ubuntu 系統提供的 GTK/WebKit。因 uv project venv 預設隔離 system site-packages，webview setup 必須先安裝 `python3-gi`、GTK/WebKit typelibs，再用 `uv venv --system-site-packages --allow-existing` 建立環境。ADB 是需要裝置操作時的外部程式。
+程式核心只使用 Python 標準函式庫；webview presentation 依賴固定版本 `pywebview==5.4` 與 Ubuntu 系統提供的 GTK/WebKit。因 uv project venv 預設隔離 system site-packages，webview setup 必須先安裝 `python3-gi`、GTK/WebKit typelibs，再用 `uv venv --system-site-packages --allow-existing` 建立環境。pywebview 由 repository 相鄰的本機資產載入，不需要 HTTP server 或遠端資產；ADB 是需要裝置操作時的外部程式。
 
 ## 實際資料流
 
@@ -33,7 +33,7 @@ flowchart LR
     Corpus --> Detector
 ```
 
-辨識重試會重用同一份 `width`、`height`、原始 `pixels` 與 `Grid`；不會在重試間重新擷取或學習中間的錯誤結果。GUI 顯示來源圖時可縮放，但辨識和校正仍使用原始像素座標。
+辨識重試會重用同一份 `width`、`height`、原始 `pixels` 與 `Grid`；不會在重試間重新擷取或學習中間的錯誤結果。webview 顯示來源圖時可縮放，但辨識和校正仍使用原始像素座標。
 
 ## 核心模組
 
@@ -45,7 +45,7 @@ flowchart LR
 - `resolve_matches`、`settle`：依橫／縱三連與既有連通規則計算 Match，`cascade` 決定是否繼續處理落下後的 Match。
 - `RuleProfile`、`LeaderCondition`、`ConditionGroup`、`ExternalCondition`：描述條件群組、外部條件與危害策略，並可序列化成 JSON。
 - `evaluate_manual_route`：驗證路徑並回傳 `RouteEvaluation`，包含 Match rounds、Combo、條件結果、危害結果及 `execution_eligible`。
-- `max_combo_layout`：列舉 5x6 的 22 種 3 格方塊鋪法並指派珠種，回傳本盤面可達的目標版型與其 Combo 數；GUI 直接顯示。
+- `max_combo_layout`：列舉 5x6 的 22 種 3 格方塊鋪法並指派珠種，回傳本盤面可達的目標版型與其 Combo 數；workspace 顯示結果。
 - `_max_combo_route`：專用最大 Combo 束搜尋，節點只算首輪 Match 與剩餘珠三連距離，束寬 `max(30, attempts * 12)`。可用 `path`／`keep` 從既有路徑接續，保留已成立的 Match 格子，讓有條件的搜尋排完形狀後繼續衝 Combo。
 - `search_qualifying_route`：固定 seed 的隨機嘗試加條件束搜尋；支援 callback 回報實際 attempts/conditions/max_combo 階段與 cooperative cancellation，取消結果會標記 `RouteSearchResult.cancelled`。最大 Combo 候選先依首輪直接 Combo 與直接最大 Combo 預估排序，不把落珠連鎖列入排名。
 - `solve`／`score`：CLI 使用的 Combo 導向束搜尋；`score` 保留 Combo 加上同色珠最近曼哈頓距離懲罰的既有語意。
@@ -54,21 +54,21 @@ flowchart LR
 ### `pad_router_gui.py`
 
 - `OrbPrototypeModel`：不訓練的 CPU nearest-prototype 學習資料，保存 human／implicit cell feature；正式檔寫在同目錄暫存檔後以 `Path.replace()` 原子替換。
-- `BoardInspectionController`：保存 GUI 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行；`snapshot()` 只回傳 JSON-safe status 與一次編碼的 PNG，不暴露 raw pixels。
-- `BoardInspectionBridge`：以分離的 interaction/search/execution worker serialise device、review、rules、search 與 execute intent，保存受控 source/board/planning/execution snapshot 與 persistent console；ADB execution 僅由 execution worker 執行，並回報 acceptance、gesture、verification、stop phases。
-- `BoardInspectionApp`：既有 Tk widget 與三種清楚的操作模式，供後續切片保留。
+- `BoardInspectionController`：保存 web workspace 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行；`snapshot()` 只回傳 JSON-safe status 與一次編碼的 PNG，不暴露 raw pixels。
+- `BoardInspectionBridge`：以分離的 interaction/search/execution/operational worker 處理 device、review、rules、search 與 execute intent，保存受控 source/board/planning/execution snapshot 與 persistent console；ADB execution 僅由 execution worker 執行，並回報 acceptance、gesture、verification、stop phases。
 
 ### `pad_router_webview.py` 與 `webview/`
 
-- pywebview 僅載入 repository 相鄰的 `index.html`、`style.css` 與 `app.js`；不請求外部網路資產。完整 Tk `--gui` 仍是預設入口，直到 cutover #14。
-- 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪。
-- 目前 workspace 提供裝置清單、選取、截圖、5×6 review、未知／疑似珠子修正、保護格、強化／鎖定標記、規則設定、背景搜尋、取消、診斷／候選預覽、核准、執行與安全停止；執行仍受 Python controller guard。
+- pywebview 僅載入 repository 相鄰的 `index.html`、`style.css` 與 `app.js`；不請求外部網路資產。`--gui` 是支援的桌面入口，`--webview` 保留為相容別名。
+- 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪，使用者檢視舊記錄時不會被強制捲回尾端。
+- workspace 提供裝置清單、選取、截圖、盤面校正、5×6 review、未知／疑似珠子修正、保護格、強化／鎖定標記、規則設定、Profile JSON 匯入／匯出、背景搜尋、取消、診斷／候選預覽、核准、執行與安全停止；執行仍受 Python controller guard。
+- 支援的 desktop smoke 尺寸為 1100×720、1366×768、1440×900 與 1920×1080；頂端 status 與底部 event console 保持可見。
 
 ## 狀態與安全不變量
 
-1. 盤面含任何 `unknown` 時，不會成為可執行的 Confirmed Board；GUI 保留 review／人工修正入口。
+1. 盤面含任何 `unknown` 時，不會成為可執行的 Confirmed Board；workspace 保留 review／人工修正入口。
 2. 路徑執行需要非空且符合規則的候選、已確認盤面、有效裝置與校正；`play` 保留手勢後盤面驗證。
-3. GUI 按下「執行路徑」代表接受目前盤面，會先將目前盤面以低權重 implicit sample 學習；寫入失敗時不送 ADB。
+3. webview 執行前完成 acceptance/learning，執行中拒絕衝突命令，停止要求保留安全放手與手勢後驗證。
 4. Human Annotation 優先於低權重 implicit sample；重新標記同一格的相同 feature 會取代舊樣本。
 5. `RuleProfile` 與 `RouteSearchOptions` 互相獨立；規則設定變更會清除舊路徑評估，重試次數不寫入 Rule Profile JSON。
 6. Bridge 的 board/rule generation 變更會使搜尋 cooperative-cancel；只有仍符合 generation 的結果才可套用，舊結果只會進 console，不會覆寫 current state。

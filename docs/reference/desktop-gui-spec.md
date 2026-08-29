@@ -1,18 +1,18 @@
-# PAD Router Desktop GUI：現行規格
+# PAD Router Desktop Web UI：現行規格
 
-本文件記錄目前已實作的桌面 GUI 行為與安全邊界；操作步驟請看[使用指南](../guides/user-guide.md)，模組責任請看[架構文件](architecture.md)。研究資料集中於[研究目錄](../research/)，不代表本規格中的已實作功能。
+本文件記錄目前已實作的桌面 web UI 行為與安全邊界；操作步驟請看[使用指南](../guides/user-guide.md)，模組責任請看[架構文件](architecture.md)。研究資料集中於[研究目錄](../research/)，不代表本規格中的已實作功能。
 
 ## 範圍
 
-目前完整桌面入口 `pad_router.py --gui` 仍使用既有 Tk 盤面流程，直到 cutover #14。Issue #9–#12 的 capture/review/rules/search/execute workspace 以明確的 `pad_router.py --webview` flag 啟動固定 GTK backend 的離線 pywebview，從相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript；不載入遠端資產。
+完整桌面入口 `pad_router.py --gui` 使用固定 GTK backend 的離線 pywebview，`--webview` 保留為相容別名。pywebview 從 repository 相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript，不載入遠端資產，也不需要 HTTP server。
 
-Issue #9–#12 的工作區垂直切片負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、persistent status/console、5×6 board review、規則設定、背景路徑搜尋、目前候選核准與安全執行。`BoardInspectionBridge` 以 board/rule generation 丟棄 stale candidates，並將 acceptance、gesture、verification、stop phase 及結果序列化。
+workspace 負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、盤面校正、persistent status/console、5×6 board review、規則設定、Profile JSON 匯入／匯出、背景路徑搜尋、目前候選核准與安全執行。`BoardInspectionBridge` 以 board/rule generation 丟棄 stale candidates，並將 acceptance、gesture、verification、stop phase 及結果序列化。
 
-來源截圖在既有 Tk Canvas 或 webview workspace 依可視區域顯示，辨識與校正仍使用原始 BGRA 像素、`BoardCalibration` 與 `BoardInspectionController`。Browser UI 只更新受控 DTO；含 unknown、診斷或未核准候選時不可執行。
+來源截圖在 webview workspace 依可視區域顯示，辨識與校正仍使用原始 BGRA 像素、`BoardCalibration` 與 `BoardInspectionController`。Browser UI 只更新受控 DTO；含 unknown、診斷或未核准候選時不可執行。支援的 desktop 尺寸為 1100×720、1366×768、1440×900 與 1920×1080，status 與 console 在各尺寸保持可見。
 
 ## Ubuntu webview setup
 
-Ubuntu 的 uv project venv 預設看不到 system site-packages；首次使用 `--webview` 前執行：
+Ubuntu 的 uv project venv 預設看不到 system site-packages；首次使用 `--gui` 前執行：
 
 ```bash
 sudo apt-get update
@@ -21,25 +21,17 @@ uv venv --system-site-packages --allow-existing
 uv sync
 ```
 
-## 既有 Tk 完整流程（`--gui`）
+啟動時 `pad_router_webview.py` 要求 `gi.require_version("Gtk", "3.0")` 與 `gi.require_version("WebKit2", "4.1")`，再呼叫 `webview.start(..., gui="gtk")`；缺少套件時會回報精確安裝指令，不會改用未驗證的 backend。
 
-1. 開啟 PNG 或選擇 ADB 裝置擷取畫面。
-2. 以來源實際寬高推定盤面區域；可重新自動校正，也可提供新的校正。
-3. 使用固定 HSV prototype、危害珠指標與局部中心圖樣辨識。心珠／闇珠的中心圖樣包含固定小網格的相對灰階與相鄰差分；訊號不足時回傳 `unknown`。
-4. 若盤面含問號，依 `max_recognition_attempts`（1–5，預設 2）用同一份來源與校正重跑辨識，直到乾淨或達到上限。
-5. `unknown` 會讓 GUI 進入 review mode；使用者可回答珠種並永久保存人工樣本。Ready 狀態另有 correction mode，可選取任何已辨識格並覆寫疑似錯誤。
-6. 規則選單變更後立即建立並套用 `RuleProfile`；GUI 可載入或儲存 Profile JSON。
-7. 在確認盤面上手動畫路徑或搜尋 Candidate Route，顯示 Match、cascade、既有 Combo、直接 Combo、直接最大 Combo 預估、危害與條件結果。
-8. 只有可執行候選才可按「執行路徑」。按下即代表接受目前盤面，程式先寫入低權重資料，再直接呼叫 ADB；不再跳第二次確認視窗。
-9. 保留手勢後盤面驗證；驗證失敗或資料寫入失敗時不得把流程當成成功。
+## Workspace workflows
 
-## 操作模式
+1. 更新裝置、選取序號並擷取畫面；device/capture/calibration 在背景執行，成功／錯誤狀態會進 status 與 structured console。
+2. 盤面校正區可輸入左上座標與格寬，或按自動校正；原始來源圖不被人工修正改寫。
+3. 檢查 5×6 盤面，修正 unknown／疑似珠子，切換強化／鎖定標記並設定／清除保護格。
+4. 在規則與搜尋區設定條件、危害策略、外部條件、搜尋界限與 seed；搜尋結果會區分可執行候選與診斷預覽，且可取消。
+5. 在相容性區匯入／匯出既有 `RuleProfile` JSON；在除錯區查看來源、generation、待處理工作與 execution phase，不取代 board/rule/search/execution。
+6. 只有可執行、已確認且已核准的候選才能執行；執行前完成接受／學習，執行中拒絕衝突命令，停止要求會在目前手勢安全放手後生效。
 
-- **路徑模式（Ready）**：無問號時，Canvas 左鍵拖曳建立路徑。
-- **檢視模式（Review）**：有問號時，Canvas 左鍵選取待回答格，珠種按鈕／`1`–`0` 回答；不啟動路徑拖曳。
-- **修正模式（Correction）**：按「修正辨識」後，Canvas 左鍵只選取任一格；珠種按鈕／`1`–`0` 寫入人工覆寫。按「結束修正」回到路徑模式。
-
-模式必須維持清楚分流：問號會優先進入 Review；Correction 只由使用者在 Ready 狀態主動開啟；Route drag 只在 Ready route mode 中啟動。
 
 ## 規則與搜尋
 

@@ -4,14 +4,14 @@
 
 ## 使用指南
 
-- [GUI 使用指南](guides/user-guide.md)
+- [桌面 web UI 使用指南](guides/user-guide.md)
 
 ## 參考文件
 
 - [架構與資料流](reference/architecture.md)
 - [開發與測試](reference/development.md)
 - [領域語彙與背景](reference/context.md)
-- [桌面 GUI 現行規格](reference/desktop-gui-spec.md)
+- [桌面 web UI 現行規格](reference/desktop-gui-spec.md)
 
 ## 研究資料
 

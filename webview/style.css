@@ -688,6 +688,12 @@ legend {
   }
 }
 
+@media (max-height: 920px) {
+  .details-panel {
+    max-height: 280px;
+  }
+}
+
 @media (max-height: 800px) {
   .details-panel {
     max-height: 220px;

@@ -16,9 +16,8 @@ from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, ExternalCondit
                         expected_board_after_path)
 
 
-from pad_router_gui import (_fit_scale, _photo_from_screenshot, BoardCalibration, BoardInspectionApp,
-                            BoardInspectionBridge, BoardInspectionController, OrbPrototypeModel, decode_png,
-                            rule_profile_from_selections)
+from pad_router_gui import (BoardCalibration, BoardInspectionBridge, BoardInspectionController,
+                            OrbPrototypeModel, decode_png, rule_profile_from_selections)
 
 
 def png_bytes(width=12, height=10):
@@ -1739,6 +1738,10 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertTrue(index.is_file())
         self.assertTrue(style.is_file())
         self.assertTrue(script.is_file())
+        gui_source = Path("pad_router_gui.py").read_text(encoding="utf-8")
+        self.assertIn("BoardInspectionBridge", gui_source)
+        self.assertNotIn("BoardInspectionApp", gui_source)
+        self.assertNotIn("tkinter", gui_source)
 
         html = index.read_text(encoding="utf-8")
         self.assertIn('href="style.css"', html)
@@ -1789,6 +1792,7 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn("min-height: 640px", styles)
         self.assertIn("min-height: 140px", styles)
         self.assertIn("@media (max-width: 1100px)", styles)
+        self.assertIn("@media (max-height: 920px)", styles)
         self.assertIn("@media (max-height: 800px)", styles)
         self.assertIn("@media (max-height: 740px)", styles)
         for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
@@ -1797,102 +1801,57 @@ class WebviewAssetTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
-    def test_gui_keeps_tk_and_webview_requires_explicit_flag(self):
+    def test_desktop_entrypoint_uses_webview(self):
         import pad_router
         with patch.object(sys, "argv", ["pad_router.py", "--gui"]), \
-                patch("pad_router_gui.main") as tk_main, \
-                patch("pad_router_webview.main") as webview_main:
-            pad_router.main()
-        tk_main.assert_called_once_with()
-        webview_main.assert_not_called()
-
-        with patch.object(sys, "argv", ["pad_router.py", "--webview"]), \
-                patch("pad_router_gui.main") as tk_main, \
                 patch("pad_router_webview.main") as webview_main:
             pad_router.main()
         webview_main.assert_called_once_with()
-        tk_main.assert_not_called()
 
+        with patch.object(sys, "argv", ["pad_router.py", "--webview"]), \
+                patch("pad_router_webview.main") as webview_main:
+            pad_router.main()
+        webview_main.assert_called_once_with()
 
-class ExecuteRouteUiTests(unittest.TestCase):
-    @staticmethod
-    def _ready_controller(model, executor):
-        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
-                      for row in range(ROWS))
-        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
-        controller = BoardInspectionController(
-            detector=lambda *_args: board, capture=lambda _serial: source,
-            executor=executor, model=model,
+    def test_webview_entrypoint_uses_gtk_and_adjacent_assets(self):
+        import pad_router_webview
+
+        window_calls = []
+        start_calls = []
+        gi_calls = []
+        bridge_closes = []
+
+        class ClosedEvent:
+            def __iadd__(self, callback):
+                self.callback = callback
+                return self
+
+        window = SimpleNamespace(events=SimpleNamespace(closed=ClosedEvent()))
+        fake_webview = SimpleNamespace(
+            create_window=lambda *args, **kwargs: (
+                window_calls.append((args, kwargs)) or window
+            ),
+            start=lambda *args, **kwargs: start_calls.append((args, kwargs)),
         )
-        controller.capture_device("test-device")
-        controller.confirm_board()
-        controller.set_rule_profile(RuleProfile("safe"))
-        controller.evaluate_manual_route(((0, 0),))
-        return controller
+        fake_gi = SimpleNamespace(require_version=lambda *args: gi_calls.append(args))
+        bridge = SimpleNamespace(close=lambda: bridge_closes.append(True))
 
-    def test_execute_learns_before_sending_without_a_second_confirmation(self):
-        import tkinter.messagebox as messagebox
+        with patch.dict(sys.modules, {"webview": fake_webview, "gi": fake_gi}), \
+                patch.object(pad_router_webview, "BoardInspectionBridge", return_value=bridge):
+            pad_router_webview.main()
 
-        calls = []
-        with tempfile.TemporaryDirectory() as directory:
-            model = OrbPrototypeModel(Path(directory) / "prototypes.json")
+        self.assertEqual(gi_calls, [("Gtk", "3.0"), ("WebKit2", "4.1")])
+        self.assertEqual(len(window_calls), 1)
+        args, options = window_calls[0]
+        self.assertEqual(args[0], "PAD Router — 裝置工作區")
+        self.assertEqual(options["url"], pad_router_webview.ASSET_ROOT.joinpath("index.html").as_uri())
+        self.assertEqual(options["min_size"], (960, 640))
+        self.assertTrue(options["resizable"])
+        self.assertEqual(len(start_calls), 1)
+        self.assertEqual(start_calls[0][1], {"gui": "gtk"})
+        self.assertEqual(bridge_closes, [True])
 
-            def executor(*args, **kwargs):
-                calls.append(len(model.samples))
-                return True
 
-            controller = self._ready_controller(model, executor)
-            app = object.__new__(BoardInspectionApp)
-            app.controller = controller
-            app._serial = SimpleNamespace(get=lambda: "test-device")
-            app._manual_route = []
-            app._apply = lambda action: action()
-
-            with patch.object(messagebox, "askyesno", side_effect=AssertionError("unexpected confirmation")):
-                app.execute_route()
-
-        self.assertEqual(calls, [30])
-
-    def test_learning_failure_reports_inline_and_does_not_send(self):
-        calls = []
-        status = []
-        with tempfile.TemporaryDirectory() as directory:
-            model = OrbPrototypeModel(Path(directory) / "prototypes.json")
-            controller = self._ready_controller(model, lambda *args, **kwargs: calls.append(args))
-            app = object.__new__(BoardInspectionApp)
-            app.controller = controller
-            app._serial = SimpleNamespace(get=lambda: "test-device")
-            app._manual_route = []
-            app._status = SimpleNamespace(set=status.append)
-            app._apply = lambda action: action()
-
-            with patch.object(model, "learn", side_effect=OSError("prototype write failed")):
-                app.execute_route()
-
-        self.assertEqual(calls, [])
-        self.assertTrue(status)
-        self.assertIn("執行前學習失敗", status[-1])
-
-    def test_execute_still_blocks_without_route_or_device(self):
-        errors = []
-        accepted = []
-        state = SimpleNamespace(route_evaluation=None)
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(
-            state=state, accept_current_board=lambda: accepted.append(True),
-        )
-        app._serial = SimpleNamespace(get=lambda: "")
-        app._show_error = errors.append
-        app._manual_route = []
-
-        app.execute_route()
-        self.assertEqual(accepted, [])
-        self.assertEqual(len(errors), 1)
-
-        state.route_evaluation = SimpleNamespace(execution_eligible=True)
-        app.execute_route()
-        self.assertEqual(accepted, [])
-        self.assertEqual(len(errors), 2)
 
 
 class ContinuousExecutionTests(unittest.TestCase):
@@ -2042,72 +2001,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         self.assertEqual(capture_calls, ["test-device", "test-device"])
         self.assertIn("新盤面沒有符合條件的路徑", status)
 
-    def test_gui_start_stop_delegates_worker_updates_through_after(self):
-        threads = []
-        callbacks = []
-        displays = []
-        calls = []
 
-        class DeferredThread:
-            def __init__(self, target, daemon):
-                self.target = target
-                self.daemon = daemon
-                threads.append(self)
-
-            def start(self):
-                pass
-
-        state = SimpleNamespace(
-            route_evaluation=SimpleNamespace(execution_eligible=True),
-            status="ready",
-        )
-
-        def run(serial, stop_event, on_state):
-            calls.append((serial, stop_event))
-            state.status = "連續執行中"
-            on_state(state)
-            return "連續執行已由使用者停止"
-
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=state, execute_continuously=run)
-        app.root = SimpleNamespace(after=lambda _delay, callback: callbacks.append(callback))
-        app._serial = SimpleNamespace(get=lambda: "test-device")
-        app._manual_route = []
-        app._auto_search_generation = 0
-        app._status = SimpleNamespace(set=lambda _value: None)
-        app._execute_button = SimpleNamespace(configure=lambda **_kwargs: None)
-        app._continuous_button = SimpleNamespace(configure=lambda **_kwargs: None)
-        app._display = displays.append
-        app._show_error = self.fail
-
-        with patch("pad_router_gui.threading.Thread", DeferredThread):
-            app.start_continuous_execution()
-            self.assertEqual(calls, [])
-            threads[0].target()
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(displays, [])
-        app.stop_continuous_execution()
-        self.assertTrue(calls[0][1].is_set())
-        self.assertEqual(len(callbacks), 1)
-        callbacks[0]()
-        self.assertEqual(displays, [state])
-
-    def test_active_continuous_run_blocks_file_dialog_actions(self):
-        statuses = []
-        app = object.__new__(BoardInspectionApp)
-        app._continuous_stop = threading.Event()
-        app._status = SimpleNamespace(set=statuses.append)
-
-        with (patch("tkinter.filedialog.askopenfilename",
-                    side_effect=AssertionError("dialog opened")),
-              patch("tkinter.filedialog.asksaveasfilename",
-                    side_effect=AssertionError("dialog opened"))):
-            app.open_png()
-            app.save_profile()
-
-        self.assertEqual(len(statuses), 2)
-        self.assertTrue(all("先停止" in status for status in statuses))
 
 
 class RecognitionRetryControllerTests(unittest.TestCase):
@@ -2196,27 +2090,6 @@ class RecognitionRetryControllerTests(unittest.TestCase):
         self.assertEqual(controller.max_recognition_attempts, 4)
 
 
-class RecognitionRetryUiTests(unittest.TestCase):
-    def test_retry_selector_is_readonly_and_updates_controller(self):
-        import tkinter as tk
-
-        controller = BoardInspectionController()
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = BoardInspectionApp(root, controller)
-            self.assertEqual(
-                tuple(app._recognition_attempts_box.cget("values")),
-                ("1", "2", "3", "4", "5"),
-            )
-            self.assertEqual(str(app._recognition_attempts_box.cget("state")), "readonly")
-            self.assertEqual(controller.max_recognition_attempts, 2)
-
-            app._recognition_attempts.set("4")
-
-            self.assertEqual(controller.max_recognition_attempts, 4)
-        finally:
-            root.destroy()
 
 
 class RecognitionRetryControllerTests(unittest.TestCase):
@@ -2305,27 +2178,6 @@ class RecognitionRetryControllerTests(unittest.TestCase):
         self.assertEqual(controller.max_recognition_attempts, 4)
 
 
-class RecognitionRetryUiTests(unittest.TestCase):
-    def test_retry_selector_is_readonly_and_updates_controller(self):
-        import tkinter as tk
-
-        controller = BoardInspectionController()
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = BoardInspectionApp(root, controller)
-            self.assertEqual(
-                tuple(app._recognition_attempts_box.cget("values")),
-                ("1", "2", "3", "4", "5"),
-            )
-            self.assertEqual(str(app._recognition_attempts_box.cget("state")), "readonly")
-            self.assertEqual(controller.max_recognition_attempts, 2)
-
-            app._recognition_attempts.set("4")
-
-            self.assertEqual(controller.max_recognition_attempts, 4)
-        finally:
-            root.destroy()
 
 
 class BoardCalibrationTests(unittest.TestCase):
@@ -2337,378 +2189,24 @@ class BoardCalibrationTests(unittest.TestCase):
             BoardCalibration(0, 0, 0).validate(6, 5)
 
 
-class SearchButtonTests(unittest.TestCase):
-    def test_search_button_displays_controller_state_not_search_result(self):
-        state = object()
-        result = object()
-        received = []
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=state, search_qualifying_route=lambda options: received.append(options) or result)
-        app._manual_route = []
-        app._search_attempts = SimpleNamespace(get=lambda: "5")
-        app._search_steps = SimpleNamespace(get=lambda: "50")
-        app._search_seed = SimpleNamespace(get=lambda: "0")
-        app._cascade = SimpleNamespace(get=lambda: "只計轉珠直接消除")
-        displayed = []
-        app._apply = lambda action: displayed.append(action())
-
-        app.search_route()
-
-        self.assertIs(displayed[0], state)
-        self.assertEqual(received[0].max_steps, 50)
-        self.assertFalse(received[0].cascade)
-
-
-class ReviewModeTests(unittest.TestCase):
-    def test_clicking_a_rejected_cell_selects_it_without_starting_a_route(self):
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=SimpleNamespace(uncertain_cells=((0, 0),)))
-        app._cell_at = lambda _event: (0, 0)
-        app._selected_label = SimpleNamespace(set=lambda _value: None)
-        app._manual_route = [(1, 1)]
-        app._dragging_route = True
-        app._display = lambda _state: None
-
-        app.route_press(SimpleNamespace())
-
-        self.assertEqual(app._selected_cell, (0, 0))
-        self.assertEqual(app._manual_route, [])
-        self.assertFalse(app._dragging_route)
-
-
-class CorrectionModeTests(unittest.TestCase):
-    def test_ready_correction_mode_selects_any_cell_and_calls_existing_override(self):
-        state = SimpleNamespace(board=object(), uncertain_cells=())
-        corrections = []
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(
-            state=state,
-            correct_cell=lambda row, col, value: corrections.append((row, col, value)) or state,
-        )
-        app._correction_mode = False
-        app._manual_route = [(1, 1)]
-        app._dragging_route = True
-        app._cell_at = lambda _event: (0, 0)
-        app._selected_label = SimpleNamespace(set=lambda _value: None)
-        app._display = lambda _state: None
-        app._enhanced = SimpleNamespace(get=lambda: False)
-        app._locked = SimpleNamespace(get=lambda: False)
-        app._apply = lambda action: action()
-
-        app.toggle_correction_mode()
-        app.route_press(SimpleNamespace())
-        app.answer_selected("fire")
-
-        self.assertTrue(app._correction_mode)
-        self.assertEqual(app._selected_cell, (0, 0))
-        self.assertEqual(app._manual_route, [])
-        self.assertFalse(app._dragging_route)
-        self.assertEqual(corrections, [(0, 0, "fire")])
-
-
-class ReadyRouteModeTests(unittest.TestCase):
-    def test_ready_route_mode_still_starts_a_route_drag(self):
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=SimpleNamespace(uncertain_cells=()))
-        app._correction_mode = False
-        app._manual_route = []
-        app._dragging_route = False
-        app._cell_at = lambda _event: (0, 0)
-        app._selected_label = SimpleNamespace(set=lambda _value: None)
-        app._display = lambda _state: None
-
-        app.route_press(SimpleNamespace())
-
-        self.assertEqual(app._manual_route, [(0, 0)])
-        self.assertTrue(app._dragging_route)
-
-    def test_route_drag_cannot_start_or_extend_through_protected_cell(self):
-        state = SimpleNamespace(uncertain_cells=(), protected_cell=(0, 1))
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(state=state)
-        app._correction_mode = False
-        app._manual_route = []
-        app._dragging_route = False
-        app._selected_label = SimpleNamespace(set=lambda _value: None)
-        app._display = lambda _state: None
-        app._cell_at = lambda event: event.cell
-
-        app.route_press(SimpleNamespace(cell=(0, 1)))
-        self.assertEqual(app._manual_route, [])
-        self.assertFalse(app._dragging_route)
-
-        app.route_press(SimpleNamespace(cell=(0, 0)))
-        app.route_motion(SimpleNamespace(cell=(0, 1)))
-        self.assertEqual(app._manual_route, [(0, 0)])
-
-
-class ProtectedCellUiTests(unittest.TestCase):
-    def test_capture_installs_source_then_schedules_search_off_the_ui_thread(self):
-        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
-        profile = RuleProfile("preset")
-        state = SimpleNamespace(
-            source_name="test-device", pixels=b"pixels", board=board, confirmed_board=board,
-            confirmed=True, uncertain_cells=(), rule_profile=profile, protected_cell=None,
-        )
-        captures = []
-        applied = []
-        callbacks = []
-        threads = []
-        result = SimpleNamespace(candidate=SimpleNamespace(route=((0, 0),)))
-
-        class DeferredThread:
-            def __init__(self, target, daemon):
-                self.target = target
-                self.daemon = daemon
-                threads.append(self)
-
-            def start(self):
-                pass
-
-        controller = SimpleNamespace(
-            state=state,
-            capture_device=lambda serial, auto_search=True: (
-                captures.append((serial, auto_search)) or state),
-            _apply_search_result=lambda value, options: applied.append((value, options)),
-        )
-        app = object.__new__(BoardInspectionApp)
-        app.controller = controller
-        app.root = SimpleNamespace(after=lambda _delay, callback: callbacks.append(callback))
-        app._serial = SimpleNamespace(get=lambda: "test-device")
-        app._manual_route = []
-        app._auto_search_generation = 0
-        app._display = lambda _state: None
-
-        with (patch("pad_router_gui.threading.Thread", DeferredThread),
-              patch("pad_router_gui.search_qualifying_route", return_value=result) as search):
-            app.capture_device()
-            self.assertEqual(captures, [("test-device", False)])
-            self.assertEqual(len(threads), 1)
-            self.assertEqual(len(callbacks), 1)
-            search.assert_not_called()
-            self.assertEqual(applied, [])
-
-            threads[0].target()
-            search.assert_called_once()
-            self.assertEqual(applied, [])
-            self.assertEqual(len(callbacks), 1)
-
-            callbacks[0]()
-            self.assertEqual(applied, [(result, RouteSearchOptions())])
-
-            app.capture_device()
-            threads[1].target()
-            app._apply(lambda: state)  # A later manual/search/execute-style state action.
-            callbacks[1]()
-
-        self.assertEqual(applied, [(result, RouteSearchOptions())])
-
-    def test_protect_and_clear_actions_use_the_selected_coordinate(self):
-        calls = []
-        state = SimpleNamespace(board=None, uncertain_cells=(), rule_profile=None)
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(
-            state=state,
-            set_protected_cell=lambda cell, recompute=True: calls.append((cell, recompute)) or state,
-        )
-        app._selected_cell = (2, 3)
-        app._manual_route = [(0, 0)]
-        app._dragging_route = True
-        app._apply = lambda action: action()
-
-        app.protect_selected_cell()
-        app.clear_protected_cell()
-
-        self.assertEqual(calls, [((2, 3), False), (None, False)])
-        self.assertEqual(app._manual_route, [])
-        self.assertFalse(app._dragging_route)
-
-    def test_protected_cell_is_marked_and_capture_button_lives_in_right_controls(self):
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
-            source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
-            controller = BoardInspectionController(
-                detector=lambda *_args: board, capture=lambda _serial: source,
-            )
-            app = BoardInspectionApp(root, controller)
-            controller.capture_device("test-device")
-            app._selected_cell = (0, 0)
-            app._display(controller.set_protected_cell((0, 0)))
-
-            self.assertTrue(app.board.find_withtag("protected"))
-            self.assertTrue(app.source.find_withtag("protected"))
-            self.assertIn("保護格", app._protected_label.get())
-            self.assertIn("第 1 列、第 1 行", app._protected_label.get())
-            self.assertEqual(app._capture_button.winfo_parent(), app.board.winfo_parent())
-
-            def buttons(widget):
-                return [child for child in widget.winfo_children()
-                        if child.winfo_class() == "TButton"] + [button for child in widget.winfo_children()
-                                                               for button in buttons(child)]
-
-            self.assertEqual(sum(button.cget("text") == "擷取畫面" for button in buttons(root)), 1)
-        finally:
-            root.destroy()
-
-
-class ManualRouteButtonTests(unittest.TestCase):
-    def test_manual_route_button_displays_controller_state_not_evaluation(self):
-        state = SimpleNamespace(board=object(), rule_profile=object())
-        result = object()
-        received = []
-        app = object.__new__(BoardInspectionApp)
-        app.controller = SimpleNamespace(
-            state=state, evaluate_manual_route=lambda route, cascade=True: received.append(cascade) or result)
-        app._manual_route = [(0, 0)]
-        app._dragging_route = True
-        app._cascade = SimpleNamespace(get=lambda: "只計轉珠直接消除")
-        displayed = []
-        app._apply = lambda action: displayed.append(action())
-
-        app.route_release(None)
-
-        self.assertIs(displayed[0], state)
-        self.assertEqual(received, [False])
-
-
-class DisplayScaleTests(unittest.TestCase):
-    def test_landscape_screenshot_fits_width_without_stretching(self):
-        scale, width, height = _fit_scale(1920, 1080, 650, 700)
-
-        self.assertAlmostEqual(scale, 650 / 1920)
-        self.assertEqual((width, height), (650, 365))
-
-    def test_portrait_screenshot_fits_height_without_stretching(self):
-        scale, width, height = _fit_scale(1080, 1920, 650, 700)
-
-        self.assertAlmostEqual(scale, 700 / 1920)
-        self.assertEqual((width, height), (393, 700))
-
-    def test_display_scale_does_not_change_calibration_coordinates(self):
-        calibration = BoardCalibration(left=35, top=120, cell=180)
-        point = calibration.to_grid().point(2, 3)
-
-        _fit_scale(1920, 1080, 650, 700)
-
-        self.assertEqual(calibration.to_grid().point(2, 3), point)
-
-
-class ScreenshotPhotoTests(unittest.TestCase):
-    def test_bgra_screenshot_loads_in_tk(self):
-        import tkinter as tk
-
-        root = tk.Tk()
-        try:
-            image = _photo_from_screenshot((1, 1, bytes((60, 40, 20, 255))), tk)
-            self.assertEqual((image.width(), image.height()), (1, 1))
-        finally:
-            root.destroy()
-
-
-class ConditionColorUiTests(unittest.TestCase):
-    def test_untyped_shape_conditions_restore_as_untyped_controls(self):
-        self.assertEqual(
-            BoardInspectionApp._condition_selection(LeaderCondition.shape("l")),
-            ("L 型", "不指定"),
-        )
-        self.assertEqual(
-            BoardInspectionApp._condition_selection(LeaderCondition.connected_orb_count(4, exact=True)),
-            ("4 顆消除", "不指定"),
-        )
-
-    def test_shape_can_be_left_untyped_from_the_gui(self):
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = BoardInspectionApp(root)
-            app._condition_choices[0].set("十字型")
-
-            self.assertIn("不指定", app._condition_color_boxes[0].cget("values"))
-            self.assertEqual(app._condition_colors[0].get(), "不指定")
-            self.assertEqual(app.controller.state.rule_profile.condition_groups[0].conditions[0].value,
-                             "cross")
-        finally:
-            root.destroy()
-
-    def test_shape_defaults_to_untyped_but_keeps_the_colour_choice_available(self):
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = BoardInspectionApp(root)
-            self.assertEqual(app._condition_colors[0].get(), "不指定")
-            self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "disabled")
-            app._condition_choices[0].set("十字型")
-            self.assertEqual(app._condition_colors[0].get(), "不指定")
-            self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "readonly")
-            app._condition_choices[0].set("不限（以最大 Combo 為主）")
-            self.assertEqual(app._condition_colors[0].get(), "不指定")
-            self.assertEqual(str(app._condition_color_boxes[0].cget("state")), "disabled")
-        finally:
-            root.destroy()
-
-
-class AutoProfileUiTests(unittest.TestCase):
-    def test_rule_changes_apply_immediately_without_create_apply_buttons(self):
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = BoardInspectionApp(root)
-            self.assertFalse(hasattr(app, "create_profile"))
-            self.assertFalse(hasattr(app, "apply_profile"))
-
-            app._condition_choices[0].set("至少 5 Combo")
-            self.assertIsNotNone(app.controller.state.rule_profile)
-            self.assertEqual(app.controller.state.rule_profile.name, "至少 5 Combo")
-            self.assertIn("已套用", app._profile_label.get())
-
-            app._search_attempts.set("10")
-            self.assertEqual(app.controller.state.rule_profile.name, "至少 5 Combo")
-        finally:
-            root.destroy()
-
-    def test_profile_load_and_save_keep_controller_and_controls_in_sync(self):
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            app = BoardInspectionApp(root)
-            app._condition_choices[0].set("十字型")
-            app._condition_colors[0].set("暗")
-            app._condition_operator.set("任一符合")
-            app._hazard_policy.set("允許危害珠")
-            app._external_condition.set("HP 條件已確認")
-            saved_profile = app.controller.state.rule_profile
-
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "profile.json"
-                with patch("tkinter.filedialog.asksaveasfilename", return_value=str(path)):
-                    app.save_profile()
-                self.assertTrue(path.exists())
-
-                app._condition_choices[0].set("至少 3 Combo")
-                with patch("tkinter.filedialog.askopenfilename", return_value=str(path)):
-                    app.load_profile()
-
-            self.assertEqual(app.controller.state.rule_profile, saved_profile)
-            self.assertEqual(app._condition_choices[0].get(), "十字型")
-            self.assertEqual(app._condition_colors[0].get(), "暗")
-            self.assertEqual(app._condition_operator.get(), "任一符合")
-            self.assertEqual(app._hazard_policy.get(), "允許危害珠")
-            self.assertEqual(app._external_condition.get(), "HP 條件已確認")
-            self.assertIn("已套用", app._profile_label.get())
-        finally:
-            root.destroy()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class RuleProfileSelectionTests(unittest.TestCase):

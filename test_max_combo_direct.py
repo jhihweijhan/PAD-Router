@@ -4,7 +4,7 @@ from collections import Counter
 from pad_router import (ConditionGroup, LeaderCondition, Orb, RouteSearchOptions, RuleProfile,
                         evaluate_manual_route, max_combo_layout, resolve_matches,
                         search_qualifying_route)
-from pad_router_gui import BoardInspectionApp
+from pad_router_gui import _format_evaluation, _format_layout
 
 
 class DirectMaxComboTests(unittest.TestCase):
@@ -153,7 +153,7 @@ class DirectMaxComboTests(unittest.TestCase):
                          Counter(orb for line in board for orb in line))
         self.assertEqual(len(resolve_matches(layout, cascade=False)[0].matches), goal)
         result = evaluate_manual_route(board, ((4, 0),), RuleProfile("max"))
-        self.assertIn("目標版型（此排法可成立 9 Combo", BoardInspectionApp._format_layout(board, result))
+        self.assertIn("目標版型（此排法可成立 9 Combo", _format_layout(board, result))
 
     def test_layout_does_not_promise_blocks_a_dominant_colour_would_merge(self):
         board = tuple(tuple(3 for _ in range(6)) for _ in range(4)) + ((3, 5, 5, 5, 5, 5),)
@@ -182,7 +182,7 @@ class DirectMaxComboTests(unittest.TestCase):
             (with_cascade.direct_combo_count, with_cascade.direct_combo_estimate),
             (without_cascade.direct_combo_count, without_cascade.direct_combo_estimate),
         )
-        self.assertIn("直接：2／預估：9", BoardInspectionApp._format_evaluation(with_cascade))
+        self.assertIn("直接：2／預估：9", _format_evaluation(with_cascade))
 
 
 if __name__ == "__main__":
