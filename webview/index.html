@@ -30,8 +30,8 @@
     <section class="panel source-panel" aria-labelledby="source-heading">
       <div class="panel-heading">
         <div>
-          <p class="eyebrow">SOURCE</p>
-          <h2 id="source-heading">目前裝置畫面</h2>
+          <p class="eyebrow">SOURCE / GROUND TRUTH</p>
+          <h2 id="source-heading">原始裝置畫面</h2>
         </div>
         <span id="source-meta" class="muted">尚未擷取</span>
       </div>
@@ -42,31 +42,76 @@
         </div>
         <img id="source-image" alt="目前裝置截圖" hidden>
       </div>
+      <p class="ground-truth-note">原始截圖保持不變；盤面檢視與人工修正只更新右側受控資料。</p>
     </section>
 
-    <aside class="panel details-panel" aria-labelledby="details-heading">
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">WORKSPACE</p>
-          <h2 id="details-heading">工作狀態</h2>
+    <aside class="workspace-sidebar">
+      <section class="panel details-panel" aria-labelledby="details-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">WORKSPACE</p>
+            <h2 id="details-heading">工作狀態</h2>
+          </div>
+          <span id="busy-label" class="muted">閒置</span>
         </div>
-        <span id="busy-label" class="muted">閒置</span>
-      </div>
-      <dl class="facts">
-        <div>
-          <dt>選取裝置</dt>
-          <dd id="selected-device">尚未選取</dd>
+        <dl class="facts">
+          <div>
+            <dt>選取裝置</dt>
+            <dd id="selected-device">尚未選取</dd>
+          </div>
+          <div>
+            <dt>來源</dt>
+            <dd id="source-name">尚未載入</dd>
+          </div>
+          <div>
+            <dt>截圖尺寸</dt>
+            <dd id="source-size">—</dd>
+          </div>
+        </dl>
+        <p class="help-text">畫面由 Python 後端擷取與準備；瀏覽器只呈現受控的 PNG 資料。</p>
+      </section>
+
+      <section class="panel review-panel" aria-labelledby="board-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">BOARD REVIEW</p>
+            <h2 id="board-heading">盤面檢視</h2>
+          </div>
+          <strong id="unknown-count" class="count-badge">未知 0</strong>
         </div>
-        <div>
-          <dt>來源</dt>
-          <dd id="source-name">尚未載入</dd>
+        <p id="review-status" class="review-status" role="status" aria-live="polite">尚未載入盤面。</p>
+        <div id="board-grid" class="board-grid" role="grid" aria-label="5 列 6 欄盤面"></div>
+        <p id="selected-cell" class="selected-cell" aria-live="polite">尚未選取盤面格</p>
+
+        <div class="correction-controls">
+          <fieldset>
+            <legend>修正所選珠子</legend>
+            <div id="orb-palette" class="orb-palette" role="group" aria-label="珠子種類">
+              <button type="button" data-orb="fire" aria-pressed="true">火</button>
+              <button type="button" data-orb="water" aria-pressed="false">水</button>
+              <button type="button" data-orb="wood" aria-pressed="false">木</button>
+              <button type="button" data-orb="light" aria-pressed="false">光</button>
+              <button type="button" data-orb="dark" aria-pressed="false">暗</button>
+              <button type="button" data-orb="heart" aria-pressed="false">心</button>
+              <button type="button" data-orb="jammer" aria-pressed="false">干擾</button>
+              <button type="button" data-orb="poison" aria-pressed="false">毒</button>
+              <button type="button" data-orb="mortal_poison" aria-pressed="false">猛毒</button>
+              <button type="button" data-orb="bomb" aria-pressed="false">炸彈</button>
+            </div>
+            <div class="orb-flags">
+              <label><input id="enhanced" type="checkbox"> 強化（+）</label>
+              <label><input id="locked" type="checkbox"> 鎖定（L）</label>
+            </div>
+            <button id="correct" type="button" class="primary-action" disabled>修正所選格</button>
+          </fieldset>
         </div>
-        <div>
-          <dt>截圖尺寸</dt>
-          <dd id="source-size">—</dd>
+
+        <div class="protection-controls" aria-label="保護格控制">
+          <button id="protect" type="button" disabled>保護所選格</button>
+          <button id="clear-protect" type="button" disabled>清除保護</button>
         </div>
-      </dl>
-      <p class="help-text">畫面由 Python 後端擷取與準備；瀏覽器只呈現受控的 PNG 資料。</p>
+        <p id="execution-gate" class="execution-gate">尚未載入盤面。</p>
+      </section>
     </aside>
   </main>
 

@@ -468,11 +468,12 @@ def _coerce_orb(value: object) -> Orb:
     if not isinstance(value, str):
         raise ValueError("珠子修正值必須是珠子、顏色數字或珠子名稱")
     text = value.strip().lower().replace(" ", "_")
-    enhanced = text.endswith("+")
-    if enhanced:
-        text = text[:-1]
-    locked = text.endswith("*")
-    if locked:
+    enhanced = locked = False
+    while text and text[-1] in "+*":
+        if text[-1] == "+":
+            enhanced = True
+        else:
+            locked = True
         text = text[:-1]
     names = {name: color for color, name in NAMES.items()}
     if text in names:
@@ -954,6 +955,40 @@ def _list_adb_devices() -> tuple[str, ...]:
     )
 
 
+def _review_cell(cell: object) -> tuple[int, int]:
+    if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+        raise ValueError("盤面座標必須是 [row, col]")
+    row, col = cell
+    if (isinstance(row, bool) or not isinstance(row, int)
+            or isinstance(col, bool) or not isinstance(col, int)
+            or not (0 <= row < ROWS and 0 <= col < COLS)):
+        raise ValueError("盤面座標必須位於 5×6 標準盤面內")
+    return row, col
+
+
+def _review_board(board: Board | None, selected: tuple[int, int] | None,
+                  protected: tuple[int, int] | None) -> list[dict[str, object]]:
+    if board is None:
+        return []
+    cells: list[dict[str, object]] = []
+    for row, values in enumerate(board):
+        for col, orb in enumerate(values):
+            key = orb_match_key(orb)
+            cells.append({
+                "cell": [row, col],
+                "label": orb_display(orb),
+                "kind": getattr(orb, "kind", "normal" if isinstance(key, int) else "unknown"),
+                "color": getattr(orb, "color", key if isinstance(key, int) else None),
+                "visual_class": getattr(orb, "visual_class", None),
+                "enhanced": bool(getattr(orb, "enhanced", False)),
+                "locked": bool(getattr(orb, "locked", False)),
+                "unknown": key is None,
+                "selected": selected == (row, col),
+                "protected": protected == (row, col),
+            })
+    return cells
+
+
 class BoardInspectionBridge:
     """Serialized, JSON-safe backend surface for the local webview."""
 
@@ -972,18 +1007,53 @@ class BoardInspectionBridge:
         self._pending_operations = 0
         self._devices: tuple[str, ...] = ()
         self._selected_device = ""
+        state = self.controller.state
+        self._selected_cell: tuple[int, int] | None = (
+            state.uncertain_cells[0] if state.uncertain_cells else None
+        )
         self._console: list[dict[str, str]] = []
         self._pending_update: dict[str, object] | None = None
-        self._controller_snapshot = self.controller.snapshot()
+        self._controller_snapshot = self._review_snapshot()
         self._announce("info", "ready", str(self._controller_snapshot["status"]))
+
+    def _review_snapshot(self, refresh_source: bool = False) -> dict[str, object]:
+        state = self.controller.state
+        cached = getattr(self, "_controller_snapshot", {})
+        if refresh_source or not cached:
+            base = self.controller.snapshot()
+        else:
+            base = {**cached, "status": state.status}
+        selected = self._selected_cell if state.board is not None else None
+        protected = state.protected_cell
+        return {
+            **base,
+            "board": _review_board(state.board, selected, protected),
+            "unknown_count": len(state.uncertain_cells),
+            "confirmed": state.confirmed,
+            "approval_allowed": bool(state.confirmed and not state.uncertain_cells),
+            "selected_cell": list(selected) if selected is not None else None,
+            "protected_cell": list(protected) if protected is not None else None,
+            "learning_status": state.learning_status,
+        }
 
     @staticmethod
     def _copy_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
         source = snapshot.get("source")
+        board = []
+        for cell in snapshot.get("board", ()):
+            copied = dict(cell)
+            if isinstance(copied.get("cell"), (list, tuple)):
+                copied["cell"] = list(copied["cell"])
+            board.append(copied)
+        selected = snapshot.get("selected_cell")
+        protected = snapshot.get("protected_cell")
         return {
             **snapshot,
             "source": dict(source) if isinstance(source, dict) else None,
+            "board": board,
             "devices": list(snapshot.get("devices", ())),
+            "selected_cell": list(selected) if isinstance(selected, (list, tuple)) else selected,
+            "protected_cell": list(protected) if isinstance(protected, (list, tuple)) else protected,
             "console": [dict(item) for item in snapshot.get("console", ())],
         }
 
@@ -1050,8 +1120,18 @@ class BoardInspectionBridge:
                                if self._devices else "沒有可用的 Android 裝置")
                     level = "info"
                 elif phase == "capture":
-                    self._controller_snapshot = self.controller.snapshot()
+                    state = self.controller.state
+                    self._selected_cell = (
+                        state.uncertain_cells[0] if state.uncertain_cells else None
+                    )
+                    self._controller_snapshot = self._review_snapshot(refresh_source=True)
                     message = str(self._controller_snapshot["status"])
+                    level = "success"
+                elif phase == "review":
+                    state, selected = result
+                    self._selected_cell = selected
+                    self._controller_snapshot = self._review_snapshot()
+                    message = str(state.status)
                     level = "success"
                 else:
                     message = str(result)
@@ -1064,6 +1144,26 @@ class BoardInspectionBridge:
                 self._pending_operations = max(0, self._pending_operations - 1)
                 self._busy = self._pending_operations > 0
                 self._announce("error", phase, str(exc))
+
+    def _resolve_cell(self, payload: dict[str, object], *, selected: bool = False) -> tuple[int, int]:
+        if "cell" in payload:
+            return _review_cell(payload["cell"])
+        if "row" in payload or "col" in payload:
+            return _review_cell((payload.get("row"), payload.get("col")))
+        if selected and self._selected_cell is not None:
+            return self._selected_cell
+        raise ValueError("請先選取盤面格")
+
+    def _correct(self, cell: tuple[int, int], value: object) -> tuple[BoardInspectionState, tuple[int, int] | None]:
+        was_unknown = cell in self.controller.state.uncertain_cells
+        state = self.controller.correct_cell(*cell, value)
+        if not was_unknown:
+            return state, cell
+        next_cell = next((item for item in state.uncertain_cells if item > cell), None)
+        return state, next_cell or (state.uncertain_cells[0] if state.uncertain_cells else None)
+
+    def _protect(self, cell: tuple[int, int] | None) -> tuple[BoardInspectionState, tuple[int, int] | None]:
+        return self.controller.set_protected_cell(cell, recompute=False), self._selected_cell
 
     def command(self, payload: str | dict[str, object]) -> dict[str, object] | list[dict[str, object]]:
         """Accept one intent and return a JSON-safe acknowledgement or view."""
@@ -1092,6 +1192,38 @@ class BoardInspectionBridge:
                 self._selected_device = serial
                 self._announce("info", "device", f"已選擇裝置：{serial}")
                 return self._view_locked()
+        if action == "select_cell":
+            if self.controller.state.board is None:
+                raise ValueError("請先擷取裝置畫面，再選取盤面格")
+            with self._lock:
+                self._selected_cell = self._resolve_cell(payload)
+                self._controller_snapshot = self._review_snapshot()
+                self._announce(
+                    "info", "review",
+                    f"已選取第 {self._selected_cell[0] + 1} 列、第 {self._selected_cell[1] + 1} 行",
+                )
+                return self._view_locked()
+        if action in {"correct", "correct_cell"}:
+            with self._lock:
+                cell = self._resolve_cell(payload, selected=True)
+            return self._submit(
+                "review",
+                f"正在修正第 {cell[0] + 1} 列、第 {cell[1] + 1} 行",
+                lambda: self._correct(cell, payload.get("value")),
+            )
+        if action in {"protect_cell", "set_protected_cell"}:
+            with self._lock:
+                if "cell" in payload and payload["cell"] is None:
+                    cell = None
+                elif "cell" in payload or "row" in payload or "col" in payload:
+                    cell = self._resolve_cell(payload)
+                else:
+                    cell = self._selected_cell
+            return self._submit(
+                "review",
+                "正在更新保護格",
+                lambda: self._protect(cell),
+            )
         if action in {"capture", "capture_device", "capture_screen"}:
             serial = payload.get("serial")
             with self._lock:

@@ -55,14 +55,14 @@ flowchart LR
 
 - `OrbPrototypeModel`：不訓練的 CPU nearest-prototype 學習資料，保存 human／implicit cell feature；正式檔寫在同目錄暫存檔後以 `Path.replace()` 原子替換。
 - `BoardInspectionController`：保存 GUI 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行；`snapshot()` 只回傳 JSON-safe status 與一次編碼的 PNG，不暴露 raw pixels。
-- `BoardInspectionBridge`：以單一 worker serialise device refresh/capture intent，保存受控 snapshot 與 persistent console；pending snapshot event 只保留最新值，避免快速事件阻塞 renderer。
+- `BoardInspectionBridge`：以單一 worker serialise device refresh/capture/review intent，保存受控 source/board snapshot 與 persistent console；selection、unknown count、protected/enhanced/locked markers 與 correction events 都是 JSON-safe DTO，pending snapshot event 只保留最新值。
 - `BoardInspectionApp`：既有 Tk widget 與三種清楚的操作模式，供後續切片保留。
 
 ### `pad_router_webview.py` 與 `webview/`
 
 - pywebview 僅載入 repository 相鄰的 `index.html`、`style.css` 與 `app.js`；不請求外部網路資產。完整 Tk `--gui` 仍是預設入口，直到 cutover #14。
 - 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪。
-- 目前 workspace 僅提供裝置清單、選取、截圖、來源畫面與 status/console；盤面修正、規則、搜尋與執行仍由後續切片處理。
+- 目前 workspace 提供裝置清單、選取、截圖、5×6 review、未知／疑似珠子修正、保護格與強化／鎖定標記；規則、搜尋與執行仍由後續切片處理。
 
 ## 狀態與安全不變量
 

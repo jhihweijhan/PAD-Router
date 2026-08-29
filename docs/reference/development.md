@@ -4,7 +4,7 @@
 
 ## 環境與原則
 
-`pyproject.toml` 宣告 Python `>=3.10` 與固定版本 `pywebview==5.4`；本專案以 `uv` 作為唯一執行入口。完整盤面入口 `--gui` 保持既有 Tk 流程，直到 cutover #14；Issue #9 capture workspace 僅由明確 `--webview` flag 啟動，固定使用 GTK backend。
+`pyproject.toml` 宣告 Python `>=3.10` 與固定版本 `pywebview==5.4`；本專案以 `uv` 作為唯一執行入口。完整盤面入口 `--gui` 保持既有 Tk 流程，直到 cutover #14；Issue #9/#10 capture/review workspace 僅由明確 `--webview` flag 啟動，固定使用 GTK backend。
 
 Ubuntu 的 uv project venv 預設隔離 system site-packages；要使用 GTK backend，先安裝 bindings/typelibs，再建立可讀取它們的 venv：
 
@@ -24,7 +24,7 @@ uv run python -c "import gi; gi.require_version('Gtk', '3.0'); gi.require_versio
 # 完整 Tk 盤面流程（--gui；直到 cutover #14）
 uv run python pad_router.py --gui
 
-# Issue #9 離線 capture workspace（明確 opt-in）
+# Issue #9/#10 離線 capture/review workspace（明確 opt-in）
 uv run python pad_router.py --webview
 
 # CLI 說明
@@ -47,7 +47,7 @@ uv run python -m unittest
 目前測試分工：
 
 - `test_pad_router_planning.py`：Rule Profile JSON、Match/cascade、危害策略、手動路徑、固定 seed 搜尋、候選排序、診斷候選與執行資格。
-- `test_pad_router_gui.py`：PNG 解析、校正、GUI controller、人工修正、原型資料原子持久化、辨識／中心圖樣、來源顯示縮放、規則自動套用、問號重試、執行前學習、webview bridge 快照／非同步擷取、1080×2400 responsive/coalescing evidence 與 entrypoint routing。
+- `test_pad_router_gui.py`：PNG 解析、校正、GUI controller、人工修正、原型資料原子持久化、辨識／中心圖樣、來源顯示縮放、規則自動套用、問號重試、執行前學習、webview bridge 快照／非同步擷取、1080×2400 responsive/coalescing evidence、5×6 review DTO、unknown advancement、protected markers 與 entrypoint routing。
 
 修改核心規則、安全條件或 bridge 合約時，先跑最接近的測試類別，再跑完整命令；不要把連線裝置或使用者截圖作為測試依賴。測試應使用固定的 5×6 Board、in-memory pixels、可替換 detector/capture/device-lister/executor 與固定 seed。
 

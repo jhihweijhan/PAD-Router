@@ -738,6 +738,113 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertGreaterEqual(len(snapshot["console"]), 5)
         json.dumps(events)
 
+    def test_board_review_serializes_markers_and_advances_unknown_correction(self):
+        unknown = Orb("unknown", visual_class="unknown")
+        first_row = (
+            unknown,
+            unknown,
+            Orb("normal", 1, enhanced=True, locked=True),
+            Orb("normal", 2),
+            Orb("normal", 3),
+            Orb("normal", 4),
+        )
+        board = (first_row,) + tuple(
+            tuple(Orb("normal", 5) for _ in range(COLS))
+            for _ in range(ROWS - 1)
+        )
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_protected_cell((0, 2), recompute=False)
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+
+        snapshot = bridge.snapshot()
+        source_image = snapshot["source"]["image"]
+        cells = {tuple(cell["cell"]): cell for cell in snapshot["board"]}
+        self.assertEqual(snapshot["unknown_count"], 2)
+        self.assertEqual(snapshot["selected_cell"], [0, 0])
+        self.assertTrue(cells[(0, 0)]["unknown"])
+        self.assertTrue(cells[(0, 2)]["protected"])
+        self.assertTrue(cells[(0, 2)]["enhanced"])
+        self.assertTrue(cells[(0, 2)]["locked"])
+        self.assertFalse(snapshot["approval_allowed"])
+        with self.assertRaises(ValueError):
+            controller.confirm_board()
+
+        selected = bridge.command({"action": "select_cell", "cell": [0, 2]})
+        self.assertEqual(selected["selected_cell"], [0, 2])
+        selected = bridge.command({"action": "select_cell", "row": 0, "col": 0})
+        self.assertEqual(selected["selected_cell"], [0, 0])
+
+        corrected = bridge.command({"action": "correct_cell", "value": "fire*+"})
+        self.assertEqual(corrected["snapshot"]["unknown_count"], 1)
+        self.assertEqual(corrected["snapshot"]["selected_cell"], [0, 1])
+        corrected_cell = {
+            tuple(cell["cell"]): cell for cell in corrected["snapshot"]["board"]
+        }[(0, 0)]
+        self.assertEqual(corrected_cell["label"], "火+L")
+        self.assertTrue(corrected_cell["enhanced"])
+        self.assertTrue(corrected_cell["locked"])
+
+        completed = bridge.command({"action": "correct_cell", "value": "water"})
+        self.assertEqual(completed["snapshot"]["unknown_count"], 0)
+        self.assertIsNone(completed["snapshot"]["selected_cell"])
+        self.assertTrue(completed["snapshot"]["approval_allowed"])
+        self.assertEqual(completed["snapshot"]["source"]["image"], source_image)
+        json.dumps(completed["snapshot"])
+        controller.confirm_board()
+
+    def test_protected_cell_intent_follows_selection_and_keeps_event_serializable(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+
+        selected = bridge.command({"action": "select_cell", "row": 2, "col": 3})
+        self.assertEqual(selected["selected_cell"], [2, 3])
+        protected = bridge.command({"action": "set_protected_cell"})
+        self.assertEqual(protected["snapshot"]["protected_cell"], [2, 3])
+        protected_cell = {
+            tuple(cell["cell"]): cell for cell in protected["snapshot"]["board"]
+        }[(2, 3)]
+        self.assertTrue(protected_cell["protected"])
+        self.assertIn("保護", protected["snapshot"]["status"])
+
+        cleared = bridge.command({"action": "set_protected_cell", "cell": None})
+        self.assertIsNone(cleared["snapshot"]["protected_cell"])
+        events = bridge.drain_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["phase"], "review")
+        json.dumps(events)
+
 
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
@@ -754,6 +861,23 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('href="style.css"', html)
         self.assertIn('src="app.js"', html)
         self.assertNotIn("://", html + style.read_text() + script.read_text())
+        self.assertIn('id="board-grid"', html)
+        self.assertIn('data-orb="fire"', html)
+        client = script.read_text()
+        self.assertIn("ArrowRight", client)
+        self.assertIn("requestAnimationFrame", client)
+        self.assertIn("pendingSnapshot", client)
+        self.assertIn("setInterval(pollEvents, 200)", client)
+        self.assertIn('command("select_cell"', client)
+        self.assertIn('command("correct_cell"', client)
+        self.assertIn('className = "cell-badge plus"', client)
+        self.assertIn('command("set_protected_cell"', client)
+        self.assertNotIn("adb", client.lower())
+        self.assertNotIn("solver", client.lower())
+        styles = style.read_text()
+        for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
+                       ".cell-badge", ".cell-badge.locked"):
+            self.assertIn(marker, styles)
 
 
 class EntrypointTests(unittest.TestCase):

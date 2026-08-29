@@ -8,7 +8,7 @@
 # Complete Tk board workflow (default --gui until cutover #14)
 uv run python pad_router.py --gui
 
-# Issue #9 capture workspace (explicit opt-in)
+# Issue #10 capture and board-review workspace (explicit opt-in)
 uv run python pad_router.py --webview
 ```
 
@@ -26,7 +26,7 @@ uv run python pad_router.py --webview
 
 - 「更新裝置」、「擷取畫面」和實際執行路徑需要已連線且已授權的 `adb` 裝置。
 
-`--webview` 目前提供 Issue #9 的離線工作區：更新裝置、選取序號、非同步擷取目前畫面，以及 persistent status/console。截圖由 Python `BoardInspectionController` 驗證後以受控 PNG snapshot 呈現；工作區尚未提供盤面修正、規則、搜尋或執行控制。
+`--webview` 目前提供 Issue #10 的離線工作區：更新裝置、選取序號、非同步擷取目前畫面，並顯示 5×6 盤面 review。可點選或以方向鍵移動選取格，修正未知／疑似珠子，切換強化與鎖定標記，或設定／清除保護格；修正未知格會立即更新未知數量並前往下一格。原始截圖保持為 ground truth，含未知格時 controller 不允許確認，工作區也不提供規則、搜尋或執行流程。
 
 以下「載入來源」之後的操作說明適用於完整 Tk `--gui` 入口。
 
