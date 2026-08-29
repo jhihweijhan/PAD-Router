@@ -688,6 +688,36 @@ legend {
   }
 }
 
+@media (max-height: 800px) {
+  .details-panel {
+    max-height: 220px;
+  }
+
+  .board-grid {
+    width: min(100%, 180px);
+  }
+
+  .board-cell {
+    min-height: 24px;
+    font-size: 14px;
+  }
+}
+
+@media (max-height: 740px) {
+  .details-panel {
+    max-height: 190px;
+  }
+
+  .board-grid {
+    width: min(100%, 170px);
+  }
+
+  .board-cell {
+    min-height: 22px;
+    font-size: 12px;
+  }
+}
+
 @media (max-width: 1000px) {
   .topbar {
     grid-template-columns: 1fr;

@@ -1467,7 +1467,8 @@ class BoardInspectionBridgeTests(unittest.TestCase):
 
         refreshed = bridge.command({"action": "refresh_devices"})
         self.assertTrue(refreshed["accepted"])
-        self.assertTrue(refreshed["snapshot"]["busy"])
+        self.assertFalse(refreshed["snapshot"]["busy"])
+        self.assertTrue(refreshed["snapshot"]["operational_busy"])
         self.assertEqual(listed, [])
         executor.run_next()
         refreshed = bridge.snapshot()
@@ -1478,7 +1479,8 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         bridge.command({"action": "select_device", "serial": "device-b"})
         captured = bridge.command({"action": "capture_screen"})
         self.assertTrue(captured["accepted"])
-        self.assertTrue(captured["snapshot"]["busy"])
+        self.assertFalse(captured["snapshot"]["busy"])
+        self.assertTrue(captured["snapshot"]["operational_busy"])
         self.assertEqual(captures, [])
         executor.run_next()
         self.assertEqual(captures, ["device-b"])
@@ -1490,7 +1492,8 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             "cell": 20,
         })
         self.assertTrue(calibration["accepted"])
-        self.assertTrue(calibration["snapshot"]["busy"])
+        self.assertFalse(calibration["snapshot"]["busy"])
+        self.assertTrue(calibration["snapshot"]["operational_busy"])
         executor.run_next()
         calibrated = bridge.snapshot()
         self.assertEqual(calibrated["calibration"], {"left": 0, "top": 0, "cell": 20})
@@ -1498,7 +1501,8 @@ class BoardInspectionBridgeTests(unittest.TestCase):
 
         automatic = bridge.command({"action": "auto_calibrate"})
         self.assertTrue(automatic["accepted"])
-        self.assertTrue(automatic["snapshot"]["busy"])
+        self.assertFalse(automatic["snapshot"]["busy"])
+        self.assertTrue(automatic["snapshot"]["operational_busy"])
         executor.run_next()
         self.assertEqual(
             bridge.snapshot()["calibration"],
@@ -1632,6 +1636,99 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             self.assertIn(key, snapshot)
 
 
+    def test_operational_requests_do_not_block_primary_interactions(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        operational_executor = DeferredExecutor()
+        bridge = BoardInspectionBridge(
+            controller=controller,
+            device_lister=lambda: ("test-device",),
+            executor=ImmediateExecutor(),
+            operational_executor=operational_executor,
+        )
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+        refreshed = bridge.command({"action": "refresh_devices"})
+        self.assertTrue(refreshed["accepted"])
+        self.assertFalse(refreshed["snapshot"]["busy"])
+        self.assertTrue(refreshed["snapshot"]["operational_busy"])
+        self.assertEqual(refreshed["snapshot"]["debug"]["pending_operational"], 1)
+
+        selected = bridge.command({"action": "select_cell", "cell": [0, 0]})
+        self.assertEqual(selected["selected_cell"], [0, 0])
+        self.assertFalse(selected["busy"])
+        self.assertTrue(selected["operational_busy"])
+        updated = bridge.command({
+            "action": "set_rule_profile",
+            "conditions": [{"label": "至少 3 Combo", "color": "不指定"}],
+            "operator": "全部符合",
+            "hazard_policy": "避免危害珠",
+            "external": "無",
+        })
+        self.assertTrue(updated["accepted"])
+        self.assertFalse(updated["snapshot"]["busy"])
+        self.assertTrue(updated["snapshot"]["operational_busy"])
+        self.assertEqual(len(operational_executor.pending), 1)
+
+        operational_executor.run_next()
+        refreshed = bridge.snapshot()
+        self.assertFalse(refreshed["busy"])
+        self.assertFalse(refreshed["operational_busy"])
+        self.assertEqual(refreshed["devices"], ["test-device"])
+        self.assertEqual(refreshed["rule_profile"]["name"], "至少 3 Combo")
+
+        calibrated = bridge.command({
+            "action": "calibrate",
+            "left": 0,
+            "top": 0,
+            "cell": 2,
+        })
+        self.assertTrue(calibrated["accepted"])
+        self.assertFalse(calibrated["snapshot"]["busy"])
+        self.assertTrue(calibrated["snapshot"]["operational_busy"])
+        with self.assertRaisesRegex(ValueError, "裝置盤面作業中"):
+            bridge.command({
+                "action": "set_rule_profile",
+                "conditions": [{"label": "至少 5 Combo", "color": "不指定"}],
+                "operator": "全部符合",
+                "hazard_policy": "避免危害珠",
+                "external": "無",
+            })
+        selected = bridge.command({"action": "select_cell", "cell": [0, 1]})
+        self.assertEqual(selected["selected_cell"], [0, 1])
+        operational_executor.run_next()
+        self.assertFalse(bridge.snapshot()["operational_busy"])
+
+
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
         from pad_router_webview import ASSET_ROOT
@@ -1682,6 +1779,7 @@ class WebviewAssetTests(unittest.TestCase):
                 'command("calibrate"', 'command("auto_calibrate"',
                 'command("import_rule_profile"', 'command("export_rule_profile"',
                 'FileReader', 'Blob', 'snapshot.debug', 'entry.level',
+                'operational_busy', 'followTail',
         ):
             self.assertIn(marker, client)
         self.assertNotIn("adb", client.lower())
@@ -1691,6 +1789,8 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn("min-height: 640px", styles)
         self.assertIn("min-height: 140px", styles)
         self.assertIn("@media (max-width: 1100px)", styles)
+        self.assertIn("@media (max-height: 800px)", styles)
+        self.assertIn("@media (max-height: 740px)", styles)
         for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
                        ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid"):
             self.assertIn(marker, styles)

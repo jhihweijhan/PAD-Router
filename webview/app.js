@@ -257,6 +257,9 @@
   function renderSnapshot(snapshot) {
     currentSnapshot = snapshot;
     const busy = Boolean(snapshot.busy);
+    const operationalBusy = Boolean(snapshot.operational_busy);
+    const operationalMutationBusy = Boolean(snapshot.operational_mutation_busy);
+    const primaryMutationBusy = busy || operationalMutationBusy;
     const devices = Array.isArray(snapshot.devices) ? snapshot.devices : [];
     const selected = snapshot.selected_device || "";
     const source = snapshot.source;
@@ -272,11 +275,12 @@
     const hasSelection = Boolean(selectedCell);
 
     status.textContent = snapshot.status || "尚未載入來源";
-    statusDot.style.background = busy ? "var(--warning)" : "var(--accent)";
-    busyLabel.textContent = executionBusy ? "執行中" : busy ? "處理中" : "閒置";
-    refresh.disabled = busy;
-    device.disabled = busy || devices.length === 0;
-    capture.disabled = busy || !selected;
+    statusDot.style.background = busy || operationalBusy ? "var(--warning)" : "var(--accent)";
+    busyLabel.textContent = executionBusy ? "執行中"
+      : operationalBusy ? "裝置作業中" : busy ? "處理中" : "閒置";
+    refresh.disabled = busy || operationalBusy;
+    device.disabled = busy || operationalBusy || devices.length === 0;
+    capture.disabled = busy || operationalBusy || !selected;
 
     const current = device.value;
     device.replaceChildren();
@@ -311,13 +315,13 @@
     calibrationStatus.textContent = calibrationEvent
       ? calibrationEvent.message
       : calibration ? `目前校正：${calibration.left}, ${calibration.top}, ${calibration.cell}` : "尚未校正。";
-    applyCalibration.disabled = busy || !source;
-    autoCalibration.disabled = busy || !source;
+    applyCalibration.disabled = busy || operationalBusy || !source;
+    autoCalibration.disabled = busy || operationalBusy || !source;
     const profileEvent = latestEvent(snapshot, "rules");
     profileStatus.textContent = profileEvent
       ? profileEvent.message
       : "沿用目前規則設定格式。";
-    importProfile.disabled = busy;
+    importProfile.disabled = primaryMutationBusy;
     exportProfile.disabled = busy || !snapshot.rule_profile;
     const debug = snapshot.debug || {};
     debugSource.textContent = debug.source_name || "—";
@@ -369,19 +373,19 @@
             : routeResult && approved
               ? "目前路徑已核准；可執行安全手勢流程。"
               : "尚無目前可執行候選。";
-    correct.disabled = busy || !hasSelection;
-    protect.disabled = busy || !hasSelection;
-    clearProtect.disabled = busy || !snapshot.protected_cell;
+    correct.disabled = primaryMutationBusy || !hasSelection;
+    protect.disabled = primaryMutationBusy || !hasSelection;
+    clearProtect.disabled = primaryMutationBusy || !snapshot.protected_cell;
     for (const button of orbPalette.querySelectorAll("button[data-orb]")) {
-      button.disabled = busy || !hasSelection;
+      button.disabled = primaryMutationBusy || !hasSelection;
       button.setAttribute("aria-pressed", String(button.dataset.orb === selectedOrb));
     }
     enhanced.checked = Boolean(selectedEntry && selectedEntry.enhanced);
     locked.checked = Boolean(selectedEntry && selectedEntry.locked);
-    syncOrbFlags(hasSelection, busy);
+    syncOrbFlags(hasSelection, primaryMutationBusy);
     renderSearch(snapshot, hasBoard, busy);
-    approveRoute.disabled = busy || !executable || approved;
-    executeRoute.disabled = busy || !executable || !approved;
+    approveRoute.disabled = primaryMutationBusy || !executable || approved;
+    executeRoute.disabled = primaryMutationBusy || !executable || !approved;
     stopExecution.disabled = !executionBusy;
     stopExecution.textContent = executionBusy && execution.stop_requested
       ? "等待安全放手…"
@@ -406,7 +410,10 @@
 
     const entriesForConsole = Array.isArray(snapshot.console) ? snapshot.console : [];
     const latestConsole = entriesForConsole[entriesForConsole.length - 1];
-    statusDot.style.background = busy
+    const consolePanel = consoleList.parentElement;
+    const followTail = consolePanel.scrollTop + consolePanel.clientHeight
+      >= consolePanel.scrollHeight - 8;
+    statusDot.style.background = busy || operationalBusy
       ? "var(--warning)"
       : latestConsole && latestConsole.level === "error" ? "var(--error)" : "var(--accent)";
     consoleCount.textContent = String(entriesForConsole.length);
@@ -423,7 +430,7 @@
       fragment.append(item);
     }
     consoleList.replaceChildren(fragment);
-    consoleList.parentElement.scrollTop = consoleList.parentElement.scrollHeight;
+    if (followTail) consolePanel.scrollTop = consolePanel.scrollHeight;
   }
 
   function applyReply(reply) {

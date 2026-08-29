@@ -262,6 +262,12 @@ EXTERNAL_CONDITIONS = {
     "技能條件未確認": (ExternalCondition("技能條件", confirmed=False),),
 }
 CASCADE_OPTIONS = {"計入落珠連鎖": True, "只計轉珠直接消除": False}
+_OPERATIONAL_MUTATION_CONFLICTS = frozenset({
+    "approve", "approve_route", "correct", "correct_cell",
+    "protect_cell", "set_protected_cell",
+    "set_rule_profile", "update_rules", "import_rule_profile", "import_profile",
+    "execute", "execute_route",
+})
 
 
 def rule_profile_from_selections(condition_selections: Iterable[tuple[str, str] | str], operator_label: str,
@@ -1143,7 +1149,8 @@ class BoardInspectionBridge:
                  device_lister: Callable[[], Iterable[str]] | None = None,
                  executor: Executor | None = None,
                  search_executor: Executor | None = None,
-                 execution_executor: Executor | None = None):
+                 execution_executor: Executor | None = None,
+                 operational_executor: Executor | None = None):
         self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
         self._device_lister = device_lister or _list_adb_devices
         self._lock = threading.RLock()
@@ -1162,15 +1169,24 @@ class BoardInspectionBridge:
                 max_workers=1, thread_name_prefix="pad-router-execution"
             ))
         )
+        self._operational_executor = (
+            operational_executor if operational_executor is not None else
+            (executor if executor is not None else ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pad-router-operational"
+            ))
+        )
         self._future: Future | None = None
         self._interaction_future: Future | None = None
         self._search_future: Future | None = None
         self._execution_future: Future | None = None
+        self._operational_future: Future | None = None
         self._closed = False
         self._busy = False
         self._pending_operations = 0
         self._pending_interactions = 0
         self._pending_searches = 0
+        self._pending_operational = 0
+        self._pending_operational_mutations = 0
         self._execution_busy = False
         self._execution_stop: threading.Event | None = None
         self._execution_stop_requested = False
@@ -1308,6 +1324,8 @@ class BoardInspectionBridge:
             "pending_operations": self._pending_operations,
             "pending_interactions": self._pending_interactions,
             "pending_searches": self._pending_searches,
+            "pending_operational": self._pending_operational,
+            "pending_operational_mutations": self._pending_operational_mutations,
             "search_generation": self._search_generation,
             "execution_phase": self._execution_phase,
         }
@@ -1319,6 +1337,8 @@ class BoardInspectionBridge:
             "selected_device": self._selected_device or None,
             "busy": self._busy,
             "search_busy": self._pending_searches > 0,
+            "operational_busy": self._pending_operational > 0,
+            "operational_mutation_busy": self._pending_operational_mutations > 0,
             "search": {
                 "status": self._search_status,
                 "progress": self._search_progress,
@@ -1511,6 +1531,9 @@ class BoardInspectionBridge:
             if self._pending_interactions:
                 self._announce("warning", "execution", "仍有後端命令執行中；執行命令已拒絕")
                 raise ValueError("仍有後端命令執行中；請稍候")
+            if self._pending_operational_mutations:
+                self._announce("warning", "execution", "裝置盤面作業中；執行命令已拒絕")
+                raise ValueError("裝置盤面作業中；請等待目前作業完成")
             if not isinstance(serial, str) or not serial.strip():
                 raise ValueError("請先更新並選擇 Android 裝置")
             state = self.controller.state
@@ -1561,23 +1584,47 @@ class BoardInspectionBridge:
                 self._announce("warning", "execution", "執行中；命令已拒絕")
                 raise ValueError("執行中；請等待目前手勢安全結束")
             is_search = phase == "search"
+            is_operational = phase in {"devices", "capture", "calibration"}
+            is_operational_mutation = phase in {"capture", "calibration"}
+            if is_operational and self._pending_operational:
+                self._announce("warning", "device", "裝置作業中；命令已拒絕")
+                raise ValueError("裝置作業中；請等待目前作業完成")
+            if is_operational_mutation and self._pending_interactions:
+                self._announce("warning", "device", "仍有盤面命令執行中；裝置作業已拒絕")
+                raise ValueError("仍有盤面命令執行中；請稍候")
+            if is_operational_mutation and self._pending_operational_mutations:
+                self._announce("warning", "device", "裝置盤面作業中；命令已拒絕")
+                raise ValueError("裝置盤面作業中；請等待目前作業完成")
             self._pending_operations += 1
             if is_search:
                 self._pending_searches += 1
+            elif is_operational:
+                self._pending_operational += 1
+                if is_operational_mutation:
+                    self._pending_operational_mutations += 1
             else:
                 self._pending_interactions += 1
             self._busy = self._pending_interactions > 0 or self._execution_busy
             self._announce("info", phase, started)
-            executor = self._search_executor if is_search else self._executor
+            executor = (
+                self._search_executor if is_search
+                else self._operational_executor if is_operational
+                else self._executor
+            )
             future = executor.submit(self._run, phase, operation)
             self._future = future
             if is_search:
                 self._search_future = future
+            elif is_operational:
+                self._operational_future = future
             else:
                 self._interaction_future = future
             return {"accepted": True, "snapshot": self._view_locked()}
 
     def _run(self, phase: str, operation: Callable[[], object]) -> None:
+        is_search = phase == "search"
+        is_operational = phase in {"devices", "capture", "calibration"}
+        is_operational_mutation = phase in {"capture", "calibration"}
         try:
             result = operation()
             with self._lock:
@@ -1590,6 +1637,7 @@ class BoardInspectionBridge:
                     level = "success" if self._devices else "warning"
                 elif phase == "capture":
                     state = self.controller.state
+                    self._invalidate_generation()
                     self._selected_cell = (
                         state.uncertain_cells[0] if state.uncertain_cells else None
                     )
@@ -1604,6 +1652,7 @@ class BoardInspectionBridge:
                     level = "success"
                 elif phase == "calibration":
                     state = result
+                    self._invalidate_generation()
                     self._selected_cell = (
                         state.uncertain_cells[0] if state.uncertain_cells else None
                     )
@@ -1660,8 +1709,14 @@ class BoardInspectionBridge:
                     message = str(result)
                     level = "success"
                 self._pending_operations -= 1
-                if phase == "search":
+                if is_search:
                     self._pending_searches = max(0, self._pending_searches - 1)
+                elif is_operational:
+                    self._pending_operational = max(0, self._pending_operational - 1)
+                    if is_operational_mutation:
+                        self._pending_operational_mutations = max(
+                            0, self._pending_operational_mutations - 1
+                        )
                 else:
                     self._pending_interactions = max(0, self._pending_interactions - 1)
                 self._busy = self._pending_interactions > 0 or self._execution_busy
@@ -1669,10 +1724,16 @@ class BoardInspectionBridge:
         except Exception as exc:
             with self._lock:
                 self._pending_operations = max(0, self._pending_operations - 1)
-                if phase == "search":
+                if is_search:
                     self._pending_searches = max(0, self._pending_searches - 1)
                     self._search_status = "failed"
                     self._search_progress = None
+                elif is_operational:
+                    self._pending_operational = max(0, self._pending_operational - 1)
+                    if is_operational_mutation:
+                        self._pending_operational_mutations = max(
+                            0, self._pending_operational_mutations - 1
+                        )
                 else:
                     self._pending_interactions = max(0, self._pending_interactions - 1)
                 self._busy = self._pending_interactions > 0 or self._execution_busy
@@ -1716,6 +1777,11 @@ class BoardInspectionBridge:
                 if self._execution_busy:
                     self._announce("warning", "execution", "執行中；命令已拒絕")
                     raise ValueError("執行中；請等待目前手勢安全結束")
+        if action in _OPERATIONAL_MUTATION_CONFLICTS:
+            with self._lock:
+                if self._pending_operational_mutations:
+                    self._announce("warning", "device", "裝置盤面作業中；命令已拒絕")
+                    raise ValueError("裝置盤面作業中；請等待目前作業完成")
         if action == "snapshot":
             return self.snapshot()
         if action in {"events", "drain_events"}:
@@ -1895,7 +1961,7 @@ class BoardInspectionBridge:
             futures = tuple(
                 future for future in (
                     self._interaction_future, self._search_future,
-                    self._execution_future, self._future,
+                    self._execution_future, self._operational_future, self._future,
                 )
                 if future is not None
             )
@@ -1910,7 +1976,10 @@ class BoardInspectionBridge:
                 self._stop_execution()
             self._closed = True
             executors = []
-            for executor in (self._executor, self._search_executor, self._execution_executor):
+            for executor in (
+                self._executor, self._search_executor,
+                self._execution_executor, self._operational_executor,
+            ):
                 if executor not in executors:
                     executors.append(executor)
         for executor in executors:
