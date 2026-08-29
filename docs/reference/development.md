@@ -4,20 +4,24 @@
 
 ## 環境與原則
 
-`pyproject.toml` 宣告 Python `>=3.10`，本專案以 `uv` 作為唯一執行入口，且沒有需要安裝的 Python runtime dependency。桌面測試與 GUI 需要系統可用的 Tk；ADB 只在裝置擷取或實際手勢測試時需要。
+`pyproject.toml` 宣告 Python `>=3.10` 與固定版本 `pywebview==5.4`；本專案以 `uv` 作為唯一執行入口。Linux webview 固定使用 GTK backend，需先安裝系統提供的 PyGObject、PyCairo 與 WebKitGTK；ADB 只在裝置擷取或實際手勢測試時需要。
 
 ```bash
+uv sync
 uv run python --version
-uv run python -c "import tkinter; print(tkinter.TkVersion)"
+uv run python -c "from importlib.metadata import version; import webview; print(version('pywebview'))"
 ```
 
-核心保持標準函式庫與普通 CPU 可用：目前沒有 ML、預訓練模型、OpenCV、雲端服務或怪物資料庫。不要把研究文件中的候選方案當成已存在的 API。
+核心保持標準函式庫與普通 CPU 可用：辨識與規劃不依賴 ML、預訓練模型、OpenCV、雲端服務或怪物資料庫。不要把研究文件中的候選方案當成已存在的 API。
 
 ## 執行入口
 
 ```bash
-# 桌面 GUI
+# 離線 pywebview 工作區
 uv run python pad_router.py --gui
+
+# 舊版 Tk 完整盤面流程
+uv run python pad_router.py --tk-gui
 
 # CLI 說明
 uv run python pad_router.py --help
@@ -39,15 +43,15 @@ uv run python -m unittest
 目前測試分工：
 
 - `test_pad_router_planning.py`：Rule Profile JSON、Match/cascade、危害策略、手動路徑、固定 seed 搜尋、候選排序、診斷候選與執行資格。
-- `test_pad_router_gui.py`：PNG 解析、校正、GUI controller、人工修正、原型資料原子持久化、辨識／中心圖樣、來源顯示縮放、規則自動套用、問號重試與執行前學習。
+- `test_pad_router_gui.py`：PNG 解析、校正、GUI controller、人工修正、原型資料原子持久化、辨識／中心圖樣、來源顯示縮放、規則自動套用、問號重試、執行前學習與 webview bridge 的快照／非同步擷取。
 
-修改核心規則或安全條件時，先跑最接近的測試類別，再跑完整命令；不要把連線裝置或使用者截圖作為測試依賴。測試應使用固定的 5×6 Board、in-memory pixels、可替換 detector/capture/executor 與固定 seed。
+修改核心規則、安全條件或 bridge 合約時，先跑最接近的測試類別，再跑完整命令；不要把連線裝置或使用者截圖作為測試依賴。測試應使用固定的 5×6 Board、in-memory pixels、可替換 detector/capture/device-lister/executor 與固定 seed。
 
 ## 重要資料與檔案邊界
 
 - `pad_router.py`：核心資料模型、規則／Match／cascade、辨識、搜尋、CLI 與 ADB play。
-- `pad_router_gui.py`：Tk GUI、controller、PNG 解碼、來源顯示、人工 correction、原型資料與執行流程。
-- `README.md` 與 `docs/`：使用者與維護文件。
+- `pad_router_gui.py`：`BoardInspectionController`、受控 PNG snapshot、序列化 bridge、既有 Tk GUI、人工 correction、原型資料與執行流程。
+- `pad_router_webview.py` 與 `webview/`：離線 pywebview shell 及本機 HTML/CSS/JavaScript 資產；前端只呼叫 bridge intent。
 - `.pad-router/orb-prototypes.json`：GUI 執行後可能產生的專案內永久學習資料；只保存小型特徵與標籤，不保存截圖。寫入先用同目錄暫存檔，再以 `Path.replace()` 原子取代正式檔。
 - 使用者選擇的 Rule Profile JSON：由 GUI 的「儲存 JSON」保存；問號重試次數不存入此 Profile。
 

@@ -4,12 +4,13 @@
 
 ## 系統邊界
 
-PAD Router 把 6×5 盤面資料流分成兩個入口：
+PAD Router 把 6×5 盤面資料流分成兩個入口與一個 presentation bridge：
 
 - `pad_router.py`：純 Python 核心，負責盤面規則、Combo／cascade 計算、路徑評估、束搜尋、CLI 與 ADB 手勢驗證。
-- `pad_router_gui.py`：Tk GUI 與 `BoardInspectionController`，負責來源檔案／裝置介接、校正、人工修正、規則控制項與顯示；核心規則仍呼叫 `pad_router`。
+- `pad_router_gui.py`：`BoardInspectionController`、既有 Tk GUI 與 `BoardInspectionBridge`；controller 負責來源／辨識，bridge 只暴露序列化 intent 與 snapshot。
+- `pad_router_webview.py`：以固定 GTK backend 啟動離線 pywebview；`webview/` 只包含本機 HTML、CSS、vanilla JavaScript。
 
-程式只使用 Python 標準函式庫；Tk 是桌面環境提供的 GUI 模組，ADB 是需要裝置操作時的外部程式。
+程式核心只使用 Python 標準函式庫；webview presentation 依賴固定版本 `pywebview==5.4` 與 Linux 系統提供的 GTK/WebKit。ADB 是需要裝置操作時的外部程式。
 
 ## 實際資料流
 
@@ -53,9 +54,15 @@ flowchart LR
 ### `pad_router_gui.py`
 
 - `OrbPrototypeModel`：不訓練的 CPU nearest-prototype 學習資料，保存 human／implicit cell feature；正式檔寫在同目錄暫存檔後以 `Path.replace()` 原子替換。
-- `BoardInspectionController`：保存 GUI 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行。
-- `BoardInspectionApp`：Tk widget 與三種清楚的操作模式：Ready 的 route mode、含 `unknown` 時的 review mode、使用者按「修正辨識」後的 correction mode。
-- 來源 Canvas 以等比例 display scale 顯示截圖；overlay 與 route overlay 同步縮放，未改變原始 `Screenshot`、`BoardCalibration` 或偵測座標。
+- `BoardInspectionController`：保存 GUI 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行；`snapshot()` 只回傳 JSON-safe status 與一次編碼的 PNG，不暴露 raw pixels。
+- `BoardInspectionBridge`：以單一 worker serialise device refresh/capture intent，保存受控 snapshot 與 persistent console；pending snapshot event 只保留最新值，避免快速事件阻塞 renderer。
+- `BoardInspectionApp`：既有 Tk widget 與三種清楚的操作模式，供後續切片保留。
+
+### `pad_router_webview.py` 與 `webview/`
+
+- pywebview 僅載入相鄰的 `index.html`；不啟動本機 HTTP server，也不請求網路資產。
+- 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪。
+- 目前 workspace 僅提供裝置清單、選取、截圖、來源畫面與 status/console；盤面修正、規則、搜尋與執行仍由後續切片處理。
 
 ## 狀態與安全不變量
 

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PAD Router — 工作區</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">PAD ROUTER</p>
+      <h1>裝置工作區</h1>
+    </div>
+    <div class="status" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status">尚未載入來源</span>
+    </div>
+    <div class="device-controls" aria-label="裝置控制">
+      <label for="device">裝置</label>
+      <select id="device" disabled>
+        <option value="">尚未更新</option>
+      </select>
+      <button id="refresh" type="button">更新裝置</button>
+      <button id="capture" type="button" disabled>擷取畫面</button>
+    </div>
+  </header>
+
+  <main class="workspace" aria-label="PAD Router 工作區">
+    <section class="panel source-panel" aria-labelledby="source-heading">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">SOURCE</p>
+          <h2 id="source-heading">目前裝置畫面</h2>
+        </div>
+        <span id="source-meta" class="muted">尚未擷取</span>
+      </div>
+      <div class="source-viewport">
+        <div id="source-empty" class="empty-state">
+          <strong>尚未擷取裝置畫面</strong>
+          <span>更新裝置後選取序號，再按「擷取畫面」。</span>
+        </div>
+        <img id="source-image" alt="目前裝置截圖" hidden>
+      </div>
+    </section>
+
+    <aside class="panel details-panel" aria-labelledby="details-heading">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">WORKSPACE</p>
+          <h2 id="details-heading">工作狀態</h2>
+        </div>
+        <span id="busy-label" class="muted">閒置</span>
+      </div>
+      <dl class="facts">
+        <div>
+          <dt>選取裝置</dt>
+          <dd id="selected-device">尚未選取</dd>
+        </div>
+        <div>
+          <dt>來源</dt>
+          <dd id="source-name">尚未載入</dd>
+        </div>
+        <div>
+          <dt>截圖尺寸</dt>
+          <dd id="source-size">—</dd>
+        </div>
+      </dl>
+      <p class="help-text">畫面由 Python 後端擷取與準備；瀏覽器只呈現受控的 PNG 資料。</p>
+    </aside>
+  </main>
+
+  <details class="console panel" open>
+    <summary>事件主控台 <span id="console-count" class="muted">0</span></summary>
+    <ol id="console-list" aria-live="polite"></ol>
+  </details>
+
+  <script src="app.js"></script>
+</body>
+</html>

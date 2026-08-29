@@ -3,6 +3,9 @@ name = "pad-router"
 version = "0.1.0"
 description = "Desktop Puzzle & Dragons board inspector and route planner"
 requires-python = ">=3.10"
+dependencies = [
+    "pywebview==5.4",
+]
 
 [tool.uv]
 package = false

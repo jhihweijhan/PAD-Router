@@ -14,11 +14,14 @@
 
 ## Quick start
 
-需求：Python 3.10 以上、[`uv`](https://docs.astral.sh/uv/) 與桌面 GUI 所需的 Tk；ADB 擷取或執行手勢才需要 `adb` 與已授權的 Android 裝置。
+需求：Python 3.10 以上、[`uv`](https://docs.astral.sh/uv/)、`pywebview==5.4`，以及 Linux GTK/WebKit 系統套件；ADB 擷取或執行手勢才需要 `adb` 與已授權的 Android 裝置。
 
 ```bash
-# 桌面 GUI
+# 離線 pywebview 工作區
 uv run python pad_router.py --gui
+
+# 舊版 Tk 完整盤面流程（後續切片移除）
+uv run python pad_router.py --tk-gui
 
 # CLI dry run（不送出 ADB）
 uv run python pad_router.py --board 111222345634456563123451234563

@@ -8,6 +8,7 @@ adapters around the existing PAD Router functions.
 
 from __future__ import annotations
 
+import base64
 import binascii
 import json
 import math
@@ -17,6 +18,7 @@ import struct
 import tempfile
 import threading
 import zlib
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
@@ -652,6 +654,19 @@ class BoardInspectionController:
             raise ValueError("請選擇裝置")
         return self._with_source(self._capture(serial), serial, auto_search)
 
+    def snapshot(self) -> dict[str, object]:
+        """Return a JSON-safe view without exposing controller internals."""
+        state = self.state
+        source = None
+        if state.width is not None and state.height is not None and state.pixels is not None:
+            source = {
+                "name": state.source_name,
+                "width": state.width,
+                "height": state.height,
+                "image": _screenshot_image((state.width, state.height, state.pixels)),
+            }
+        return {"source": source, "status": state.status}
+
     def set_calibration(self, calibration: BoardCalibration) -> BoardInspectionState:
         if self.state.pixels is None or self.state.width is None or self.state.height is None:
             raise ValueError("請先載入圖片或擷取裝置畫面，再校正盤面")
@@ -901,6 +916,206 @@ def _fit_scale(width: int, height: int, available_width: int,
         raise ValueError("可視區域尺寸必須為正數")
     scale = min(1.0, available_width / width, available_height / height)
     return scale, max(1, int(width * scale)), max(1, int(height * scale))
+
+def _png_from_screenshot(screenshot_data: Screenshot) -> bytes:
+    width, height, pixels = screenshot_data
+    if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
+        raise ValueError("截圖必須包含 width×height 個 BGRA 像素")
+    raw = bytearray()
+    for row in range(height):
+        raw.append(0)
+        start = row * width * 4
+        for offset in range(start, start + width * 4, 4):
+            blue, green, red, alpha = pixels[offset:offset + 4]
+            raw.extend((red, green, blue, alpha))
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", binascii.crc32(kind + payload) & 0xFFFFFFFF))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b""))
+
+
+def _screenshot_image(screenshot_data: Screenshot) -> str:
+    encoded = base64.b64encode(_png_from_screenshot(screenshot_data)).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _list_adb_devices() -> tuple[str, ...]:
+    try:
+        output = subprocess.check_output(["adb", "devices"], text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("無法取得 Android 裝置；請確認 adb 已安裝且可執行") from exc
+    return tuple(
+        parts[0] for line in output.splitlines()[1:]
+        if len(parts := line.split()) == 2 and parts[1] == "device"
+    )
+
+
+class BoardInspectionBridge:
+    """Serialized, JSON-safe backend surface for the local webview."""
+
+    def __init__(self, controller: BoardInspectionController | None = None,
+                 device_lister: Callable[[], Iterable[str]] | None = None):
+        self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
+        self._device_lister = device_lister or _list_adb_devices
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pad-router")
+        self._future: Future | None = None
+        self._closed = False
+        self._busy = False
+        self._pending_operations = 0
+        self._devices: tuple[str, ...] = ()
+        self._selected_device = ""
+        self._console: list[dict[str, str]] = []
+        self._pending_update: dict[str, object] | None = None
+        self._controller_snapshot = self.controller.snapshot()
+        self._announce("info", "ready", str(self._controller_snapshot["status"]))
+
+    @staticmethod
+    def _copy_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+        source = snapshot.get("source")
+        return {
+            **snapshot,
+            "source": dict(source) if isinstance(source, dict) else None,
+            "devices": list(snapshot.get("devices", ())),
+            "console": [dict(item) for item in snapshot.get("console", ())],
+        }
+
+    def _view_locked(self) -> dict[str, object]:
+        return self._copy_snapshot({
+            **self._controller_snapshot,
+            "devices": self._devices,
+            "selected_device": self._selected_device or None,
+            "busy": self._busy,
+            "console": self._console,
+        })
+
+    def _announce(self, level: str, phase: str, message: str,
+                  *, status: str | None = None) -> None:
+        entry = {"level": level, "phase": phase, "message": message}
+        self._console.append(entry)
+        del self._console[:-100]
+        self._controller_snapshot = {
+            **self._controller_snapshot,
+            "status": status if status is not None else message,
+        }
+        self._pending_update = {
+            "type": "snapshot",
+            "level": level,
+            "phase": phase,
+            "message": message,
+            "snapshot": self._view_locked(),
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return self._view_locked()
+
+    def drain_events(self) -> list[dict[str, object]]:
+        with self._lock:
+            if self._pending_update is None:
+                return []
+            event = {
+                **self._pending_update,
+                "snapshot": self._copy_snapshot(self._pending_update["snapshot"]),
+            }
+            self._pending_update = None
+            return [event]
+
+    def _submit(self, phase: str, started: str, operation: Callable[[], object]) -> dict[str, object]:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("後端已關閉")
+            self._pending_operations += 1
+            self._busy = True
+            self._announce("info", phase, started)
+            self._future = self._executor.submit(self._run, phase, operation)
+            return {"accepted": True, "snapshot": self._view_locked()}
+
+    def _run(self, phase: str, operation: Callable[[], object]) -> None:
+        try:
+            result = operation()
+            with self._lock:
+                if phase == "devices":
+                    self._devices = tuple(result)
+                    if self._selected_device not in self._devices:
+                        self._selected_device = self._devices[0] if self._devices else ""
+                    message = (f"已找到 {len(self._devices)} 個 Android 裝置"
+                               if self._devices else "沒有可用的 Android 裝置")
+                    level = "info"
+                elif phase == "capture":
+                    self._controller_snapshot = self.controller.snapshot()
+                    message = str(self._controller_snapshot["status"])
+                    level = "success"
+                else:
+                    message = str(result)
+                    level = "success"
+                self._pending_operations -= 1
+                self._busy = self._pending_operations > 0
+                self._announce(level, phase, message)
+        except Exception as exc:
+            with self._lock:
+                self._pending_operations = max(0, self._pending_operations - 1)
+                self._busy = self._pending_operations > 0
+                self._announce("error", phase, str(exc))
+
+    def command(self, payload: str | dict[str, object]) -> dict[str, object] | list[dict[str, object]]:
+        """Accept one intent and return a JSON-safe acknowledgement or view."""
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("命令必須是有效 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("命令必須是 JSON 物件")
+        action = payload.get("action", payload.get("command"))
+        if action == "snapshot":
+            return self.snapshot()
+        if action in {"events", "drain_events"}:
+            return self.drain_events()
+        if action == "refresh_devices":
+            return self._submit("devices", "正在更新 Android 裝置清單", self._device_lister)
+        if action == "select_device":
+            serial = payload.get("serial")
+            if not isinstance(serial, str) or not serial.strip():
+                raise ValueError("請選擇裝置")
+            serial = serial.strip()
+            with self._lock:
+                if self._devices and serial not in self._devices:
+                    raise ValueError("選取的裝置不在目前清單")
+                self._selected_device = serial
+                self._announce("info", "device", f"已選擇裝置：{serial}")
+                return self._view_locked()
+        if action in {"capture", "capture_device", "capture_screen"}:
+            serial = payload.get("serial")
+            with self._lock:
+                serial = self._selected_device if serial is None else serial
+            if not isinstance(serial, str) or not serial.strip():
+                raise ValueError("請先更新並選擇 Android 裝置")
+            serial = serial.strip()
+            return self._submit(
+                "capture",
+                f"正在擷取裝置畫面：{serial}",
+                lambda: self.controller.capture_device(serial, auto_search=False),
+            )
+        raise ValueError(f"不支援的命令：{action}")
+
+    def wait_for_idle(self, timeout: float | None = None) -> None:
+        with self._lock:
+            future = self._future
+        if future is not None:
+            future.result(timeout=timeout)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            executor = self._executor
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _photo_from_screenshot(screenshot_data: Screenshot, tk_module,
@@ -1514,12 +1729,10 @@ class BoardInspectionApp:
 
     def refresh_devices(self):
         try:
-            output = subprocess.check_output(["adb", "devices"], text=True)
-        except (OSError, subprocess.CalledProcessError):
-            self._show_error("無法取得 Android 裝置；請確認 adb 已安裝且可執行")
+            serials = _list_adb_devices()
+        except RuntimeError as exc:
+            self._show_error(str(exc))
             return
-        serials = tuple(line.split()[0] for line in output.splitlines()[1:]
-                        if len(line.split()) == 2 and line.split()[1] == "device")
         self._serial_box.configure(values=serials)
         self._serial.set(serials[0] if serials else "")
 

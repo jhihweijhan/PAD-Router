@@ -4,9 +4,13 @@
 
 ## 範圍
 
-GUI 使用 Python Tk 建立，限制在固定 6×5 Standard Board。來源可以是 PNG 或 Android `adb screencap`；來源截圖在 Canvas 依可視區域等比例顯示，顯示縮放不會改變原始像素、Board Calibration、辨識或偵測座標。
+目前桌面入口 `pad_router.py --gui` 使用固定 GTK backend 的 pywebview 離線工作區，從相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript；不啟動網路服務，也不載入遠端資產。`--tk-gui` 暫時保留既有完整 Tk 盤面流程，直到後續切片完成等價安全覆蓋。
 
-## 已實作流程
+Issue #9 的工作區垂直切片只負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、persistent status 與 console。擷取與 PNG 準備在 `BoardInspectionBridge` 的單一 worker 執行；前端以 serializable snapshot/event 更新，快速更新在 `requestAnimationFrame` 合併。
+
+來源截圖在既有 Tk Canvas 或 webview workspace 依可視區域顯示，辨識與校正仍使用原始 BGRA 像素、`BoardCalibration` 與 `BoardInspectionController`。
+
+## 既有 Tk 完整流程（`--tk-gui`）
 
 1. 開啟 PNG 或選擇 ADB 裝置擷取畫面。
 2. 以來源實際寬高推定盤面區域；可重新自動校正，也可提供新的校正。
@@ -45,7 +49,8 @@ GUI 使用 Python Tk 建立，限制在固定 6×5 Standard Board。來源可以
 
 - 非 6×5 Board、非 PNG 來源、雲端服務或角色／怪物資料庫。
 - 完整辨識 HP、隊伍組成、技能、地城狀態與遊戲隨機天降。
-- ML、預訓練模型、需要額外 Python 套件的視覺流程。
+- ML、預訓練模型、OpenCV 或其他認知流程仍不在範圍內。
+- pywebview 不支援的其他平台 backend、遠端資產與本地 HTTP 服務。
 - 搜尋全域最佳保證或任意新 skin 的零標記辨識保證。
 
 相關入口：[文件索引](../README.md)、[使用指南](../guides/user-guide.md)、[開發與測試](development.md)。

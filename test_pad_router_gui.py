@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import struct
@@ -14,7 +15,7 @@ from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, Grid, LeaderCo
 
 
 from pad_router_gui import (_fit_scale, _photo_from_screenshot, BoardCalibration, BoardInspectionApp,
-                            BoardInspectionController, OrbPrototypeModel, decode_png,
+                            BoardInspectionBridge, BoardInspectionController, OrbPrototypeModel, decode_png,
                             rule_profile_from_selections)
 
 
@@ -330,6 +331,32 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(state.source_name, "test-device")
         self.assertEqual((state.width, state.height), (12, 10))
         self.assertFalse(state.confirmed)
+
+    def test_capture_snapshot_serializes_source_without_internal_pixels(self):
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        controller = BoardInspectionController(
+            detector=lambda *_args: self.board,
+            capture=lambda _serial: source,
+        )
+
+        state = controller.capture_device("test-device", auto_search=False)
+        snapshot = controller.snapshot()
+
+        self.assertEqual(snapshot["source"]["name"], "test-device")
+        self.assertEqual(snapshot["source"]["width"], 12)
+        self.assertEqual(snapshot["source"]["height"], 10)
+        self.assertTrue(snapshot["source"]["image"].startswith("data:image/png;base64,"))
+        self.assertNotIn("pixels", snapshot)
+        self.assertEqual(snapshot["status"], state.status)
+        json.dumps(snapshot)
+        encoded = snapshot["source"]["image"].split(",", 1)[1]
+        with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+            image_file.write(base64.b64decode(encoded))
+            image_file.flush()
+            self.assertEqual(decode_png(image_file.name)[0:2], (12, 10))
+            self.assertEqual(decode_png(image_file.name)[2][:4], bytes((60, 40, 20, 255)))
+
+
 
     def test_clean_png_and_capture_with_preset_profile_auto_search(self):
         board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
@@ -651,6 +678,71 @@ class BoardInspectionControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "符合條件的路徑"):
             controller.execute_route("test-device", explicit_confirmation=True)
         self.assertEqual(calls, [])
+
+
+class BoardInspectionBridgeTests(unittest.TestCase):
+    def test_serial_commands_capture_off_thread_and_coalesce_snapshot_events(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        started = threading.Event()
+        release = threading.Event()
+
+        def capture(_serial):
+            started.set()
+            release.wait(timeout=2)
+            return source
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=capture,
+        )
+        bridge = BoardInspectionBridge(
+            controller=controller,
+            device_lister=lambda: ("test-device",),
+        )
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+
+        bridge.command({"action": "refresh_devices"})
+        bridge.wait_for_idle()
+        bridge.drain_events()
+        selected = bridge.command({"action": "select_device", "serial": "test-device"})
+        self.assertEqual(selected["selected_device"], "test-device")
+        bridge.drain_events()
+
+        acknowledgement = bridge.command({"action": "capture_screen"})
+        self.assertTrue(started.wait(timeout=1))
+        self.assertTrue(acknowledgement["accepted"])
+        self.assertTrue(acknowledgement["snapshot"]["busy"])
+        self.assertIsNone(bridge.snapshot()["source"])
+
+        release.set()
+        bridge.wait_for_idle()
+        events = bridge.drain_events()
+        self.assertEqual(len(events), 1)
+        snapshot = events[0]["snapshot"]
+        self.assertEqual(snapshot["source"]["name"], "test-device")
+        self.assertFalse(snapshot["busy"])
+        self.assertGreaterEqual(len(snapshot["console"]), 3)
+        json.dumps(snapshot)
+        json.dumps(events)
+
+
+class WebviewAssetTests(unittest.TestCase):
+    def test_workspace_uses_only_adjacent_local_assets(self):
+        from pad_router_webview import ASSET_ROOT
+
+        index = ASSET_ROOT / "index.html"
+        style = ASSET_ROOT / "style.css"
+        script = ASSET_ROOT / "app.js"
+        self.assertTrue(index.is_file())
+        self.assertTrue(style.is_file())
+        self.assertTrue(script.is_file())
+
+        html = index.read_text(encoding="utf-8")
+        self.assertIn('href="style.css"', html)
+        self.assertIn('src="app.js"', html)
+        self.assertNotIn("://", html + style.read_text() + script.read_text())
 
 
 class ExecuteRouteUiTests(unittest.TestCase):
