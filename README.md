@@ -14,7 +14,7 @@
 
 ## Quick start
 
-需求：Python 3.10 以上與 [`uv`](https://docs.astral.sh/uv/)；完整 GUI 使用系統 Tk。Issue #9–#11 的 webview 工作區另需 `pywebview==5.4`、Ubuntu GTK/WebKit 套件與下列一次性 venv 設定：
+需求：Python 3.10 以上與 [`uv`](https://docs.astral.sh/uv/)；完整 GUI 使用系統 Tk。Issue #9–#12 的 webview 工作區另需 `pywebview==5.4`、Ubuntu GTK/WebKit 套件與下列一次性 venv 設定：
 
 ```bash
 # Ubuntu/Linux webview prerequisites (once)
@@ -26,7 +26,7 @@ uv sync
 # 完整 Tk 盤面流程（--gui；直到 cutover #14）
 uv run python pad_router.py --gui
 
-# Issue #9–#11 離線 capture/review/rules/search workspace（明確 opt-in）
+# Issue #9–#12 離線 capture/review/rules/search/execute workspace（明確 opt-in）
 uv run python pad_router.py --webview
 
 # CLI dry run（不送出 ADB）

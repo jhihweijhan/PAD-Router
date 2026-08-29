@@ -55,14 +55,14 @@ flowchart LR
 
 - `OrbPrototypeModel`：不訓練的 CPU nearest-prototype 學習資料，保存 human／implicit cell feature；正式檔寫在同目錄暫存檔後以 `Path.replace()` 原子替換。
 - `BoardInspectionController`：保存 GUI 狀態，串接來源、校正、辨識、問號重試、人工修正、規則、路徑評估與執行；`snapshot()` 只回傳 JSON-safe status 與一次編碼的 PNG，不暴露 raw pixels。
-- `BoardInspectionBridge`：以單一 worker serialise device refresh/capture/review/rules/search intent，保存受控 source/board/planning snapshot 與 persistent console；selection、unknown count、protected/enhanced/locked markers、rule profile、search progress/results 與 correction events 都是 JSON-safe DTO，pending updates 只保留最新值。
+- `BoardInspectionBridge`：以分離的 interaction/search/execution worker serialise device、review、rules、search 與 execute intent，保存受控 source/board/planning/execution snapshot 與 persistent console；ADB execution 僅由 execution worker 執行，並回報 acceptance、gesture、verification、stop phases。
 - `BoardInspectionApp`：既有 Tk widget 與三種清楚的操作模式，供後續切片保留。
 
 ### `pad_router_webview.py` 與 `webview/`
 
 - pywebview 僅載入 repository 相鄰的 `index.html`、`style.css` 與 `app.js`；不請求外部網路資產。完整 Tk `--gui` 仍是預設入口，直到 cutover #14。
 - 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪。
-- 目前 workspace 提供裝置清單、選取、截圖、5×6 review、未知／疑似珠子修正、保護格、強化／鎖定標記、規則設定、背景搜尋、取消與診斷／候選預覽；執行仍由後續切片處理。
+- 目前 workspace 提供裝置清單、選取、截圖、5×6 review、未知／疑似珠子修正、保護格、強化／鎖定標記、規則設定、背景搜尋、取消、診斷／候選預覽、核准、執行與安全停止；執行仍受 Python controller guard。
 
 ## 狀態與安全不變量
 
@@ -72,6 +72,7 @@ flowchart LR
 4. Human Annotation 優先於低權重 implicit sample；重新標記同一格的相同 feature 會取代舊樣本。
 5. `RuleProfile` 與 `RouteSearchOptions` 互相獨立；規則設定變更會清除舊路徑評估，重試次數不寫入 Rule Profile JSON。
 6. Bridge 的 board/rule generation 變更會使搜尋 cooperative-cancel；只有仍符合 generation 的結果才可套用，舊結果只會進 console，不會覆寫 current state。
+7. Execution command 只接受 current、confirmed、qualifying 且已核准的候選；執行前完成 acceptance/learning，執行中拒絕衝突命令，`play` 保留安全放手與手勢後驗證。
 
 ## 不是目前實作的內容
 

@@ -993,6 +993,10 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertFalse(candidate["confirmed"])
         self.assertFalse(snapshot["approval_allowed"])
         self.assertFalse(snapshot["route_result"]["execution_eligible"])
+        with self.assertRaisesRegex(ValueError, "核准"):
+            bridge.command({"action": "approve_route"})
+        with self.assertRaisesRegex(ValueError, "核准"):
+            bridge.command({"action": "execute_route", "serial": "test-device"})
         json.dumps(snapshot)
 
     def test_stale_search_result_cannot_overwrite_new_rule_generation(self):
@@ -1186,6 +1190,169 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertEqual(bridge.snapshot()["search"]["status"], "stale")
 
 
+    def test_web_approval_and_execution_learns_before_gesture_and_reports_verification(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        model = OrbPrototypeModel()
+        execution_calls = []
+
+        def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
+                    max_corrections, on_verification):
+            execution_calls.append((serial, len(model.samples)))
+            on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
+            return True
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+            executor=execute,
+            model=model,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0),))
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+
+        with self.assertRaisesRegex(ValueError, "核准"):
+            bridge.command({"action": "execute_route", "serial": "test-device"})
+
+        approved = bridge.command({"action": "approve_route"})
+        self.assertTrue(approved["snapshot"]["route_approved"])
+        executed = bridge.command({"action": "execute_route", "serial": "test-device"})
+
+        self.assertTrue(executed["accepted"])
+        self.assertEqual(execution_calls, [("test-device", 30)])
+        self.assertEqual(executed["snapshot"]["execution"]["status"], "success")
+        self.assertEqual(executed["snapshot"]["execution"]["verification"]["status"], "verified")
+        self.assertFalse(executed["snapshot"]["route_approved"])
+        json.dumps(executed["snapshot"])
+    def test_learning_failure_stops_before_adb_gesture(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        model = OrbPrototypeModel()
+        gestures = []
+
+        def execute(*_args, **_kwargs):
+            gestures.append(True)
+            return True
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+            executor=execute,
+            model=model,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0),))
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+        bridge.command({"action": "approve_route"})
+
+        with patch.object(model, "learn", side_effect=OSError("learning failed")):
+            result = bridge.command({"action": "execute_route", "serial": "test-device"})
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(gestures, [])
+        self.assertEqual(result["snapshot"]["execution"]["status"], "failed")
+        self.assertIn("learning failed", result["snapshot"]["status"])
+
+    def test_execution_rejects_conflicts_and_stop_takes_effect_after_safe_gesture(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        model = OrbPrototypeModel()
+        gesture_calls = []
+        stop_replies = []
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        bridge = None
+
+        def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
+                    max_corrections, on_verification):
+            gesture_calls.append((serial, len(model.samples)))
+            stop_replies.append(bridge.command({"action": "stop_execution"}))
+            on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
+            return True
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+            executor=execute,
+            model=model,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0),))
+        execution_executor = DeferredExecutor()
+        bridge = BoardInspectionBridge(
+            controller=controller,
+            executor=ImmediateExecutor(),
+            execution_executor=execution_executor,
+        )
+        self.addCleanup(bridge.close)
+
+        bridge.command({"action": "approve_route"})
+        started = bridge.command({"action": "execute_route", "serial": "test-device"})
+        self.assertTrue(started["accepted"])
+        self.assertTrue(started["snapshot"]["execution"]["busy"])
+        self.assertEqual(gesture_calls, [])
+        with self.assertRaisesRegex(ValueError, "執行中"):
+            bridge.command({"action": "select_cell", "cell": [0, 0]})
+
+        execution_executor.run_next()
+
+        self.assertEqual(gesture_calls, [("test-device", 30)])
+        self.assertIn("安全放手", stop_replies[0]["status"])
+        result = bridge.snapshot()
+        self.assertEqual(result["execution"]["status"], "stopped")
+        self.assertEqual(result["execution"]["phase"], "stopped")
+        self.assertEqual(result["execution"]["verification"]["status"], "verified")
+        self.assertTrue(result["execution"]["stop_requested"])
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
         from pad_router_webview import ASSET_ROOT
@@ -1206,6 +1373,9 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('id="planning-controls"', html)
         self.assertIn('id="start-search"', html)
         self.assertIn('id="cancel-search"', html)
+        self.assertIn('id="approve-route"', html)
+        self.assertIn('id="execute-route"', html)
+        self.assertIn('id="stop-execution"', html)
         client = script.read_text()
         self.assertIn("ArrowRight", client)
         self.assertIn("requestAnimationFrame", client)
@@ -1217,6 +1387,9 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('command("set_rule_profile"', client)
         self.assertIn('command("search_route"', client)
         self.assertIn('command("cancel_search"', client)
+        self.assertIn('command("approve_route"', client)
+        self.assertIn('command("execute_route"', client)
+        self.assertIn('command("stop_execution"', client)
         self.assertIn('command("set_protected_cell"', client)
         self.assertNotIn("adb", client.lower())
         self.assertNotIn("solver", client.lower())

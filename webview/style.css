@@ -421,6 +421,29 @@ legend {
   margin: 8px 0 0;
   color: var(--warning);
 }
+.execution-controls {
+  margin-top: 8px;
+}
+
+.execution-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.execution-actions button {
+  min-height: 34px;
+  padding: 0 4px;
+  font-size: 11px;
+}
+
+.execution-status {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: pre-line;
+}
+
 .planning-controls {
   margin-top: 10px;
   border: 1px solid var(--border);

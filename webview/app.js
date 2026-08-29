@@ -41,6 +41,10 @@
   const activeProfile = document.querySelector("#active-profile");
   const searchProgress = document.querySelector("#search-progress");
   const searchResult = document.querySelector("#search-result");
+  const approveRoute = document.querySelector("#approve-route");
+  const executeRoute = document.querySelector("#execute-route");
+  const stopExecution = document.querySelector("#stop-execution");
+  const executionStatus = document.querySelector("#execution-status");
 
   let pendingSnapshot = null;
   let renderFrame = null;
@@ -232,6 +236,9 @@
     const devices = Array.isArray(snapshot.devices) ? snapshot.devices : [];
     const selected = snapshot.selected_device || "";
     const source = snapshot.source;
+    const routeResult = snapshot.route_result;
+    const execution = snapshot.execution || {};
+    const executionBusy = Boolean(execution.busy);
     const entries = Array.isArray(snapshot.board) ? snapshot.board : [];
     const selectedCell = cellParts(snapshot.selected_cell);
     const selectedEntry = entries.find((entry) => cellEquals(entry.cell, selectedCell));
@@ -242,7 +249,7 @@
 
     status.textContent = snapshot.status || "尚未載入來源";
     statusDot.style.background = busy ? "var(--warning)" : "var(--accent)";
-    busyLabel.textContent = busy ? "處理中" : "閒置";
+    busyLabel.textContent = executionBusy ? "執行中" : busy ? "處理中" : "閒置";
     refresh.disabled = busy;
     device.disabled = busy || devices.length === 0;
     capture.disabled = busy || !selected;
@@ -293,11 +300,19 @@
       : unknown > 0
         ? `模型無法判斷 ${unknown} 格；選取後修正，修正未知格會前往下一格。`
         : "盤面已辨識；可選取任一格檢查或修正。";
+    const approved = Boolean(snapshot.route_approved);
+    const executable = Boolean(routeResult && routeResult.execution_eligible && snapshot.confirmed);
     executionGate.textContent = !hasBoard
       ? "尚未載入盤面。"
       : unknown > 0
         ? `含 ${unknown} 個未知格；不可確認或執行。`
-        : "未知格為 0；目前 review 不提供執行按鈕。";
+        : routeResult && !routeResult.execution_eligible
+          ? "目前候選是診斷預覽；不可核准或執行。"
+          : routeResult && !approved
+            ? "目前候選符合條件；請先核准後執行。"
+            : routeResult && approved
+              ? "目前路徑已核准；可執行安全手勢流程。"
+              : "尚無目前可執行候選。";
     correct.disabled = busy || !hasSelection;
     protect.disabled = busy || !hasSelection;
     clearProtect.disabled = busy || !snapshot.protected_cell;
@@ -309,6 +324,29 @@
     locked.checked = Boolean(selectedEntry && selectedEntry.locked);
     syncOrbFlags(hasSelection, busy);
     renderSearch(snapshot, hasBoard, busy);
+    approveRoute.disabled = busy || !executable || approved;
+    executeRoute.disabled = busy || !executable || !approved;
+    stopExecution.disabled = !executionBusy;
+    stopExecution.textContent = executionBusy && execution.stop_requested
+      ? "等待安全放手…"
+      : "停止（安全放手後生效）";
+    if (executionBusy) {
+      executionStatus.textContent = `執行階段：${execution.phase || "processing"}`;
+    } else if (execution.status === "success") {
+      executionStatus.textContent = "執行成功。";
+    } else if (execution.status === "failed") {
+      executionStatus.textContent = "執行失敗；請查看驗證結果與事件主控台。";
+    } else if (execution.status === "stopped") {
+      executionStatus.textContent = "已停止；目前手勢已安全放手。";
+    } else {
+      executionStatus.textContent = "尚未執行路徑。";
+    }
+    if (execution.verification) {
+      const report = execution.verification;
+      const mismatch = report.mismatches === null || report.mismatches === undefined
+        ? "未知" : report.mismatches;
+      executionStatus.textContent += `\n手勢後驗證：${report.success ? "成功" : "失敗"}（${mismatch} 格不符）`;
+    }
 
     const entriesForConsole = Array.isArray(snapshot.console) ? snapshot.console : [];
     consoleCount.textContent = String(entriesForConsole.length);
@@ -392,6 +430,12 @@
   }
   startSearch.addEventListener("click", () => command("search_route", searchPayload()));
   cancelSearch.addEventListener("click", () => command("cancel_search"));
+  approveRoute.addEventListener("click", () => command("approve_route"));
+  executeRoute.addEventListener("click", () => {
+    const serial = currentSnapshot && currentSnapshot.selected_device;
+    if (serial) command("execute_route", { serial });
+  });
+  stopExecution.addEventListener("click", () => command("stop_execution"));
   refresh.addEventListener("click", () => command("refresh_devices"));
   device.addEventListener("change", () => command("select_device", { serial: device.value }));
   capture.addEventListener("click", () => command("capture_screen"));

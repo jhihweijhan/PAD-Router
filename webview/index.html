@@ -111,6 +111,14 @@
           <button id="clear-protect" type="button" disabled>清除保護</button>
         </div>
         <p id="execution-gate" class="execution-gate">尚未載入盤面。</p>
+        <div class="execution-controls" aria-label="路徑核准與執行">
+          <div class="execution-actions">
+            <button id="approve-route" type="button" disabled>核准目前路徑</button>
+            <button id="execute-route" type="button" class="primary-action" disabled>執行目前路徑</button>
+            <button id="stop-execution" type="button" disabled>停止（安全放手後生效）</button>
+          </div>
+          <p id="execution-status" class="execution-status" role="status" aria-live="polite">尚未執行路徑。</p>
+        </div>
 
       <details id="planning-controls" class="planning-controls">
         <summary>規則與路徑搜尋</summary>

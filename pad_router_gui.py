@@ -1042,6 +1042,18 @@ def _search_options_snapshot(options: RouteSearchOptions | None) -> dict[str, ob
     }
 
 
+def _verification_snapshot(report: PlayVerification | None) -> dict[str, object] | None:
+    if report is None:
+        return None
+    return {
+        "status": report.status,
+        "success": report.success,
+        "mismatches": report.mismatches,
+        "expected_board": _review_board(report.expected_board, None, None),
+        "detected_board": _review_board(report.detected_board, None, None),
+    }
+
+
 def _profile_from_payload(payload: dict[str, object]) -> RuleProfile:
     raw_profile = payload.get("profile")
     if raw_profile is not None:
@@ -1098,7 +1110,8 @@ class BoardInspectionBridge:
     def __init__(self, controller: BoardInspectionController | None = None,
                  device_lister: Callable[[], Iterable[str]] | None = None,
                  executor: Executor | None = None,
-                 search_executor: Executor | None = None):
+                 search_executor: Executor | None = None,
+                 execution_executor: Executor | None = None):
         self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
         self._device_lister = device_lister or _list_adb_devices
         self._lock = threading.RLock()
@@ -1111,14 +1124,27 @@ class BoardInspectionBridge:
                 max_workers=1, thread_name_prefix="pad-router-search"
             ))
         )
+        self._execution_executor = (
+            execution_executor if execution_executor is not None else
+            (executor if executor is not None else ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pad-router-execution"
+            ))
+        )
         self._future: Future | None = None
         self._interaction_future: Future | None = None
         self._search_future: Future | None = None
+        self._execution_future: Future | None = None
         self._closed = False
         self._busy = False
         self._pending_operations = 0
         self._pending_interactions = 0
         self._pending_searches = 0
+        self._execution_busy = False
+        self._execution_stop: threading.Event | None = None
+        self._execution_stop_requested = False
+        self._execution_status = "idle"
+        self._execution_phase = "idle"
+        self._execution_verification: dict[str, object] | None = None
         self._generation = 0
         self._search_cancel: threading.Event | None = None
         self._search_generation: int | None = None
@@ -1162,6 +1188,7 @@ class BoardInspectionBridge:
             "learning_status": state.learning_status,
             "rule_profile": profile.to_dict() if profile is not None else None,
             "route_result": _route_evaluation_snapshot(state.route_evaluation),
+            "route_approved": state.route_approved,
             "search_result": _route_search_snapshot(state.route_search),
         }
 
@@ -1184,6 +1211,16 @@ class BoardInspectionBridge:
             "qualifying_candidate": cls._copy_route(result.get("qualifying_candidate")),
             "diagnostic_candidate": cls._copy_route(result.get("diagnostic_candidate")),
         }
+    @staticmethod
+    def _copy_execution(execution: object) -> object:
+        if not isinstance(execution, dict):
+            return execution
+        verification = execution.get("verification")
+        return {
+            **execution,
+            "verification": deepcopy(verification) if isinstance(verification, dict) else verification,
+        }
+
 
     @classmethod
     def _copy_snapshot(cls, snapshot: dict[str, object]) -> dict[str, object]:
@@ -1218,6 +1255,7 @@ class BoardInspectionBridge:
             "search_result": cls._copy_search(snapshot.get("search_result")),
             "rule_profile": deepcopy(profile) if isinstance(profile, dict) else profile,
             "search": search,
+            "execution": cls._copy_execution(snapshot.get("execution")),
             "console": [dict(item) for item in snapshot.get("console", ())],
         }
 
@@ -1234,6 +1272,14 @@ class BoardInspectionBridge:
                 "options": _search_options_snapshot(self._search_options),
                 "generation": self._generation,
                 "result": self._controller_snapshot.get("search_result"),
+            },
+            "route_approved": self._controller_snapshot.get("route_approved", False),
+            "execution": {
+                "status": self._execution_status,
+                "phase": self._execution_phase,
+                "busy": self._execution_busy,
+                "stop_requested": self._execution_stop_requested,
+                "verification": self._execution_verification,
             },
             "console": self._console,
         })
@@ -1334,17 +1380,139 @@ class BoardInspectionBridge:
         return generation, result, options
 
 
+    def _execution_announce(self, phase: str, message: str,
+                            level: str = "info") -> None:
+        with self._lock:
+            self._execution_phase = phase
+            self._announce(level, "execution", message)
+
+    def _finish_execution(self, status: str, message: str,
+                          verification: dict[str, object] | None = None) -> None:
+        with self._lock:
+            self._execution_status = status
+            self._execution_phase = "stopped" if status == "stopped" else "complete"
+            self._execution_verification = verification
+            self._execution_busy = False
+            self._execution_stop = None
+            self._busy = self._pending_interactions > 0
+            self._controller_snapshot = self._review_snapshot()
+            level = ("success" if status == "success"
+                     else "warning" if status == "stopped" else "error")
+            self._announce(level, "execution", message)
+
+    def _run_execution(self, serial: str, stop_event: threading.Event) -> None:
+        verification = None
+        try:
+            self._execution_announce(
+                "acceptance",
+                "執行準備：正在接受目前盤面並完成低權重學習",
+            )
+            self.controller.accept_current_board()
+            if stop_event.is_set():
+                self._finish_execution(
+                    "stopped",
+                    "停止已生效：低權重學習已完成，尚未開始手勢。",
+                )
+                return
+            self._execution_announce(
+                "gesture",
+                "正在執行手勢；停止要求將於目前手勢安全放手後生效",
+            )
+            succeeded = self.controller.execute_route(serial)
+            verification = _verification_snapshot(self.controller.state.verification)
+            if verification is not None:
+                with self._lock:
+                    self._execution_verification = verification
+                mismatch = verification["mismatches"]
+                detail = ("成功（0 格不符）" if verification["success"]
+                          else f"失敗（{mismatch if mismatch is not None else '未知'} 格不符）")
+                self._execution_announce("verification", f"手勢後盤面驗證：{detail}",
+                                         "success" if verification["success"] else "warning")
+            if stop_event.is_set():
+                self._finish_execution(
+                    "stopped",
+                    "停止已生效：目前手勢已安全放手。",
+                    verification,
+                )
+            elif succeeded:
+                self._finish_execution(
+                    "success",
+                    "執行成功：手勢後盤面驗證完成。",
+                    verification,
+                )
+            else:
+                self._finish_execution(
+                    "failed",
+                    "執行失敗：請查看手勢後驗證結果。",
+                    verification,
+                )
+        except Exception as exc:
+            self._finish_execution("failed", f"執行失敗：{exc}", verification)
+
+    def _start_execution(self, serial: object) -> dict[str, object]:
+        with self._lock:
+            if self._execution_busy:
+                self._announce("warning", "execution", "執行中；命令已拒絕")
+                raise ValueError("執行中；請等待目前手勢安全結束")
+            if self._pending_interactions:
+                self._announce("warning", "execution", "仍有後端命令執行中；執行命令已拒絕")
+                raise ValueError("仍有後端命令執行中；請稍候")
+            if not isinstance(serial, str) or not serial.strip():
+                raise ValueError("請先更新並選擇 Android 裝置")
+            state = self.controller.state
+            result = state.route_evaluation
+            if (result is None or not state.confirmed
+                    or not result.execution_eligible or not state.route_approved):
+                raise ValueError("僅能執行目前已核准、確認且符合條件的路徑")
+            serial = serial.strip()
+            self._execution_busy = True
+            self._execution_stop_requested = False
+            self._execution_status = "running"
+            self._execution_phase = "acceptance"
+            self._execution_verification = None
+            self._execution_stop = threading.Event()
+            self._busy = True
+            self._announce(
+                "info",
+                "execution",
+                "執行準備：接受目前路徑；ADB 手勢尚未開始",
+            )
+            future = self._execution_executor.submit(
+                self._run_execution, serial, self._execution_stop
+            )
+            self._execution_future = future
+            self._future = future
+            return {"accepted": True, "snapshot": self._view_locked()}
+
+    def _stop_execution(self) -> dict[str, object]:
+        with self._lock:
+            if not self._execution_busy:
+                return self._view_locked()
+            self._execution_stop_requested = True
+            if self._execution_stop is not None:
+                self._execution_stop.set()
+            self._execution_phase = "stopping"
+            self._announce(
+                "info",
+                "execution",
+                "停止已要求；目前手勢完成並安全放手後生效",
+            )
+            return self._view_locked()
+
     def _submit(self, phase: str, started: str, operation: Callable[[], object]) -> dict[str, object]:
         with self._lock:
             if self._closed:
                 raise RuntimeError("後端已關閉")
+            if self._execution_busy:
+                self._announce("warning", "execution", "執行中；命令已拒絕")
+                raise ValueError("執行中；請等待目前手勢安全結束")
             is_search = phase == "search"
             self._pending_operations += 1
             if is_search:
                 self._pending_searches += 1
             else:
                 self._pending_interactions += 1
-            self._busy = self._pending_interactions > 0
+            self._busy = self._pending_interactions > 0 or self._execution_busy
             self._announce("info", phase, started)
             executor = self._search_executor if is_search else self._executor
             future = executor.submit(self._run, phase, operation)
@@ -1434,7 +1602,7 @@ class BoardInspectionBridge:
                     self._pending_searches = max(0, self._pending_searches - 1)
                 else:
                     self._pending_interactions = max(0, self._pending_interactions - 1)
-                self._busy = self._pending_interactions > 0
+                self._busy = self._pending_interactions > 0 or self._execution_busy
                 self._announce(level, phase, message)
         except Exception as exc:
             with self._lock:
@@ -1445,7 +1613,7 @@ class BoardInspectionBridge:
                     self._search_progress = None
                 else:
                     self._pending_interactions = max(0, self._pending_interactions - 1)
-                self._busy = self._pending_interactions > 0
+                self._busy = self._pending_interactions > 0 or self._execution_busy
                 self._announce("error", phase, str(exc))
 
     def _resolve_cell(self, payload: dict[str, object], *, selected: bool = False) -> tuple[int, int]:
@@ -1478,6 +1646,11 @@ class BoardInspectionBridge:
         if not isinstance(payload, dict):
             raise ValueError("命令必須是 JSON 物件")
         action = payload.get("action", payload.get("command"))
+        if action not in {"snapshot", "events", "drain_events", "stop_execution", "cancel_execution"}:
+            with self._lock:
+                if self._execution_busy:
+                    self._announce("warning", "execution", "執行中；命令已拒絕")
+                    raise ValueError("執行中；請等待目前手勢安全結束")
         if action == "snapshot":
             return self.snapshot()
         if action in {"events", "drain_events"}:
@@ -1495,6 +1668,15 @@ class BoardInspectionBridge:
                 self._selected_device = serial
                 self._announce("info", "device", f"已選擇裝置：{serial}")
                 return self._view_locked()
+        if action in {"approve", "approve_route"}:
+            with self._lock:
+                if self._execution_busy:
+                    self._announce("warning", "execution", "執行中；命令已拒絕")
+                    raise ValueError("執行中；請等待目前手勢安全結束")
+                self.controller.approve_route(explicit_confirmation=True)
+                self._controller_snapshot = self._review_snapshot()
+                self._announce("success", "approval", "目前路徑已核准")
+                return {"accepted": True, "snapshot": self._view_locked()}
         if action == "select_cell":
             if self.controller.state.board is None:
                 raise ValueError("請先擷取裝置畫面，再選取盤面格")
@@ -1576,6 +1758,12 @@ class BoardInspectionBridge:
                 self._search_progress = None
                 self._announce("info", "search", "正在取消搜尋")
                 return self._view_locked()
+        if action in {"execute", "execute_route"}:
+            with self._lock:
+                serial = self._selected_device if payload.get("serial") is None else payload.get("serial")
+            return self._start_execution(serial)
+        if action in {"stop_execution", "cancel_execution"}:
+            return self._stop_execution()
 
         if action in {"capture", "capture_device", "capture_screen"}:
             serial = payload.get("serial")
@@ -1595,7 +1783,10 @@ class BoardInspectionBridge:
     def wait_for_idle(self, timeout: float | None = None) -> None:
         with self._lock:
             futures = tuple(
-                future for future in (self._interaction_future, self._search_future, self._future)
+                future for future in (
+                    self._interaction_future, self._search_future,
+                    self._execution_future, self._future,
+                )
                 if future is not None
             )
         for future in dict.fromkeys(futures):
@@ -1606,8 +1797,10 @@ class BoardInspectionBridge:
             if self._closed:
                 return
             self._closed = True
-            executors = ((self._executor,) if self._search_executor is self._executor
-                         else (self._executor, self._search_executor))
+            executors = []
+            for executor in (self._executor, self._search_executor, self._execution_executor):
+                if executor not in executors:
+                    executors.append(executor)
         for executor in executors:
             executor.shutdown(wait=False, cancel_futures=True)
 
