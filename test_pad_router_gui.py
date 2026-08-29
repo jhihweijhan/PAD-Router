@@ -1440,6 +1440,14 @@ class BoardInspectionBridgeTests(unittest.TestCase):
 
             def shutdown(self, **_kwargs):
                 self.pending.clear()
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
 
         def list_devices():
             if fail_devices:
@@ -1460,6 +1468,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             controller=controller,
             device_lister=list_devices,
             executor=executor,
+            search_executor=ImmediateExecutor(),
         )
         self.addCleanup(bridge.close)
         bridge.drain_events()
@@ -1728,6 +1737,115 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertFalse(bridge.snapshot()["operational_busy"])
 
 
+    def test_capture_auto_searches_thirty_attempts_and_explicit_settings_override(self):
+        board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
+                      for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        search_calls = []
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        interaction_executor = DeferredExecutor()
+        search_executor = DeferredExecutor()
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        bridge = BoardInspectionBridge(
+            controller=controller,
+            executor=interaction_executor,
+            search_executor=search_executor,
+        )
+        self.addCleanup(bridge.close)
+        bridge.drain_events()
+
+        started = bridge.command({"action": "capture_screen", "serial": "test-device"})
+        self.assertTrue(started["accepted"])
+        self.assertFalse(started["snapshot"]["busy"])
+        self.assertEqual(search_executor.pending, [])
+        interaction_executor.run_next()
+
+        pending = bridge.snapshot()
+        self.assertEqual(pending["search"]["status"], "running")
+        self.assertEqual(pending["search"]["options"]["attempts"], 30)
+        self.assertEqual(len(search_executor.pending), 1)
+
+        def fake_search(_board, _profile, options, **_kwargs):
+            search_calls.append(options)
+            return RouteSearchResult(None, None, 1, options.attempts)
+
+        with patch("pad_router_gui.search_qualifying_route", side_effect=fake_search):
+            search_executor.run_next()
+            explicit = bridge.command({
+                "action": "search_route",
+                "attempts": 7,
+                "max_steps": 0,
+                "seed": 42,
+                "cascade": False,
+            })
+            self.assertTrue(explicit["accepted"])
+            self.assertEqual(explicit["snapshot"]["search"]["options"]["attempts"], 7)
+            search_executor.run_next()
+
+        self.assertEqual([options.attempts for options in search_calls], [30, 7])
+
+    def test_route_preview_keeps_authoritative_overlay_and_drag_only_board_state(self):
+        board = tuple(tuple(Orb("normal", (row * COLS + col) % 6 + 1)
+                            for col in range(COLS)) for row in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board,
+            capture=lambda _serial: source,
+        )
+        controller.capture_device("test-device", auto_search=False)
+        controller.set_rule_profile(RuleProfile("preview"))
+        controller.confirm_board()
+        result = controller.evaluate_manual_route(((0, 0), (0, 1)), cascade=False)
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+
+        snapshot = bridge.snapshot()
+        preview = snapshot["route_preview"]
+        self.assertEqual(preview["stage"], "drag_applied")
+        self.assertEqual(preview["route"], [[0, 0], [0, 1]])
+        self.assertEqual(preview["projected_combo"], result.combo_count)
+        self.assertEqual(
+            {tuple(item["cell"]): item["color"] for item in preview["board"]},
+            {
+                (row, col): getattr(orb, "color", None)
+                for row, values in enumerate(expected_board_after_path(board, ((0, 0), (0, 1))))
+                for col, orb in enumerate(values)
+            },
+        )
+        self.assertEqual(
+            [(point["x"], point["y"]) for point in snapshot["route_overlay"]],
+            [(12, 12), (36, 12)],
+        )
+        self.assertEqual(snapshot["route_overlay"][1]["step"], 2)
+        json.dumps(snapshot)
+
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
         from pad_router_webview import ASSET_ROOT
@@ -1750,12 +1868,15 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('id="board-grid"', html)
         self.assertIn('data-orb="fire"', html)
         self.assertIn('id="planning-controls"', html)
+        self.assertIn('<option selected>30</option>', html)
         self.assertIn('id="start-search"', html)
         self.assertIn('id="cancel-search"', html)
         self.assertIn('id="approve-route"', html)
         self.assertIn('id="execute-route"', html)
         self.assertIn('id="stop-execution"', html)
         for marker in (
+                'id="source-stage"', 'id="route-overlay"', 'id="route-preview"',
+                'id="route-preview-grid"', 'id="projected-combo"', 'id="route-preview-status"',
                 'id="device-status"', 'id="calibration-controls"',
                 'id="calibration-left"', 'id="calibration-top"', 'id="calibration-cell"',
                 'id="apply-calibration"', 'id="auto-calibration"', 'id="profile-controls"',
@@ -1782,7 +1903,8 @@ class WebviewAssetTests(unittest.TestCase):
                 'command("calibrate"', 'command("auto_calibrate"',
                 'command("import_rule_profile"', 'command("export_rule_profile"',
                 'FileReader', 'Blob', 'snapshot.debug', 'entry.level',
-                'operational_busy', 'followTail',
+                'route_overlay', 'route_preview', 'projected_combo',
+                'createElementNS', 'preview-cell',
         ):
             self.assertIn(marker, client)
         self.assertNotIn("adb", client.lower())
@@ -1796,7 +1918,8 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn("@media (max-height: 800px)", styles)
         self.assertIn("@media (max-height: 740px)", styles)
         for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
-                       ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid"):
+                       ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid",
+                       ".route-preview", ".route-line", ".route-marker", ".combo-badge"):
             self.assertIn(marker, styles)
 
 

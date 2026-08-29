@@ -7,6 +7,13 @@
   const refresh = document.querySelector("#refresh");
   const capture = document.querySelector("#capture");
   const sourceImage = document.querySelector("#source-image");
+  const sourceStage = document.querySelector("#source-stage");
+  const sourceViewport = document.querySelector(".source-viewport");
+  const routeOverlay = document.querySelector("#route-overlay");
+  const routePreview = document.querySelector("#route-preview");
+  const routePreviewGrid = document.querySelector("#route-preview-grid");
+  const projectedCombo = document.querySelector("#projected-combo");
+  const routePreviewStatus = document.querySelector("#route-preview-status");
   const sourceEmpty = document.querySelector("#source-empty");
   const sourceMeta = document.querySelector("#source-meta");
   const sourceName = document.querySelector("#source-name");
@@ -164,6 +171,82 @@
       fragment.append(button);
     }
     boardGrid.append(fragment);
+  }
+
+  function renderRouteOverlay(snapshot, source) {
+    routeOverlay.replaceChildren();
+    const points = Array.isArray(snapshot.route_overlay) ? snapshot.route_overlay : [];
+    if (!source || points.length === 0) {
+      routeOverlay.setAttribute("hidden", "");
+      return;
+    }
+    routeOverlay.setAttribute("viewBox", `0 0 ${source.width} ${source.height}`);
+    const namespace = "http\u003a//www.w3.org/2000/svg";
+    if (points.length > 1) {
+      const line = document.createElementNS(namespace, "polyline");
+      line.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
+      line.setAttribute("class", "route-line");
+      routeOverlay.append(line);
+    }
+    for (const point of points) {
+      const marker = document.createElementNS(namespace, "circle");
+      marker.setAttribute("cx", String(point.x));
+      marker.setAttribute("cy", String(point.y));
+      marker.setAttribute("r", String(Math.max(5, Math.min(source.width, source.height) / 35)));
+      marker.setAttribute("class", "route-marker");
+      marker.setAttribute("aria-label", `路徑第 ${point.step} 步`);
+      routeOverlay.append(marker);
+    }
+    routeOverlay.removeAttribute("hidden");
+  }
+
+  function renderRoutePreview(snapshot) {
+    const preview = snapshot.route_preview;
+    const entries = preview && Array.isArray(preview.board) ? preview.board : [];
+    routePreviewGrid.replaceChildren();
+    if (!preview || entries.length === 0) {
+      routePreview.hidden = true;
+      projectedCombo.textContent = "— Combo";
+      routePreviewStatus.textContent = "尚未有選定路徑。";
+      return;
+    }
+    routePreview.hidden = false;
+    projectedCombo.textContent = `預計 ${preview.projected_combo ?? "未知"} Combo`;
+    const fragment = document.createDocumentFragment();
+    for (const entry of entries) {
+      const cell = cellParts(entry.cell);
+      if (!cell) continue;
+      const orb = document.createElement("span");
+      orb.className = "board-cell preview-cell";
+      if (entry.unknown) orb.classList.add("unknown");
+      if (entry.protected) orb.classList.add("protected");
+      orb.dataset.kind = entry.kind || "unknown";
+      if (entry.color !== null && entry.color !== undefined) {
+        orb.dataset.color = String(entry.color);
+      }
+      const state = entry.unknown ? "未知" : entry.label || "未命名";
+      const flags = [entry.enhanced ? "強化" : "", entry.locked ? "鎖定" : "", entry.protected ? "保護" : ""]
+        .filter(Boolean).join("、");
+      orb.setAttribute("aria-label", `${cellText(cell)}：${state}${flags ? `（${flags}）` : ""}`);
+      orb.textContent = entry.unknown ? "?" : entry.label || "?";
+      fragment.append(orb);
+    }
+    routePreviewGrid.append(fragment);
+    const label = preview.execution_eligible ? "可執行候選" : "診斷預覽（不可執行）";
+    routePreviewStatus.textContent = `拖曳後、匹配前（未移除珠子或套用天降）；${label}。`;
+  }
+
+  function sizeSourceStage(source) {
+    if (!source || !source.width || !source.height) return;
+    const scale = Math.min(
+      1,
+      sourceViewport.clientWidth / source.width,
+      sourceViewport.clientHeight / source.height,
+    );
+    sourceStage.style.width = `${Math.max(1, Math.floor(source.width * scale))}px`;
+    sourceStage.style.height = `${Math.max(1, Math.floor(source.height * scale))}px`;
+    sourceImage.style.width = "100%";
+    sourceImage.style.height = "100%";
   }
 
   function syncOrbFlags(hasSelection, busy) {
@@ -334,6 +417,7 @@
     debugExecutionPhase.textContent = debug.execution_phase || "idle";
     debugConfirmed.textContent = debug.confirmed ? "是" : "否";
     if (source) {
+      sourceStage.hidden = false;
       sourceImage.hidden = false;
       if (sourceImage.src !== source.image) sourceImage.src = source.image;
       sourceImage.alt = `裝置 ${source.name || "source"} 的目前截圖`;
@@ -341,14 +425,20 @@
       sourceName.textContent = source.name || "未命名來源";
       sourceSize.textContent = `${source.width} × ${source.height}`;
       sourceMeta.textContent = `${source.width} × ${source.height}`;
+      sizeSourceStage(source);
     } else {
+      sourceStage.hidden = true;
       sourceImage.hidden = true;
       sourceImage.removeAttribute("src");
+      routeOverlay.setAttribute("hidden", "");
       sourceEmpty.hidden = false;
       sourceName.textContent = "尚未載入";
       sourceSize.textContent = "—";
       sourceMeta.textContent = "尚未擷取";
     }
+    renderRouteOverlay(snapshot, source);
+    if (source) window.requestAnimationFrame(() => sizeSourceStage(source));
+    renderRoutePreview(snapshot);
 
     renderBoard(snapshot);
     unknownCount.textContent = `未知 ${unknown}`;
@@ -560,6 +650,9 @@
     profileFile.value = "";
   });
   exportProfile.addEventListener("click", () => downloadProfile());
+  window.addEventListener("resize", () => {
+    if (currentSnapshot && currentSnapshot.source) sizeSourceStage(currentSnapshot.source);
+  });
   window.addEventListener("pywebviewready", ready);
   if (window.pywebview && window.pywebview.api) ready();
 })();

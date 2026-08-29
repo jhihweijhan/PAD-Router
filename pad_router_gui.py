@@ -44,6 +44,7 @@ from pad_router import (
     detect_board_pixels,
     evaluate_manual_route,
     load_rule_profile,
+    expected_board_after_path,
     orb_display,
     orb_match_key,
     play,
@@ -1086,6 +1087,38 @@ def _verification_snapshot(report: PlayVerification | None) -> dict[str, object]
         "detected_board": _review_board(report.detected_board, None, None),
     }
 
+def _route_overlay_snapshot(overlay: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "cell": list(item["cell"]),
+            "step": item["step"],
+            "x": item["x"],
+            "y": item["y"],
+        }
+        for item in overlay
+    ]
+
+
+def _route_preview_snapshot(state: BoardInspectionState) -> dict[str, object] | None:
+    result = state.route_evaluation
+    board = state.confirmed_board or state.board
+    if result is None or board is None:
+        return None
+    applied = expected_board_after_path(board, result.route)
+    return {
+        "stage": "drag_applied",
+        "route": [list(cell) for cell in result.route],
+        "board": _review_board(applied, None, state.protected_cell),
+        "projected_combo": result.combo_count,
+        "direct_combo_count": result.direct_combo_count,
+        "direct_combo_estimate": result.direct_combo_estimate,
+        "qualifying": result.qualifying,
+        "confirmed": result.confirmed,
+        "execution_eligible": result.execution_eligible,
+        "diagnostic_status": result.diagnostic_status,
+        "diagnostic": result.diagnostic,
+    }
+
 def _calibration_snapshot(calibration: BoardCalibration | None) -> dict[str, int] | None:
     if calibration is None:
         return None
@@ -1262,6 +1295,8 @@ class BoardInspectionBridge:
             "learning_status": state.learning_status,
             "rule_profile": profile.to_dict() if profile is not None else None,
             "route_result": _route_evaluation_snapshot(state.route_evaluation),
+            "route_overlay": _route_overlay_snapshot(state.route_overlay),
+            "route_preview": _route_preview_snapshot(state),
             "route_approved": state.route_approved,
             "search_result": _route_search_snapshot(state.route_search),
         }
@@ -1318,6 +1353,17 @@ class BoardInspectionBridge:
                 "options": dict(options) if isinstance(options, dict) else options,
                 "result": cls._copy_search(search.get("result")),
             }
+        route_overlay = [
+            {
+                **item,
+                "cell": list(item["cell"]),
+            }
+            for item in snapshot.get("route_overlay", ())
+            if isinstance(item, dict) and isinstance(item.get("cell"), (list, tuple))
+        ]
+        route_preview = snapshot.get("route_preview")
+        if isinstance(route_preview, dict):
+            route_preview = deepcopy(route_preview)
         return {
             **snapshot,
             "source": dict(source) if isinstance(source, dict) else None,
@@ -1328,6 +1374,8 @@ class BoardInspectionBridge:
             "calibration": (dict(snapshot["calibration"])
                             if isinstance(snapshot.get("calibration"), dict) else None),
             "route_result": cls._copy_route(snapshot.get("route_result")),
+            "route_overlay": route_overlay,
+            "route_preview": route_preview,
             "search_result": cls._copy_search(snapshot.get("search_result")),
             "rule_profile": deepcopy(profile) if isinstance(profile, dict) else profile,
             "search": search,
@@ -1421,6 +1469,8 @@ class BoardInspectionBridge:
             self._controller_snapshot = {
                 **self._controller_snapshot,
                 "route_result": None,
+                "route_overlay": [],
+                "route_preview": None,
                 "search_result": None,
             }
         if self._search_cancel is not None:
@@ -1477,6 +1527,28 @@ class BoardInspectionBridge:
             cancel=cancel.is_set,
         )
         return generation, result, options
+
+    def _start_search(self, options: RouteSearchOptions) -> dict[str, object]:
+        with self._lock:
+            state = self.controller.state
+            if state.board is None:
+                raise ValueError("請先擷取裝置畫面，再搜尋路徑")
+            if state.rule_profile is None:
+                raise ValueError("請先套用規則設定，再搜尋路徑")
+            board = state.confirmed_board or state.board
+            profile = state.rule_profile
+            confirmed = state.confirmed
+            protected = state.protected_cell
+            generation, cancel = self._begin_search(options)
+            self.controller.invalidate_route("正在搜尋；先前候選已失效")
+            self._controller_snapshot = self._review_snapshot()
+        return self._submit(
+            "search",
+            "正在搜尋符合規則的路徑",
+            lambda: self._search_operation(
+                generation, board, profile, options, confirmed, protected, cancel
+            ),
+        )
 
 
     def _execution_announce(self, phase: str, message: str,
@@ -1669,6 +1741,8 @@ class BoardInspectionBridge:
                     self._controller_snapshot = self._review_snapshot(refresh_source=True)
                     message = str(self._controller_snapshot["status"])
                     level = "success"
+                    if state.board is not None and state.rule_profile is not None:
+                        self._start_search(RouteSearchOptions(attempts=30))
                 elif phase == "review":
                     state, selected = result
                     self._selected_cell = selected
@@ -1924,27 +1998,7 @@ class BoardInspectionBridge:
                 lambda: self.controller.set_rule_profile(profile),
             )
         if action in {"search", "search_route", "start_search"}:
-            options = _search_options_from_payload(payload)
-            with self._lock:
-                state = self.controller.state
-                if state.board is None:
-                    raise ValueError("請先擷取裝置畫面，再搜尋路徑")
-                if state.rule_profile is None:
-                    raise ValueError("請先套用規則設定，再搜尋路徑")
-                board = state.confirmed_board or state.board
-                profile = state.rule_profile
-                confirmed = state.confirmed
-                protected = state.protected_cell
-                generation, cancel = self._begin_search(options)
-                self.controller.invalidate_route("正在搜尋；先前候選已失效")
-                self._controller_snapshot = self._review_snapshot()
-            return self._submit(
-                "search",
-                "正在搜尋符合規則的路徑",
-                lambda: self._search_operation(
-                    generation, board, profile, options, confirmed, protected, cancel
-                ),
-            )
+            return self._start_search(_search_options_from_payload(payload))
         if action in {"cancel_search", "stop_search"}:
             with self._lock:
                 if self._search_cancel is None or self._search_generation is None:

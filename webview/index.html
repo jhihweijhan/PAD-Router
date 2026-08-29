@@ -40,8 +40,22 @@
           <strong>尚未擷取裝置畫面</strong>
           <span>更新裝置後選取序號，再按「擷取畫面」。</span>
         </div>
-        <img id="source-image" alt="目前裝置截圖" hidden>
+        <div id="source-stage" hidden>
+          <img id="source-image" alt="目前裝置截圖">
+          <svg id="route-overlay" aria-hidden="true" hidden></svg>
+        </div>
       </div>
+      <section id="route-preview" class="route-preview" aria-labelledby="preview-heading" hidden>
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">AFTER DRAG</p>
+            <h2 id="preview-heading">拖曳後盤面預覽</h2>
+          </div>
+          <strong id="projected-combo" class="combo-badge">— Combo</strong>
+        </div>
+        <div id="route-preview-grid" class="board-grid" role="grid" aria-label="拖曳後 5 列 6 欄盤面"></div>
+        <p id="route-preview-status" class="review-status" role="status" aria-live="polite">尚未有選定路徑。</p>
+      </section>
       <p class="ground-truth-note">原始截圖保持不變；盤面檢視與人工修正只更新右側受控資料。</p>
     </section>
 
@@ -291,7 +305,7 @@
         <div class="search-fields">
           <label>嘗試
             <select id="search-attempts">
-              <option>5</option><option selected>10</option><option>25</option><option>50</option>
+              <option>5</option><option>10</option><option>25</option><option selected>30</option><option>50</option>
             </select>
           </label>
           <label>步數

@@ -217,6 +217,41 @@ h2 {
   object-fit: contain;
 }
 
+#source-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+#source-stage[hidden],
+#route-overlay[hidden] {
+  display: none;
+}
+
+#route-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.route-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 12;
+}
+
+.route-marker {
+  fill: var(--warning);
+  stroke: #171d27;
+  stroke-width: 5;
+}
+
 #source-image[hidden],
 .empty-state[hidden] {
   display: none;
@@ -333,6 +368,39 @@ h2 {
   grid-template-columns: 1fr 1fr;
   gap: 4px;
   margin-top: 8px;
+}
+
+.route-preview {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-raised);
+}
+
+.route-preview .panel-heading {
+  margin-bottom: 6px;
+}
+
+.route-preview-grid {
+  width: min(100%, 260px);
+  margin-bottom: 4px;
+}
+
+.route-preview-grid .preview-cell {
+  cursor: default;
+  border: 1px solid #d6dde6;
+  font-size: clamp(11px, 1.4vw, 16px);
+}
+
+.combo-badge {
+  padding: 4px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 13px;
+  white-space: nowrap;
 }
 
 
@@ -707,6 +775,24 @@ legend {
     min-height: 24px;
     font-size: 14px;
   }
+
+  .route-preview {
+    padding: 6px;
+  }
+
+  .route-preview .panel-heading {
+    margin-bottom: 4px;
+  }
+
+  .route-preview-grid {
+    width: min(100%, 180px);
+    margin-bottom: 2px;
+  }
+
+  .route-preview-grid .preview-cell {
+    min-height: 20px;
+    font-size: 12px;
+  }
 }
 
 @media (max-height: 740px) {
@@ -721,6 +807,23 @@ legend {
   .board-cell {
     min-height: 22px;
     font-size: 12px;
+  }
+
+  .route-preview {
+    padding: 4px;
+  }
+
+  .route-preview .panel-heading {
+    margin-bottom: 2px;
+  }
+
+  .route-preview-grid {
+    width: min(100%, 150px);
+  }
+
+  .route-preview-grid .preview-cell {
+    min-height: 18px;
+    font-size: 10px;
   }
 }
 
