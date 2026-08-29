@@ -2059,18 +2059,18 @@ def main() -> None:
                         help="Seconds to wait for revealed cells before recognition")
     parser.add_argument("--round-limit", type=int, default=0, help="Stop after this many rounds; 0 means unlimited")
     parser.add_argument("--play", action="store_true", help="Actually send the gesture; default only prints it")
-    parser.add_argument("--gui", action="store_true", help="Open the offline pywebview workspace")
-    parser.add_argument("--tk-gui", action="store_true", help="Open the legacy Tk board inspection GUI")
+    parser.add_argument("--gui", action="store_true", help="Open the native Board inspection GUI")
+    parser.add_argument("--webview", action="store_true", help="Open the offline capture workspace")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
-    if args.gui and args.tk_gui:
-        parser.error("--gui and --tk-gui are mutually exclusive")
+    if args.gui and args.webview:
+        parser.error("--gui and --webview are mutually exclusive")
     if args.gui:
-        from pad_router_webview import main as gui_main
+        from pad_router_gui import main as gui_main
         gui_main()
         return
-    if args.tk_gui:
-        from pad_router_gui import main as gui_main
+    if args.webview:
+        from pad_router_webview import main as gui_main
         gui_main()
         return
     if args.self_check:

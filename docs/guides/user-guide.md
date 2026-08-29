@@ -5,17 +5,30 @@
 ## 1. 啟動與準備
 
 ```bash
+# Complete Tk board workflow (default --gui until cutover #14)
 uv run python pad_router.py --gui
+
+# Issue #9 capture workspace (explicit opt-in)
+uv run python pad_router.py --webview
 ```
 
 需要：
 
-- Python 3.10 以上、`uv`、固定版本 `pywebview==5.4`，以及 Linux GTK/WebKit 系統套件。
+- Python 3.10 以上與 `uv`；`--gui` 需要系統 Tk。
+- `--webview` 需要固定版本 `pywebview==5.4`，以及 Ubuntu GTK/WebKit 套件。先執行：
+
+  ```bash
+  sudo apt-get update
+  sudo apt-get install --yes python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+  uv venv --system-site-packages --allow-existing
+  uv sync
+  ```
+
 - 「更新裝置」、「擷取畫面」和實際執行路徑需要已連線且已授權的 `adb` 裝置。
 
-`--gui` 目前提供 Issue #9 的離線工作區：更新裝置、選取序號、非同步擷取目前畫面，以及 persistent status/console。截圖由 Python `BoardInspectionController` 驗證後以受控 PNG snapshot 呈現；工作區尚未提供盤面修正、規則、搜尋或執行控制。
+`--webview` 目前提供 Issue #9 的離線工作區：更新裝置、選取序號、非同步擷取目前畫面，以及 persistent status/console。截圖由 Python `BoardInspectionController` 驗證後以受控 PNG snapshot 呈現；工作區尚未提供盤面修正、規則、搜尋或執行控制。
 
-完整盤面流程仍可用 `uv run python pad_router.py --tk-gui` 開啟；以下「載入來源」之後的操作說明目前適用於這個 legacy Tk 入口。
+以下「載入來源」之後的操作說明適用於完整 Tk `--gui` 入口。
 
 ## 2. 載入來源與校正
 

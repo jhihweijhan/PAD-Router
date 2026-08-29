@@ -18,7 +18,7 @@ import struct
 import tempfile
 import threading
 import zlib
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
@@ -958,11 +958,14 @@ class BoardInspectionBridge:
     """Serialized, JSON-safe backend surface for the local webview."""
 
     def __init__(self, controller: BoardInspectionController | None = None,
-                 device_lister: Callable[[], Iterable[str]] | None = None):
+                 device_lister: Callable[[], Iterable[str]] | None = None,
+                 executor: Executor | None = None):
         self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
         self._device_lister = device_lister or _list_adb_devices
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pad-router")
+        self._executor = executor if executor is not None else ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pad-router"
+        )
         self._future: Future | None = None
         self._closed = False
         self._busy = False

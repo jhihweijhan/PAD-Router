@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import struct
+import sys
 import tempfile
 import threading
 import unittest
@@ -681,50 +682,60 @@ class BoardInspectionControllerTests(unittest.TestCase):
 
 
 class BoardInspectionBridgeTests(unittest.TestCase):
-    def test_serial_commands_capture_off_thread_and_coalesce_snapshot_events(self):
+    def test_1080x2400_capture_defers_work_and_coalesces_updates(self):
         board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
-        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
-        started = threading.Event()
-        release = threading.Event()
+        source = (1080, 2400, bytes((60, 40, 20, 255)) * (1080 * 2400))
+        captures = []
 
-        def capture(_serial):
-            started.set()
-            release.wait(timeout=2)
+        def capture(serial):
+            captures.append(serial)
             return source
 
-        controller = BoardInspectionController(
-            detector=lambda *_args: board,
-            capture=capture,
-        )
+        class DeferredExecutor:
+            def __init__(self):
+                self.pending = []
+
+            def submit(self, function, *args):
+                self.pending.append((function, args))
+                return object()
+
+            def run_next(self):
+                function, args = self.pending.pop(0)
+                function(*args)
+
+            def shutdown(self, **_kwargs):
+                self.pending.clear()
+
+        executor = DeferredExecutor()
         bridge = BoardInspectionBridge(
-            controller=controller,
+            controller=BoardInspectionController(detector=lambda *_args: board, capture=capture),
             device_lister=lambda: ("test-device",),
+            executor=executor,
         )
         self.addCleanup(bridge.close)
         bridge.drain_events()
 
-        bridge.command({"action": "refresh_devices"})
-        bridge.wait_for_idle()
-        bridge.drain_events()
+        refresh = bridge.command({"action": "refresh_devices"})
+        self.assertTrue(refresh["accepted"])
+        self.assertEqual(captures, [])
+        executor.run_next()
+
         selected = bridge.command({"action": "select_device", "serial": "test-device"})
         self.assertEqual(selected["selected_device"], "test-device")
-        bridge.drain_events()
-
         acknowledgement = bridge.command({"action": "capture_screen"})
-        self.assertTrue(started.wait(timeout=1))
         self.assertTrue(acknowledgement["accepted"])
-        self.assertTrue(acknowledgement["snapshot"]["busy"])
-        self.assertIsNone(bridge.snapshot()["source"])
+        self.assertIsNone(acknowledgement["snapshot"]["source"])
+        self.assertEqual(captures, [])
 
-        release.set()
-        bridge.wait_for_idle()
+        executor.run_next()
+        self.assertEqual(captures, ["test-device"])
         events = bridge.drain_events()
         self.assertEqual(len(events), 1)
         snapshot = events[0]["snapshot"]
-        self.assertEqual(snapshot["source"]["name"], "test-device")
+        self.assertEqual(snapshot["source"]["width"], 1080)
+        self.assertEqual(snapshot["source"]["height"], 2400)
         self.assertFalse(snapshot["busy"])
-        self.assertGreaterEqual(len(snapshot["console"]), 3)
-        json.dumps(snapshot)
+        self.assertGreaterEqual(len(snapshot["console"]), 5)
         json.dumps(events)
 
 
@@ -743,6 +754,24 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('href="style.css"', html)
         self.assertIn('src="app.js"', html)
         self.assertNotIn("://", html + style.read_text() + script.read_text())
+
+
+class EntrypointTests(unittest.TestCase):
+    def test_gui_keeps_tk_and_webview_requires_explicit_flag(self):
+        import pad_router
+        with patch.object(sys, "argv", ["pad_router.py", "--gui"]), \
+                patch("pad_router_gui.main") as tk_main, \
+                patch("pad_router_webview.main") as webview_main:
+            pad_router.main()
+        tk_main.assert_called_once_with()
+        webview_main.assert_not_called()
+
+        with patch.object(sys, "argv", ["pad_router.py", "--webview"]), \
+                patch("pad_router_gui.main") as tk_main, \
+                patch("pad_router_webview.main") as webview_main:
+            pad_router.main()
+        webview_main.assert_called_once_with()
+        tk_main.assert_not_called()
 
 
 class ExecuteRouteUiTests(unittest.TestCase):

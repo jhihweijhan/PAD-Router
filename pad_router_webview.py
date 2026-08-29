@@ -16,12 +16,23 @@ def main() -> None:
         import webview
     except ModuleNotFoundError as exc:
         raise SystemExit(
-            "開啟 webview 介面需要 pywebview[gtk]；請先依 README 安裝相依套件"
+            "開啟 webview 介面需要 pywebview==5.4；請先依 README 安裝相依套件"
         ) from exc
 
     index = ASSET_ROOT / "index.html"
     if not index.is_file():
         raise SystemExit(f"找不到 webview 本機資產：{index}")
+
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("WebKit2", "4.1")
+    except (ImportError, ValueError) as exc:
+        raise SystemExit(
+            "Ubuntu GTK backend is unavailable; install python3-gi, "
+            "gir1.2-gtk-3.0, gir1.2-webkit2-4.1, then run "
+            "`uv venv --system-site-packages --allow-existing` and `uv sync`"
+        ) from exc
 
     bridge = BoardInspectionBridge()
     window = webview.create_window(
@@ -35,8 +46,12 @@ def main() -> None:
         confirm_close=True,
     )
     window.events.closed += bridge.close
+
+    def on_started():
+        print("PAD Router GTK webview workspace started", flush=True)
+
     try:
-        webview.start(gui="gtk")
+        webview.start(on_started, gui="gtk")
     finally:
         bridge.close()
 

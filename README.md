@@ -14,14 +14,20 @@
 
 ## Quick start
 
-需求：Python 3.10 以上、[`uv`](https://docs.astral.sh/uv/)、`pywebview==5.4`，以及 Linux GTK/WebKit 系統套件；ADB 擷取或執行手勢才需要 `adb` 與已授權的 Android 裝置。
+需求：Python 3.10 以上與 [`uv`](https://docs.astral.sh/uv/)；完整 GUI 使用系統 Tk。Issue #9 的 webview 工作區另需 `pywebview==5.4`、Ubuntu GTK/WebKit 套件與下列一次性 venv 設定：
 
 ```bash
-# 離線 pywebview 工作區
+# Ubuntu/Linux webview prerequisites (once)
+sudo apt-get update
+sudo apt-get install --yes python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+uv venv --system-site-packages --allow-existing
+uv sync
+
+# 完整 Tk 盤面流程（--gui；直到 cutover #14）
 uv run python pad_router.py --gui
 
-# 舊版 Tk 完整盤面流程（後續切片移除）
-uv run python pad_router.py --tk-gui
+# Issue #9 離線 capture workspace（明確 opt-in）
+uv run python pad_router.py --webview
 
 # CLI dry run（不送出 ADB）
 uv run python pad_router.py --board 111222345634456563123451234563

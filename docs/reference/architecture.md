@@ -8,9 +8,9 @@ PAD Router 把 6×5 盤面資料流分成兩個入口與一個 presentation brid
 
 - `pad_router.py`：純 Python 核心，負責盤面規則、Combo／cascade 計算、路徑評估、束搜尋、CLI 與 ADB 手勢驗證。
 - `pad_router_gui.py`：`BoardInspectionController`、既有 Tk GUI 與 `BoardInspectionBridge`；controller 負責來源／辨識，bridge 只暴露序列化 intent 與 snapshot。
-- `pad_router_webview.py`：以固定 GTK backend 啟動離線 pywebview；`webview/` 只包含本機 HTML、CSS、vanilla JavaScript。
+- `pad_router_webview.py`：只有明確 `--webview` flag 才啟動固定 GTK backend 的離線 pywebview；`webview/` 只包含本機 HTML、CSS、vanilla JavaScript。
 
-程式核心只使用 Python 標準函式庫；webview presentation 依賴固定版本 `pywebview==5.4` 與 Linux 系統提供的 GTK/WebKit。ADB 是需要裝置操作時的外部程式。
+程式核心只使用 Python 標準函式庫；webview presentation 依賴固定版本 `pywebview==5.4` 與 Ubuntu 系統提供的 GTK/WebKit。因 uv project venv 預設隔離 system site-packages，webview setup 必須先安裝 `python3-gi`、GTK/WebKit typelibs，再用 `uv venv --system-site-packages --allow-existing` 建立環境。ADB 是需要裝置操作時的外部程式。
 
 ## 實際資料流
 
@@ -60,7 +60,7 @@ flowchart LR
 
 ### `pad_router_webview.py` 與 `webview/`
 
-- pywebview 僅載入相鄰的 `index.html`；不啟動本機 HTTP server，也不請求網路資產。
+- pywebview 僅載入 repository 相鄰的 `index.html`、`style.css` 與 `app.js`；不請求外部網路資產。完整 Tk `--gui` 仍是預設入口，直到 cutover #14。
 - 前端只呼叫 `BoardInspectionBridge.command()` 與 `drain_events()`；`requestAnimationFrame` 合併快速 snapshot，console 從 backend snapshot 重繪。
 - 目前 workspace 僅提供裝置清單、選取、截圖、來源畫面與 status/console；盤面修正、規則、搜尋與執行仍由後續切片處理。
 

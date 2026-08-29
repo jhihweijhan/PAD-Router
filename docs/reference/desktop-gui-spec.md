@@ -4,13 +4,24 @@
 
 ## 範圍
 
-目前桌面入口 `pad_router.py --gui` 使用固定 GTK backend 的 pywebview 離線工作區，從相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript；不啟動網路服務，也不載入遠端資產。`--tk-gui` 暫時保留既有完整 Tk 盤面流程，直到後續切片完成等價安全覆蓋。
+目前完整桌面入口 `pad_router.py --gui` 仍使用既有 Tk 盤面流程，直到 cutover #14。Issue #9 的不完整 capture workspace 以明確的 `pad_router.py --webview` flag 啟動固定 GTK backend 的離線 pywebview，從相鄰的 `webview/` 載入本機 HTML、CSS 與 vanilla JavaScript；不載入遠端資產。
 
 Issue #9 的工作區垂直切片只負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、persistent status 與 console。擷取與 PNG 準備在 `BoardInspectionBridge` 的單一 worker 執行；前端以 serializable snapshot/event 更新，快速更新在 `requestAnimationFrame` 合併。
 
 來源截圖在既有 Tk Canvas 或 webview workspace 依可視區域顯示，辨識與校正仍使用原始 BGRA 像素、`BoardCalibration` 與 `BoardInspectionController`。
 
-## 既有 Tk 完整流程（`--tk-gui`）
+## Ubuntu webview setup
+
+Ubuntu 的 uv project venv 預設看不到 system site-packages；首次使用 `--webview` 前執行：
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+uv venv --system-site-packages --allow-existing
+uv sync
+```
+
+## 既有 Tk 完整流程（`--gui`）
 
 1. 開啟 PNG 或選擇 ADB 裝置擷取畫面。
 2. 以來源實際寬高推定盤面區域；可重新自動校正，也可提供新的校正。
