@@ -1347,14 +1347,18 @@ def search_qualifying_route(
                 for _condition_rank, _combo_rank, _node, result in selected:
                     record(result)
             report("conditions", depth, shape_steps)
-        if best_qualifying is not None and len(best_qualifying.route) - 1 < options.max_steps:
-            settled = best_qualifying.expected_board
+        # A rule the Board cannot reach leaves no qualifier, and stopping here
+        # made a rule search strictly worse at Combos than no rule at all.  The
+        # best diagnosis then anchors the Combo pass, with no Match to keep.
+        anchor = best_qualifying if best_qualifying is not None else best_diagnostic
+        if anchor is not None and len(anchor.route) - 1 < options.max_steps:
+            settled = anchor.expected_board
             keep = {cell: orb_match_key(settled[cell[0]][cell[1]])
-                    for match in (best_qualifying.rounds[0].matches if best_qualifying.rounds else ())
-                    for cell in match.cells}
+                    for match in (anchor.rounds[0].matches if anchor.rounds else ())
+                    for cell in match.cells} if anchor is best_qualifying else {}
             extended = _max_combo_route(
                 settled, options, protected_cell, profile.hazard_policy == "allow",
-                best_qualifying.route, keep, on_progress=report, cancel=stopped,
+                anchor.route, keep, on_progress=report, cancel=stopped,
             )
             if stopped():
                 return finish()
@@ -1691,11 +1695,22 @@ def _hazard_kind(features: CellFeatures) -> str | None:
     """Recognize the distinctive glyph/palette of the three board hazards."""
     if features.orange >= 0.025 and features.dark >= 0.18 and features.green >= 0.06:
         return "bomb"
-    # A poison skull is a dark glyph on a magenta ring whose hue sits past
-    # every normal orb.  White-pixel share cannot separate it: the '+' flash
-    # animation whitens normal orbs *more* than a skull ever is.
-    if features.dark >= 0.25 and _hue_distance(features.hue, 0.92) <= 0.05:
-        return "poison"
+    # Poison variants share a purple ring, but their skulls invert: ordinary
+    # poison is mostly white while mortal poison is mostly dark.
+    # Poison variants share a purple ring, but their skulls invert: ordinary
+    # poison is mostly white while mortal poison is mostly dark.  The ring runs
+    # violet to magenta, so the hue window has to reach 0.97 rather than stop at
+    # the older 0.87 sample, and a dimmed in-game board (skill banner, cut-in)
+    # drops both the purple and the white share roughly 0.1 below the values the
+    # isolated artwork gives -- hence the low gates.
+    if features.purple >= 0.20 and 0.70 <= features.hue <= 0.97:
+        if features.dark >= 0.25 and features.white < 0.25:
+            return "mortal_poison"
+        # A '+' flashing dark orb also reaches a 0.25 white share, but it is a
+        # bright orb throughout (value 0.9+), while a poison ring stays dark
+        # around its skull (0.31 lit, 0.25 dimmed).
+        if features.white >= 0.26 and features.value < 0.75:
+            return "poison"
     # Live jammer glyphs are dark with only a small blue-eye region.
     if features.dark >= 0.25 and features.blue >= 0.06 and features.white < 0.20:
         return "jammer"
@@ -2100,9 +2115,18 @@ def self_check() -> None:
     washed_water = [CellFeatures(0.024, 0.67, 0.73, 0, 0.19, 0.287, 0, 0.11, 0, 1, 0.087, 0.69, 0.96),
                     CellFeatures(0.014, 0.44, 0.94, 0, 0.25, 0.159, 0, 0.11, 0, 1, 0.147, 0.39, 0.99)]
     assert [_normal_color(item) for item in washed_water] == [2, 2]
-    # A real poison skull: dark glyph, magenta ring, and *less* white than the
-    # flashing orbs above, which is why white share cannot identify it.
-    assert _hazard_kind(CellFeatures(0.921, 0.48, 0.76, 0.33, 0.16, 0, 0.49, 0.09, 0, 0)) == "poison"
+    assert _hazard_kind(CellFeatures(0.795, 0.419, 0.312, 0.168, 0.375, 0, 0.375, 0.020, 0, 0)) == "poison"
+    assert _hazard_kind(CellFeatures(0.869, 0.469, 0.306, 0.191, 0.320, 0, 0.441, 0.020, 0, 0)) == "poison"
+    # Poison on a board dimmed by a skill banner: the purple ring and the white
+    # skull both lose about 0.1 of their share, which used to read as dark.
+    dimmed_poison = [CellFeatures(0.869, 0.56, 0.25, 0.278, 0.361, 0, 0.250, 0.250, 0, 0),
+                     CellFeatures(0.868, 0.63, 0.28, 0.194, 0.389, 0, 0.250, 0.278, 0, 0),
+                     CellFeatures(0.879, 0.50, 0.29, 0.111, 0.278, 0, 0.306, 0.139, 0, 0)]
+    assert [_hazard_kind(item) for item in dimmed_poison] == ["poison"] * 3
+    assert _hazard_kind(CellFeatures(0.745, 0.419, 0.890, 0.360, 0.183, 0, 0.401, 0.020, 0, 0)) == "mortal_poison"
+    # Magenta-ringed mortal poison: outside the old 0.87 hue window it read as a
+    # jammer, and with the jammer branch closed it fell through to dark.
+    assert _hazard_kind(CellFeatures(0.922, 0.339, 0.847, 0.312, 0.173, 0, 0.373, 0.102, 0, 0)) == "mortal_poison"
     # Regression values from the live board: hearts must remain normal while
     # the dark jammer with small blue eyes remains a matchable jammer.
     assert _hazard_kind(CellFeatures(0, 0, 0, 0, 0.161, 0, 0.626, 0.006, 0, 0)) is None
@@ -2161,8 +2185,8 @@ def self_check() -> None:
     patch(0, 1, (-45, -10, -25, 10), (220, 40, 100))  # shading/outlier on water
     for col in range(6):
         paint(2, col, (5, 10, 45))  # jammer
-        paint(3, col, (153, 61, 105))  # poison ring, hue 0.92
-        patch(3, col, (-30, -30, 30, 30), (12, 4, 12))  # dark skull glyph
+        paint(3, col, (134, 61, 153))  # poison ring, hue 0.80
+        patch(3, col, (-30, -30, 30, 30), (230, 220, 240))  # white skull glyph
         paint(4, col, (5, 50, 30))  # bomb body
         patch(4, col, (-15, -50, 15, -25), (255, 130, 20))  # fuse
     detected = detect_board_pixels(width, height, bytes(pixels), grid)

@@ -135,6 +135,25 @@ class DirectMaxComboTests(unittest.TestCase):
         self.assertTrue(candidate.condition_results[0].satisfied)
         self.assertGreaterEqual(candidate.direct_combo_count, 7)
 
+    def test_an_unreachable_rule_still_collects_the_combos_a_reachable_one_would(self):
+        # A rule the Board cannot satisfy used to skip the Combo pass entirely,
+        # so this Board stopped at 6 and left a whole wood triple unassembled.
+        board = (
+            (2, 5, 1, 4, 6, 3),
+            (6, 3, 1, 4, 5, 5),
+            (1, 4, 3, 5, 5, 4),
+            (5, 6, 2, 1, 6, 4),
+            (2, 1, 5, 6, 5, 1),
+        )
+        profile = RuleProfile("7 combo", condition_groups=(
+            ConditionGroup.all_of((LeaderCondition.combo_minimum(7),)),
+        ))
+
+        result = search_qualifying_route(board, profile, RouteSearchOptions(attempts=50, max_steps=80))
+
+        candidate = result.qualifying_candidate or result.diagnostic_candidate
+        self.assertGreaterEqual(candidate.direct_combo_count, 7)
+
     def test_layout_never_touches_two_blocks_of_one_key_and_is_shown_as_the_target(self):
         board = (
             (1, 3, 3, 6, 4, 4),
