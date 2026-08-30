@@ -74,9 +74,34 @@ class OrbPrototypeModel:
         self.samples: list[dict[str, object]] = []
         if path is not None and path.exists():
             try:
-                self.samples = json.loads(path.read_text()).get("samples", [])
+                self.samples = self._deduplicated(json.loads(path.read_text()).get("samples", []))
             except (OSError, ValueError):
                 self.samples = []
+        self._keys = {self._key(sample) for sample in self.samples}
+
+    @staticmethod
+    def _key(sample: dict[str, object]) -> tuple:
+        return (sample.get("kind"), sample.get("color"), sample.get("enhanced"),
+                sample.get("locked"), sample.get("visual_class"), sample.get("human"),
+                tuple(sample.get("cell") or ()), tuple(sample.get("feature") or ()))
+
+    @classmethod
+    def _deduplicated(cls, samples: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Drop records identical to one already held.
+
+        Every capture re-learns the whole visible board, so a board seen twice
+        contributes the same feature vectors twice.  Identical records cannot
+        change a prediction -- they neither move a nearest distance nor add a
+        label -- they only make every later prediction scan more samples.
+        """
+        seen: set[tuple] = set()
+        kept = []
+        for sample in samples:
+            key = cls._key(sample)
+            if key not in seen:
+                seen.add(key)
+                kept.append(sample)
+        return kept
 
     @classmethod
     def default(cls) -> "OrbPrototypeModel":
@@ -158,10 +183,18 @@ class OrbPrototypeModel:
             raise OSError("原型模型暫存檔寫入或取代失敗") from exc
 
     def learn(self, orb: object, feature, human: bool,
-              cell: tuple[int, int] | None = None) -> bool:
+              cell: tuple[int, int] | None = None, persist: bool = True) -> bool:
+        """Record one cell.  ``persist=False`` defers the write to ``persist()``.
+
+        The whole store is rewritten on every save, so a board's worth of cells
+        saved one by one rewrites it ROWS*COLS times -- 253MB of writes for a
+        6MB store on a 7x6 Board.  Batch callers defer instead.
+        """
         if not isinstance(orb, Orb) or orb_match_key(orb) is None:
             return False
         record = self._record(orb, feature, human, cell)
+        if self._key(record) in self._keys:
+            return False
         candidate = self.samples
         if human:
             candidate = [
@@ -170,23 +203,35 @@ class OrbPrototypeModel:
                         and sample.get("cell") == record.get("cell"))
             ]
         candidate = [*candidate, record]
-        self._save(candidate)
+        if persist:
+            self._save(candidate)
         self.samples = candidate
+        self._keys = {self._key(sample) for sample in candidate} if human else self._keys | {self._key(record)}
         return True
+
+    def persist(self) -> None:
+        """Write what deferred learns have accumulated."""
+        self._save()
 
     def _predict_sample(self, feature) -> tuple[Orb, float, dict[str, object]] | None:
         candidates = self.samples
         if not candidates:
             return None
         vector = self._feature(feature)
-        scored = sorted(((self._distance(vector, sample["feature"]) + (0 if sample.get("human") else .02), sample)
-                         for sample in candidates),
-                        key=lambda item: item[0])
-        distance, sample = scored[0]
-        label = (sample["kind"], sample.get("color"), sample.get("enhanced"), sample.get("locked"))
-        runner_up = next((score for score, other in scored[1:]
-                          if (other["kind"], other.get("color"), other.get("enhanced"), other.get("locked")) != label),
-                         math.inf)
+        # Only the nearest sample and the nearest differently-labelled one
+        # matter, so keep the best per label in one pass rather than sorting
+        # every sample for every cell.
+        best: tuple[float, dict[str, object], tuple] | None = None
+        nearest: dict[tuple, float] = {}
+        for sample in candidates:
+            score = self._distance(vector, sample["feature"]) + (0 if sample.get("human") else .02)
+            label = (sample["kind"], sample.get("color"), sample.get("enhanced"), sample.get("locked"))
+            if score < nearest.get(label, math.inf):
+                nearest[label] = score
+            if best is None or score < best[0]:
+                best = (score, sample, label)
+        distance, sample, label = best
+        runner_up = min((score for other, score in nearest.items() if other != label), default=math.inf)
         if distance > 0.14 or runner_up - distance < 0.035:
             return None
         return Orb(str(sample["kind"]), sample.get("color"), bool(sample.get("enhanced")),
@@ -632,11 +677,20 @@ class BoardInspectionController:
             return self._detector(width, height, pixels, grid)
         return self._model.detect(width, height, pixels, grid, self._detector)
     def _detect_with_retries(self, width: int, height: int, pixels: bytes, grid: Grid) -> tuple[Board, int]:
+        """Re-read the same source until it resolves, stops changing, or runs out.
+
+        A retry can only help a detector that answers differently -- the source
+        never changes here -- so an answer that repeats ends the attempts.  A
+        board still animating its Combos reads as unknown every time, and that
+        is precisely when a capture would otherwise pay for recognition twice.
+        """
+        previous = None
         for attempt in range(1, self.max_recognition_attempts + 1):
             detected = self._detect(width, height, pixels, grid)
             _board_shape(detected)
-            if not _uncertain_cells(detected):
+            if not _uncertain_cells(detected) or detected == previous:
                 return detected, attempt
+            previous = detected
         return detected, self.max_recognition_attempts
 
 
@@ -647,18 +701,23 @@ class BoardInspectionController:
             return ""
         grid = state.calibration.to_grid()
         learned = 0
-        for row in range(pad_router.ROWS):
-            for col in range(pad_router.COLS):
-                try:
-                    feature = _cell_features(state.width, state.height, state.pixels,
-                                             grid.point(row, col), grid.cell)
-                except ValueError:
-                    continue
+        try:
+            for row in range(pad_router.ROWS):
+                for col in range(pad_router.COLS):
+                    try:
+                        feature = _cell_features(state.width, state.height, state.pixels,
+                                                 grid.point(row, col), grid.cell)
+                    except ValueError:
+                        continue
+                    with self._learning_write_lock:
+                        if not self._learning_enabled or self._learning_disable_requested.is_set():
+                            return f"{label}已學習（{learned} 格{data_label}）" if learned else ""
+                        learned += self._model.learn(state.board[row][col], feature, human=False,
+                                                     cell=(row, col), persist=False)
+        finally:
+            if learned:
                 with self._learning_write_lock:
-                    if not self._learning_enabled or self._learning_disable_requested.is_set():
-                        return f"{label}已學習（{learned} 格{data_label}）" if learned else ""
-                    learned += self._model.learn(state.board[row][col], feature, human=False,
-                                                 cell=(row, col))
+                    self._model.persist()
         return f"{label}已學習（{learned} 格{data_label}）" if learned else ""
 
     def accept_current_board(self) -> BoardInspectionState:

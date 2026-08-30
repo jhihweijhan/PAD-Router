@@ -273,6 +273,56 @@ class PrototypeCompatibilityTests(unittest.TestCase):
         self.assertEqual(detected, baseline)
 
 
+class PrototypeStoreTests(unittest.TestCase):
+    """The store is rewritten whole, so repeats and per-cell writes both hurt."""
+
+    def setUp(self):
+        handle, path = tempfile.mkstemp(suffix=".json")
+        os.close(handle)
+        self.path = Path(path)
+        self.path.unlink(missing_ok=True)
+        self.addCleanup(lambda: self.path.unlink(missing_ok=True))
+        self.feature = NormalColorTextureTests._feature(.25)
+
+    def test_an_identical_observation_is_not_stored_twice(self):
+        model = OrbPrototypeModel(self.path)
+        orb = Orb("normal", 3)
+        self.assertTrue(model.learn(orb, self.feature, human=False, cell=(0, 0)))
+        self.assertFalse(model.learn(orb, self.feature, human=False, cell=(0, 0)))
+        self.assertEqual(len(model.samples), 1)
+        self.assertEqual(len(OrbPrototypeModel(self.path).samples), 1)
+
+    def test_a_different_cell_is_still_stored(self):
+        model = OrbPrototypeModel(self.path)
+        orb = Orb("normal", 3)
+        model.learn(orb, self.feature, human=False, cell=(0, 0))
+        self.assertTrue(model.learn(orb, self.feature, human=False, cell=(0, 1)))
+        self.assertEqual(len(model.samples), 2)
+
+    def test_loading_drops_duplicates_already_on_disk(self):
+        model = OrbPrototypeModel(self.path)
+        model.learn(Orb("normal", 3), self.feature, human=False, cell=(0, 0))
+        doubled = json.loads(self.path.read_text())["samples"] * 4
+        self.path.write_text(json.dumps({"samples": doubled}))
+        self.assertEqual(len(OrbPrototypeModel(self.path).samples), 1)
+
+    def test_deferred_learns_write_once(self):
+        model = OrbPrototypeModel(self.path)
+        for column in range(6):
+            model.learn(Orb("normal", 3), NormalColorTextureTests._feature(.25 + column / 100),
+                        human=False, cell=(0, column), persist=False)
+        self.assertFalse(self.path.exists())
+        model.persist()
+        self.assertEqual(len(OrbPrototypeModel(self.path).samples), 6)
+
+    def test_a_human_correction_replaces_the_implicit_sample(self):
+        model = OrbPrototypeModel(self.path)
+        model.learn(Orb("normal", 3), self.feature, human=False, cell=(0, 0))
+        self.assertTrue(model.learn(Orb("normal", 4), self.feature, human=True, cell=(0, 0)))
+        self.assertEqual([(sample["color"], sample["human"]) for sample in model.samples],
+                         [(4, True)])
+
+
 class BoardInspectionControllerTests(unittest.TestCase):
     def setUp(self):
         self.board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
@@ -2456,17 +2506,18 @@ class RecognitionRetryControllerTests(unittest.TestCase):
         self.assertIn("主動辨識第 1/2 次", state.status)
         self.assertIn("已提前停止", state.status)
 
-    def test_retry_limit_five_preserves_unknown_board(self):
+    def test_retry_stops_once_the_answer_repeats(self):
         unknown = self._unknown_board()
         controller, calls = self._controller([unknown] * 5, max_attempts=5)
 
         state = controller.load_png(self.path)
 
-        self.assertEqual(len(calls), 5)
+        # The source never changes, so a repeated answer ends the attempts.
+        self.assertEqual(len(calls), 2)
         self.assertEqual(state.uncertain_cells, tuple(
             (row, col) for row in range(ROWS) for col in range(COLS)
         ))
-        self.assertIn("主動辨識第 5/5 次", state.status)
+        self.assertIn("主動辨識第 2/5 次", state.status)
 
     def test_calibration_uses_the_same_retry_flow(self):
         controller, calls = self._controller(
@@ -2544,17 +2595,18 @@ class RecognitionRetryControllerTests(unittest.TestCase):
         self.assertIn("主動辨識第 1/2 次", state.status)
         self.assertIn("已提前停止", state.status)
 
-    def test_retry_limit_five_preserves_unknown_board(self):
+    def test_retry_stops_once_the_answer_repeats(self):
         unknown = self._unknown_board()
         controller, calls = self._controller([unknown] * 5, max_attempts=5)
 
         state = controller.load_png(self.path)
 
-        self.assertEqual(len(calls), 5)
+        # The source never changes, so a repeated answer ends the attempts.
+        self.assertEqual(len(calls), 2)
         self.assertEqual(state.uncertain_cells, tuple(
             (row, col) for row in range(ROWS) for col in range(COLS)
         ))
-        self.assertIn("主動辨識第 5/5 次", state.status)
+        self.assertIn("主動辨識第 2/5 次", state.status)
 
     def test_calibration_uses_the_same_retry_flow(self):
         controller, calls = self._controller(
