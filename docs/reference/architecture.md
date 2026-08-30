@@ -40,12 +40,14 @@ flowchart LR
 ### `pad_router.py`
 
 - `Orb`：基本色／危害珠及 `enhanced`、`locked` 等可觀察狀態。
-- `Grid`：把 6×5 格子映射到截圖像素座標。
+- `Grid`：把盤面格子映射到截圖像素座標。
+- `infer_calibration` / `_measure_board`：PAD 用黑底框住盤面，因此直接從像素量測盤面邊界——最後一列有內容的位置即底邊，該區帶內亮像素的左右界即側邊，cell = 寬度 ÷ COLS。實機量測（SM-A1560）證實 7×6 盤面**不會**像 6×5 那樣占滿寬度：實際為 left 23、top 1381、cell 147（真值 23–26 / 1381 / 146.5），量測結果 42 格辨識全對。量不到時才退回置中並貼齊底部的推估值。
 - `detect_board_pixels`／`detect_board`：先判斷危害珠，再用固定 HSV prototype 與局部中心特徵辨識基本色；信心不足回傳 `unknown`。
 - `resolve_matches`、`settle`：依橫／縱三連與既有連通規則計算 Match，`cascade` 決定是否繼續處理落下後的 Match。
 - `RuleProfile`、`LeaderCondition`、`ConditionGroup`、`ExternalCondition`：描述條件群組、外部條件與危害策略，並可序列化成 JSON。
 - `evaluate_manual_route`：驗證路徑並回傳 `RouteEvaluation`，包含 Match rounds、Combo、條件結果、危害結果及 `execution_eligible`。
-- `max_combo_layout`：列舉 5x6 的 22 種 3 格方塊鋪法並指派珠種，回傳本盤面可達的目標版型與其 Combo 數；workspace 顯示結果。
+- `max_combo_layout`：列舉盤面的 3 格方塊鋪法（6×5 有 22 種，7×6 有 155 種）並指派珠種，回傳本盤面可達的目標版型與其 Combo 數；workspace 顯示結果。
+- `set_board_size` / `board_label` / `max_combo_ceiling`：切換 6×5 與 7×6 盤面。盤面大小是模組層級開關，`ROWS`／`COLS` 需以 `pad_router.ROWS` 形式讀取才會跟著切換。
 - `_max_combo_route`：專用最大 Combo 束搜尋，節點只算首輪 Match 與剩餘珠三連距離，束寬 `max(30, attempts * 12)`。可用 `path`／`keep` 從既有路徑接續，保留已成立的 Match 格子，讓有條件的搜尋排完形狀後繼續衝 Combo。
 - `search_qualifying_route`：固定 seed 的隨機嘗試加條件束搜尋；支援 callback 回報實際 attempts/conditions/max_combo 階段與 cooperative cancellation，取消結果會標記 `RouteSearchResult.cancelled`。最大 Combo 候選先依首輪直接 Combo 與直接最大 Combo 預估排序，不把落珠連鎖列入排名。
 - `solve`／`score`：CLI 使用的 Combo 導向束搜尋；`score` 保留 Combo 加上同色珠最近曼哈頓距離懲罰的既有語意。

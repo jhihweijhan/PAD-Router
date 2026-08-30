@@ -22,7 +22,11 @@
         <option value="">尚未更新</option>
       </select>
       <button id="refresh" type="button">更新裝置</button>
-      <button id="capture" type="button" disabled>擷取畫面</button>
+      <label for="board-size">盤面</label>
+      <select id="board-size">
+        <option value="6x5">6×5 標準</option>
+        <option value="7x6">7×6 擴張</option>
+      </select>
     </div>
   </header>
 
@@ -34,6 +38,18 @@
           <h2 id="source-heading">原始裝置畫面</h2>
         </div>
         <span id="source-meta" class="muted">尚未擷取</span>
+      </div>
+      <div id="action-rail" class="action-rail" aria-label="主要操作">
+        <button id="capture" type="button" disabled>擷取畫面</button>
+        <button id="execute-route" type="button" class="primary-action" disabled>執行路徑</button>
+        <button id="stop-execution" type="button" disabled>停止（安全放手後生效）</button>
+        <label class="move-delay-control" for="move-delay">
+          <span>MOVE 間隔（秒）</span>
+          <input id="move-delay" type="number" min="0" step="0.01" value="0.04"
+                 inputmode="decimal" aria-describedby="move-delay-note">
+        </label>
+        <span id="move-delay-note" class="muted">預設 0.04；沿用目前實機安全基準</span>
+        <label><input id="learning-enabled" type="checkbox"> <span id="learning-status">AI 模型學習：關閉</span></label>
       </div>
       <div class="source-viewport">
         <div id="source-empty" class="empty-state">
@@ -53,7 +69,7 @@
           </div>
           <strong id="projected-combo" class="combo-badge">— Combo</strong>
         </div>
-        <div id="route-preview-grid" class="board-grid" role="grid" aria-label="拖曳後 5 列 6 欄盤面"></div>
+        <div id="route-preview-grid" class="board-grid" role="grid" aria-label="拖曳後盤面"></div>
         <p id="route-preview-status" class="review-status" role="status" aria-live="polite">尚未有選定路徑。</p>
       </section>
       <p class="ground-truth-note">原始截圖保持不變；盤面檢視與人工修正只更新右側受控資料。</p>
@@ -135,7 +151,7 @@
           <strong id="unknown-count" class="count-badge">未知 0</strong>
         </div>
         <p id="review-status" class="review-status" role="status" aria-live="polite">尚未載入盤面。</p>
-        <div id="board-grid" class="board-grid" role="grid" aria-label="5 列 6 欄盤面"></div>
+        <div id="board-grid" class="board-grid" role="grid" aria-label="盤面"></div>
         <p id="selected-cell" class="selected-cell" aria-live="polite">尚未選取盤面格</p>
 
         <div class="correction-controls">
@@ -166,14 +182,7 @@
           <button id="clear-protect" type="button" disabled>清除保護</button>
         </div>
         <p id="execution-gate" class="execution-gate">尚未載入盤面。</p>
-        <div class="execution-controls" aria-label="路徑核准與執行">
-          <div class="execution-actions">
-            <button id="approve-route" type="button" disabled>核准目前路徑</button>
-            <button id="execute-route" type="button" class="primary-action" disabled>執行目前路徑</button>
-            <button id="stop-execution" type="button" disabled>停止（安全放手後生效）</button>
-          </div>
-          <p id="execution-status" class="execution-status" role="status" aria-live="polite">尚未執行路徑。</p>
-        </div>
+        <p id="execution-status" class="execution-status" role="status" aria-live="polite">尚未執行路徑。</p>
 
       <details id="planning-controls" class="planning-controls">
         <summary>規則與路徑搜尋</summary>
@@ -186,7 +195,11 @@
               <option>至少 7 Combo</option>
               <option>至少 8 Combo</option>
               <option>至少 9 Combo</option>
-              <option>至少 10 Combo（5x6 上限）</option>
+              <option>至少 10 Combo（6×5 上限）</option>
+              <option>至少 11 Combo</option>
+              <option>至少 12 Combo</option>
+              <option>至少 13 Combo</option>
+              <option>至少 14 Combo（7×6 上限）</option>
               <option>消除火珠</option>
               <option>消除水珠</option>
               <option>消除木珠</option>
@@ -220,7 +233,11 @@
               <option>至少 7 Combo</option>
               <option>至少 8 Combo</option>
               <option>至少 9 Combo</option>
-              <option>至少 10 Combo（5x6 上限）</option>
+              <option>至少 10 Combo（6×5 上限）</option>
+              <option>至少 11 Combo</option>
+              <option>至少 12 Combo</option>
+              <option>至少 13 Combo</option>
+              <option>至少 14 Combo（7×6 上限）</option>
               <option>消除火珠</option>
               <option>消除水珠</option>
               <option>消除木珠</option>
@@ -254,7 +271,11 @@
               <option>至少 7 Combo</option>
               <option>至少 8 Combo</option>
               <option>至少 9 Combo</option>
-              <option>至少 10 Combo（5x6 上限）</option>
+              <option>至少 10 Combo（6×5 上限）</option>
+              <option>至少 11 Combo</option>
+              <option>至少 12 Combo</option>
+              <option>至少 13 Combo</option>
+              <option>至少 14 Combo（7×6 上限）</option>
               <option>消除火珠</option>
               <option>消除水珠</option>
               <option>消除木珠</option>

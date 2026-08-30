@@ -19,23 +19,25 @@ import threading
 import zlib
 from copy import deepcopy
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
+import pad_router
 from pad_router import (
-    COLS,
     ConditionGroup,
     ExternalCondition,
     HAZARDS,
     LeaderCondition,
     NAMES,
-    ROWS,
     Grid,
     Orb,
     PlayVerification,
     RouteEvaluation,
     RouteSearchOptions,
+    board_label,
+    max_combo_ceiling,
     max_combo_layout,
     RouteSearchResult,
     RuleProfile,
@@ -59,6 +61,9 @@ Board = tuple[tuple[object, ...], ...]
 Detector = Callable[[int, int, bytes, Grid], Board]
 Capture = Callable[[str], Screenshot]
 Executor = Callable[..., bool | PlayVerification]
+
+# Keep the measured 0.04-second pacing until a real-device run justifies changing it.
+DEFAULT_MOVE_DELAY = 0.04
 
 
 class OrbPrototypeModel:
@@ -195,8 +200,8 @@ class OrbPrototypeModel:
         board = [list(row) for row in baseline(width, height, pixels, grid)]
         if not self.samples:
             return tuple(map(tuple, board))
-        for row in range(ROWS):
-            for col in range(COLS):
+        for row in range(pad_router.ROWS):
+            for col in range(pad_router.COLS):
                 try:
                     feature = _cell_features(width, height, pixels, grid.point(row, col), grid.cell)
                 except ValueError:
@@ -222,15 +227,13 @@ ORB_LABELS = {
 }
 ORB_KINDS = {label: kind for kind, label in ORB_LABELS.items()}
 
+_COMBO_CEILINGS = {10: "（6×5 上限）", 14: "（7×6 上限）"}
 CONDITION_PRESETS = {
     "不限（以最大 Combo 為主）": (),
-    "至少 3 Combo": (LeaderCondition.combo_minimum(3),),
-    "至少 5 Combo": (LeaderCondition.combo_minimum(5),),
-    "至少 7 Combo": (LeaderCondition.combo_minimum(7),),
-    # 上限依 pazuma「最大火力配置：コンボ」的 2 色盤面表，5x6 在 15-15 分佈時為 10 Combo。
-    "至少 8 Combo": (LeaderCondition.combo_minimum(8),),
-    "至少 9 Combo": (LeaderCondition.combo_minimum(9),),
-    "至少 10 Combo（5x6 上限）": (LeaderCondition.combo_minimum(10),),
+    # 上限依 pazuma「最大火力配置：コンボ」的 2 色盤面表：6×5 盤面 15-15 分佈為 10 Combo，
+    # 7×6 盤面 42 顆珠 21-21 分佈為 14 Combo（每 3 顆一組直線鋪滿整個盤面）。
+    **{f"至少 {minimum} Combo{_COMBO_CEILINGS.get(minimum, '')}": (LeaderCondition.combo_minimum(minimum),)
+       for minimum in (3, 5, 7, 8, 9, 10, 11, 12, 13, 14)},
     "消除火珠": (LeaderCondition.attribute("fire"),),
     "消除水珠": (LeaderCondition.attribute("water"),),
     "消除木珠": (LeaderCondition.attribute("wood"),),
@@ -263,7 +266,7 @@ EXTERNAL_CONDITIONS = {
 }
 CASCADE_OPTIONS = {"計入落珠連鎖": True, "只計轉珠直接消除": False}
 _OPERATIONAL_MUTATION_CONFLICTS = frozenset({
-    "approve", "approve_route", "correct", "correct_cell",
+    "correct", "correct_cell", "set_board_size",
     "protect_cell", "set_protected_cell",
     "set_rule_profile", "update_rules", "import_rule_profile", "import_profile",
     "execute", "execute_route",
@@ -297,7 +300,7 @@ def rule_profile_from_selections(condition_selections: Iterable[tuple[str, str] 
 
 @dataclass(frozen=True)
 class BoardCalibration:
-    """Top-left pixel and cell size for a Standard Board."""
+    """Top-left pixel and cell size for the current Board."""
 
     left: int = 0
     top: int = 1380
@@ -308,27 +311,62 @@ class BoardCalibration:
             raise ValueError("截圖尺寸必須為正數")
         if self.left < 0 or self.top < 0 or self.cell <= 0:
             raise ValueError("校正座標不可為負數，格寬必須為正數")
-        if self.left + COLS * self.cell > width or self.top + ROWS * self.cell > height:
-            raise ValueError("校正範圍必須讓 6×5 標準盤面完整位於截圖內")
+        if self.left + pad_router.COLS * self.cell > width or self.top + pad_router.ROWS * self.cell > height:
+            raise ValueError(f"校正範圍必須讓 {board_label()} 盤面完整位於截圖內")
 
     def to_grid(self) -> Grid:
         return Grid(self.left, self.top, self.cell)
 
 
-def infer_calibration(width: int, height: int) -> BoardCalibration:
-    """Choose the legacy calibration when it fits, otherwise center a board."""
+_LIT = 24  # Mean channel value separating drawn pixels from the black frame.
 
-    legacy = BoardCalibration()
-    try:
-        legacy.validate(width, height)
-    except ValueError:
-        cell = min(width // COLS, height // ROWS)
-        if cell <= 0:
-            raise ValueError("截圖太小，無法容納 6×5 標準盤面")
-        legacy = BoardCalibration((width - COLS * cell) // 2,
-                                  (height - ROWS * cell) // 2, cell)
-        legacy.validate(width, height)
-    return legacy
+
+def _measure_board(width: int, height: int, pixels: bytes) -> BoardCalibration | None:
+    """Read the Board's own edges out of the screenshot.
+
+    PAD frames the Board in black and pins it to the bottom of the play area, so
+    its bottom edge is the last lit row and its side edges are where that band's
+    lit pixels stop.  Measuring beats assuming: a 7x6 Board is *not* drawn full
+    width the way the 6x5 Board is (on the SM-A1560 it measures left 23, cell
+    147, top 1381), and a tight crop of a Board reports its own full extent.
+    """
+    def lit(x: int, y: int) -> bool:
+        return sum(pixels[(y * width + x) * 4:(y * width + x) * 4 + 3]) / 3 > _LIT
+
+    columns = range(0, width, 8)
+    bottom = next((y + 1 for y in range(height - 1, -1, -1)
+                   if sum(sum(pixels[(y * width + x) * 4:(y * width + x) * 4 + 3]) / 3
+                          for x in columns) / len(columns) > _LIT), 0)
+    # A band inside the Board's lower rows: at most a third of it, whatever the
+    # real cell size turns out to be, since the Board is never wider than the
+    # screenshot.
+    band = range(max(0, bottom - pad_router.ROWS * (width // pad_router.COLS) // 3), bottom)
+    edges = [x for x in range(width) if any(lit(x, y) for y in band)]
+    if not edges:
+        return None
+    cell = (edges[-1] + 1 - edges[0]) // pad_router.COLS
+    top = bottom - pad_router.ROWS * cell
+    if cell <= 0 or top < 0:
+        return None
+    return BoardCalibration(edges[0], top, cell)
+
+
+def infer_calibration(width: int, height: int, pixels: bytes | None = None) -> BoardCalibration:
+    """Measure the Board in the screenshot, falling back to a bottom-anchored fit."""
+    measured = _measure_board(width, height, pixels) if pixels is not None else None
+    if measured is not None:
+        try:
+            measured.validate(width, height)
+            return measured
+        except ValueError:
+            pass
+    cell = min(width // pad_router.COLS, height // pad_router.ROWS)
+    if cell <= 0:
+        raise ValueError(f"截圖太小，無法容納 {board_label()} 盤面")
+    calibration = BoardCalibration((width - pad_router.COLS * cell) // 2,
+                                   height - pad_router.ROWS * cell, cell)
+    calibration.validate(width, height)
+    return calibration
 
 
 def _paeth(left: int, above: int, upper_left: int) -> int:
@@ -447,17 +485,17 @@ def decode_png(path: str | Path) -> Screenshot:
                 raise ValueError("PNG 調色盤索引超出範圍")
             red, green, blue = (palette or b"")[palette_offset:palette_offset + 3]
             alpha = transparency[palette_index] if transparency and palette_index < len(transparency) else 255
-        result[index * 4:index * 4 + 4] = bytes((blue, green, red, alpha))
+        result[index * 4:index * 4 + 4] = bytes((red, green, blue, alpha))
     return width, height, bytes(result)
 
 
 def _board_shape(board: Board) -> None:
-    if len(board) != ROWS or any(len(row) != COLS for row in board):
-        raise ValueError("辨識器必須回傳 5×6 盤面")
+    if len(board) != pad_router.ROWS or any(len(row) != pad_router.COLS for row in board):
+        raise ValueError(f"辨識器必須回傳 {board_label()} 盤面")
 
 
 def _uncertain_cells(board: Board) -> tuple[tuple[int, int], ...]:
-    return tuple((row, col) for row in range(ROWS) for col in range(COLS)
+    return tuple((row, col) for row in range(pad_router.ROWS) for col in range(pad_router.COLS)
                  if orb_match_key(board[row][col]) is None)
 
 
@@ -506,7 +544,6 @@ class BoardInspectionState:
     status: str = "尚未載入來源"
     rule_profile: RuleProfile | None = None
     route_evaluation: RouteEvaluation | None = None
-    route_approved: bool = False
     verification: PlayVerification | None = None
     route_search: RouteSearchResult | None = None
     route_overlay: tuple[dict[str, object], ...] = ()
@@ -533,6 +570,10 @@ class BoardInspectionController:
         self._capture = capture
         self._executor = executor
         self._model = model
+        self._learning_toggle_lock = threading.Lock()
+        self._learning_write_lock = threading.Lock()
+        self._learning_enabled = False
+        self._learning_disable_requested = threading.Event()
         self._max_recognition_attempts = 2
         self.max_recognition_attempts = max_recognition_attempts
         self.state = BoardInspectionState()
@@ -546,6 +587,45 @@ class BoardInspectionController:
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
             raise ValueError("主動辨識次數必須是 1 到 5 的整數")
         self._max_recognition_attempts = value
+
+    @property
+    def learning_enabled(self) -> bool:
+        with self._learning_write_lock:
+            return self._learning_enabled
+
+    def set_learning_enabled(self, enabled: bool) -> BoardInspectionState:
+        if not isinstance(enabled, bool):
+            raise ValueError("AI 模型學習設定必須是布林值")
+        with self._learning_toggle_lock:
+            if not enabled:
+                self._learning_disable_requested.set()
+            with self._learning_write_lock:
+                self._learning_enabled = enabled
+                if enabled:
+                    self._learning_disable_requested.clear()
+            self.state = replace(
+                self.state, learning_status=f"AI 模型學習：{'開啟' if enabled else '關閉'}",
+            )
+            return self.state
+
+    def set_board_size(self, name: str) -> BoardInspectionState:
+        """Switch between the 6×5 Standard Board and the 7×6 Board a 76 leader grants."""
+        if name not in pad_router.BOARD_SIZES:
+            raise ValueError("盤面大小必須是 6x5 或 7x6")
+        if pad_router.BOARD_SIZES[name] == (pad_router.ROWS, pad_router.COLS):
+            return self.state
+        # ponytail: the board size is a module-wide switch, so one controller at
+        # a time; per-controller sizes would mean threading it through every
+        # pad_router function.
+        pad_router.set_board_size(*pad_router.BOARD_SIZES[name])
+        state = self.state
+        if state.width is None or state.height is None or state.pixels is None:
+            self.state = replace(BoardInspectionState(status=f"盤面大小已改為 {board_label()}"),
+                                 rule_profile=state.rule_profile)
+            return self.state
+        # The old board has the wrong shape now, so re-read the same screenshot.
+        return self._with_source((state.width, state.height, state.pixels),
+                                 state.source_name or "source", auto_search=False)
 
     def _detect(self, width: int, height: int, pixels: bytes, grid: Grid) -> Board:
         if self._model is None:
@@ -567,15 +647,18 @@ class BoardInspectionController:
             return ""
         grid = state.calibration.to_grid()
         learned = 0
-        for row in range(ROWS):
-            for col in range(COLS):
+        for row in range(pad_router.ROWS):
+            for col in range(pad_router.COLS):
                 try:
                     feature = _cell_features(state.width, state.height, state.pixels,
                                              grid.point(row, col), grid.cell)
                 except ValueError:
                     continue
-                learned += self._model.learn(state.board[row][col], feature, human=False,
-                                             cell=(row, col))
+                with self._learning_write_lock:
+                    if not self._learning_enabled or self._learning_disable_requested.is_set():
+                        return f"{label}已學習（{learned} 格{data_label}）" if learned else ""
+                    learned += self._model.learn(state.board[row][col], feature, human=False,
+                                                 cell=(row, col))
         return f"{label}已學習（{learned} 格{data_label}）" if learned else ""
 
     def accept_current_board(self) -> BoardInspectionState:
@@ -594,14 +677,16 @@ class BoardInspectionController:
                                      grid.point(row, col), grid.cell)
         except ValueError:
             return
-        self._model.learn(orb, feature, human=True, cell=(row, col))
+        with self._learning_write_lock:
+            if self._learning_enabled and not self._learning_disable_requested.is_set():
+                self._model.learn(orb, feature, human=True, cell=(row, col))
 
     def _with_source(self, source: Screenshot, source_name: str,
                      auto_search: bool = True) -> BoardInspectionState:
         width, height, pixels = source
         if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
-            raise ValueError("截圖必須包含 width×height 個 BGRA 像素")
-        calibration = infer_calibration(width, height)
+            raise ValueError("截圖必須包含 width×height 個 RGBA 像素")
+        calibration = infer_calibration(width, height, pixels)
         learned = self._learn_implicit()
         detected, recognition_attempts = self._detect_with_retries(
             width, height, pixels, calibration.to_grid()
@@ -614,8 +699,8 @@ class BoardInspectionController:
                         recognition_attempts: int = 1,
                         auto_search: bool = True) -> BoardInspectionState:
         uncertain = _uncertain_cells(detected)
-        status = (f"已載入 {source_name}；有 {len(uncertain)} 格需要手動修正"
-                  if uncertain else f"已載入 {source_name}；辨識完成")
+        status = (f"盤面辨識完成：已載入 {source_name}；有 {len(uncertain)} 格需要手動修正"
+                  if uncertain else f"盤面辨識完成：已載入 {source_name}")
         status += f"；主動辨識第 {recognition_attempts}/{self.max_recognition_attempts} 次"
         if uncertain:
             status += "；仍有問號，請手動修正"
@@ -625,7 +710,8 @@ class BoardInspectionController:
             status += f"；{learned}"
         state = BoardInspectionState(source_name, source[0], source[1], source[2], calibration,
                                      detected, detected, detected if not uncertain else None, not uncertain,
-                                     uncertain, (), status, learning_status=learned or "目前畫面尚未學習")
+                                     uncertain, (), status,
+                                     learning_status=learned or ("目前畫面尚未學習" if self.learning_enabled else "AI 模型學習：關閉"))
         state = replace(state, rule_profile=self.state.rule_profile,
                         protected_cell=self.state.protected_cell)
         self.state = self._with_overlay(state)
@@ -641,7 +727,7 @@ class BoardInspectionController:
         overlay = tuple({"cell": (row, col), "x": grid.point(row, col)[0],
                          "y": grid.point(row, col)[1], "label": orb_display(source_board[row][col]),
                          "uncertain": (row, col) in state.uncertain_cells}
-                         for row in range(ROWS) for col in range(COLS))
+                         for row in range(pad_router.ROWS) for col in range(pad_router.COLS))
         return replace(state, overlay=overlay)
 
     def _route_overlay(self, result: RouteEvaluation | None) -> tuple[dict[str, object], ...]:
@@ -673,7 +759,7 @@ class BoardInspectionController:
                 "height": state.height,
                 "image": _screenshot_image((state.width, state.height, state.pixels)),
             }
-        return {"source": source, "status": state.status}
+        return {"source": source, "status": state.status, "learning_enabled": self.learning_enabled}
 
     def set_calibration(self, calibration: BoardCalibration,
                         auto_search: bool = True) -> BoardInspectionState:
@@ -707,8 +793,8 @@ class BoardInspectionController:
     def correct_cell(self, row: int, col: int, value: object) -> BoardInspectionState:
         if self.state.board is None:
             raise ValueError("請先載入圖片或擷取裝置畫面，再修正珠子")
-        if not (0 <= row < ROWS and 0 <= col < COLS):
-            raise ValueError("珠子必須位於 6×5 標準盤面內")
+        if not (0 <= row < pad_router.ROWS and 0 <= col < pad_router.COLS):
+            raise ValueError(f"珠子必須位於 {board_label()} 盤面內")
         board = [list(items) for items in self.state.board]
         orb = _coerce_orb(value)
         board[row][col] = orb
@@ -718,10 +804,12 @@ class BoardInspectionController:
         updated = replace(self.state, board=updated_board,
                           confirmed_board=updated_board if not uncertain else None,
                           confirmed=not uncertain, uncertain_cells=uncertain,
-                          overlay=(), route_evaluation=None, route_approved=False, verification=None,
+                          overlay=(), route_evaluation=None, verification=None,
                           route_search=None, route_overlay=(), search_options=None,
-                          status="珠子已修正並寫入模型；辨識結果已自動更新",
-                          learning_status="人工標記已寫入模型")
+                          status=("珠子已修正並寫入模型；辨識結果已自動更新" if self.learning_enabled
+                                  else "珠子已修正；AI 模型學習已關閉"),
+                          learning_status=("人工標記已寫入模型" if self.learning_enabled
+                                           else "AI 模型學習：關閉"))
         self.state = self._with_overlay(updated)
         return self.state
 
@@ -731,7 +819,7 @@ class BoardInspectionController:
         if self.state.uncertain_cells:
             raise ValueError("請先手動修正無法辨識的珠子，才能確認盤面")
         self.state = replace(self.state, confirmed_board=self.state.board, confirmed=True,
-                             uncertain_cells=(), route_evaluation=None, route_approved=False, verification=None,
+                             uncertain_cells=(), route_evaluation=None, verification=None,
                              route_search=None, route_overlay=(), search_options=None,
                              status="盤面已確認")
         return self.state.board
@@ -740,7 +828,7 @@ class BoardInspectionController:
         if not isinstance(profile, RuleProfile):
             raise TypeError("profile 必須是 RuleProfile")
         self.state = replace(self.state, rule_profile=profile, route_evaluation=None,
-                             route_approved=False, verification=None, route_search=None, route_overlay=(), search_options=None,
+                             verification=None, route_search=None, route_overlay=(), search_options=None,
                              status=f"已套用規則設定：{profile.name}")
         return self.state
 
@@ -776,7 +864,7 @@ class BoardInspectionController:
         if self.state.protected_cell in route:
             raise ValueError("路徑不可碰觸保護格")
         result = evaluate_manual_route(board, route, profile, confirmed=self.state.confirmed, cascade=cascade)
-        self.state = replace(self.state, route_evaluation=result, route_approved=False,
+        self.state = replace(self.state, route_evaluation=result,
                              verification=None,
                              route_search=None, route_overlay=self._route_overlay(result), search_options=None,
                              status=f"路徑已評估：{'符合' if result.qualifying else '不符合'}條件")
@@ -799,7 +887,7 @@ class BoardInspectionController:
                              options: RouteSearchOptions) -> None:
         candidate = result.candidate
         self.state = replace(self.state, route_search=result, route_evaluation=candidate,
-                             route_approved=False, verification=None, route_overlay=self._route_overlay(candidate),
+                             verification=None, route_overlay=self._route_overlay(candidate),
                              search_options=options,
                              status=("搜尋完成：找到符合條件的路徑" if candidate and candidate.qualifying
                                      else "搜尋完成：沒有符合條件的路徑"))
@@ -809,36 +897,23 @@ class BoardInspectionController:
 
     def invalidate_route(self, status: str = "路徑已失效；請確認設定後重新搜尋") -> BoardInspectionState:
         self.state = replace(self.state, route_search=None, route_evaluation=None,
-                             route_approved=False, verification=None, route_overlay=(), search_options=None,
+                             verification=None, route_overlay=(), search_options=None,
                              status=status)
         return self.state
 
-    def approve_route(self, explicit_confirmation: bool = False) -> RouteEvaluation:
-        result = self.state.route_evaluation
-        if result is None or not result.execution_eligible:
-            raise ValueError("僅能核准已確認盤面上、符合條件的路徑")
-        if not explicit_confirmation:
-            raise ValueError("必須明確確認路徑")
-        self.state = replace(self.state, route_approved=True, status="路徑已核准")
-        return result
-
-    def execute_route(self, serial: str, explicit_confirmation: bool = False,
-                      delay: float = 0.04, hold_delay: float = 0.15,
+    def execute_route(self, serial: str,
+                      delay: float = DEFAULT_MOVE_DELAY, hold_delay: float = 0.15,
                       lift_threshold: float = 12.0, max_corrections: int = 2) -> bool:
         result = self.state.route_evaluation
         if (result is None or self.state.confirmed_board is None
                 or not self.state.confirmed or not result.execution_eligible):
             raise ValueError("僅能執行已確認盤面上、符合條件的路徑")
-        if not explicit_confirmation and not self.state.route_approved:
-            raise ValueError("必須明確確認路徑")
         serial = serial.strip()
         if not serial:
             raise ValueError("請選擇裝置")
         calibration = self.state.calibration
         if calibration is None:
             raise ValueError("執行前必須先校正盤面")
-        if explicit_confirmation:
-            self.approve_route(explicit_confirmation=True)
         self.state = replace(self.state, verification=None,
                              status="正在執行路徑；安全 ADB 驗證進行中")
         verification: PlayVerification | None = None
@@ -878,7 +953,7 @@ class BoardInspectionController:
                         if verification.mismatches is not None else "比對結果不確定")
             status = (f"手勢已安全放開；手勢後盤面驗證失敗（{mismatch}）。"
                       "請擷取新盤面後再試。")
-        self.state = replace(self.state, verification=verification, route_approved=False,
+        self.state = replace(self.state, verification=verification,
                              route_search=None, route_evaluation=None, route_overlay=(),
                              search_options=None, status=status)
         return succeeded
@@ -901,7 +976,7 @@ class BoardInspectionController:
                 route = self.state.route_evaluation
                 if route is None or not route.execution_eligible:
                     return publish("連續執行已停止：沒有可執行且符合條件的路徑")
-                if not self.execute_route(serial, explicit_confirmation=True):
+                if not self.execute_route(serial):
                     return publish("連續執行已因執行或驗證失敗停止")
                 if on_state is not None:
                     on_state(self.state)
@@ -953,17 +1028,18 @@ def _format_layout(board, result: RouteEvaluation | None) -> str:
     return f"目標版型（此排法可成立 {goal} Combo，路徑已排出 {result.direct_combo_count}）：\n{rows}"
 
 
+@lru_cache(maxsize=1)
 def _png_from_screenshot(screenshot_data: Screenshot) -> bytes:
     width, height, pixels = screenshot_data
     if width <= 0 or height <= 0 or len(pixels) != width * height * 4:
-        raise ValueError("截圖必須包含 width×height 個 BGRA 像素")
+        raise ValueError("截圖必須包含 width×height 個 RGBA 像素")
     raw = bytearray()
     for row in range(height):
         raw.append(0)
         start = row * width * 4
-        for offset in range(start, start + width * 4, 4):
-            blue, green, red, alpha = pixels[offset:offset + 4]
-            raw.extend((red, green, blue, alpha))
+        # adb screencap reports pixel format 1, RGBA_8888, and Android's own
+        # `screencap -p` encodes those bytes in this order, so they go out as-is.
+        raw.extend(pixels[start:start + width * 4])
 
     def chunk(kind: bytes, payload: bytes) -> bytes:
         return (struct.pack(">I", len(payload)) + kind + payload
@@ -996,8 +1072,8 @@ def _review_cell(cell: object) -> tuple[int, int]:
     row, col = cell
     if (isinstance(row, bool) or not isinstance(row, int)
             or isinstance(col, bool) or not isinstance(col, int)
-            or not (0 <= row < ROWS and 0 <= col < COLS)):
-        raise ValueError("盤面座標必須位於 5×6 標準盤面內")
+            or not (0 <= row < pad_router.ROWS and 0 <= col < pad_router.COLS)):
+        raise ValueError(f"盤面座標必須位於 {board_label()} 盤面內")
     return row, col
 
 
@@ -1210,6 +1286,18 @@ def _capture_search_options(payload: dict[str, object]) -> RouteSearchOptions:
         raise ValueError("capture 的 search 必須是 JSON 物件")
     return _search_options_from_payload(raw, default_attempts=30)
 
+def _move_delay_from_payload(payload: dict[str, object]) -> float:
+    raw = payload.get("delay", DEFAULT_MOVE_DELAY)
+    if isinstance(raw, bool):
+        raise ValueError("MOVE delay 必須是有限的非負數")
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("MOVE delay 必須是有限的非負數") from exc
+    if not math.isfinite(delay) or delay < 0:
+        raise ValueError("MOVE delay 必須是有限的非負數")
+    return delay
+
 
 class BoardInspectionBridge:
     """Serialized, JSON-safe backend surface for the local webview."""
@@ -1297,18 +1385,20 @@ class BoardInspectionBridge:
         return {
             **base,
             "board": _review_board(state.board, selected, protected),
+            "board_size": {"name": f"{pad_router.COLS}x{pad_router.ROWS}", "label": board_label(),
+                           "rows": pad_router.ROWS, "cols": pad_router.COLS,
+                           "max_combo": max_combo_ceiling()},
             "unknown_count": len(state.uncertain_cells),
             "confirmed": state.confirmed,
-            "approval_allowed": bool(state.confirmed and not state.uncertain_cells),
             "selected_cell": list(selected) if selected is not None else None,
             "protected_cell": list(protected) if protected is not None else None,
             "calibration": _calibration_snapshot(state.calibration),
+            "learning_enabled": self.controller.learning_enabled,
             "learning_status": state.learning_status,
             "rule_profile": profile.to_dict() if profile is not None else None,
             "route_result": _route_evaluation_snapshot(state.route_evaluation),
             "route_overlay": _route_overlay_snapshot(state.route_overlay),
             "route_preview": _route_preview_snapshot(state),
-            "route_approved": state.route_approved,
             "search_result": _route_search_snapshot(state.route_search),
         }
 
@@ -1430,7 +1520,6 @@ class BoardInspectionBridge:
                 "generation": self._generation,
                 "result": self._controller_snapshot.get("search_result"),
             },
-            "route_approved": self._controller_snapshot.get("route_approved", False),
             "execution": {
                 "status": self._execution_status,
                 "phase": self._execution_phase,
@@ -1555,7 +1644,7 @@ class BoardInspectionBridge:
             self._controller_snapshot = self._review_snapshot()
         return self._submit(
             "search",
-            "正在搜尋符合規則的路徑",
+            "正在計算並搜尋路徑",
             lambda: self._search_operation(
                 generation, board, profile, options, confirmed, protected, cancel
             ),
@@ -1582,25 +1671,26 @@ class BoardInspectionBridge:
                      else "warning" if status == "stopped" else "error")
             self._announce(level, "execution", message)
 
-    def _run_execution(self, serial: str, stop_event: threading.Event) -> None:
+    def _run_execution(self, serial: str, stop_event: threading.Event,
+                       delay: float = DEFAULT_MOVE_DELAY) -> None:
         verification = None
         try:
             self._execution_announce(
                 "acceptance",
-                "執行準備：正在接受目前盤面並完成低權重學習",
+                "執行準備：正在接受目前盤面",
             )
             self.controller.accept_current_board()
             if stop_event.is_set():
                 self._finish_execution(
                     "stopped",
-                    "停止已生效：低權重學習已完成，尚未開始手勢。",
+                    "停止已生效：目前盤面已接受，尚未開始手勢。",
                 )
                 return
             self._execution_announce(
                 "gesture",
                 "正在執行手勢；停止要求將於目前手勢安全放手後生效",
             )
-            succeeded = self.controller.execute_route(serial)
+            succeeded = self.controller.execute_route(serial, delay=delay)
             verification = _verification_snapshot(self.controller.state.verification)
             if verification is not None:
                 with self._lock:
@@ -1608,7 +1698,7 @@ class BoardInspectionBridge:
                 mismatch = verification["mismatches"]
                 detail = ("成功（0 格不符）" if verification["success"]
                           else f"失敗（{mismatch if mismatch is not None else '未知'} 格不符）")
-                self._execution_announce("verification", f"手勢後盤面驗證：{detail}",
+                self._execution_announce("verification", f"正在驗證結果：手勢後盤面驗證：{detail}",
                                          "success" if verification["success"] else "warning")
             if stop_event.is_set():
                 self._finish_execution(
@@ -1631,7 +1721,7 @@ class BoardInspectionBridge:
         except Exception as exc:
             self._finish_execution("failed", f"執行失敗：{exc}", verification)
 
-    def _start_execution(self, serial: object) -> dict[str, object]:
+    def _start_execution(self, serial: object, delay: float = DEFAULT_MOVE_DELAY) -> dict[str, object]:
         with self._lock:
             if self._execution_busy:
                 self._announce("warning", "execution", "執行中；命令已拒絕")
@@ -1646,9 +1736,8 @@ class BoardInspectionBridge:
                 raise ValueError("請先更新並選擇 Android 裝置")
             state = self.controller.state
             result = state.route_evaluation
-            if (result is None or not state.confirmed
-                    or not result.execution_eligible or not state.route_approved):
-                raise ValueError("僅能執行目前已核准、確認且符合條件的路徑")
+            if result is None or not state.confirmed or not result.execution_eligible:
+                raise ValueError("僅能執行目前已確認且符合條件的路徑")
             serial = serial.strip()
             self._execution_busy = True
             self._execution_stop_requested = False
@@ -1663,7 +1752,7 @@ class BoardInspectionBridge:
                 "執行準備：接受目前路徑；ADB 手勢尚未開始",
             )
             future = self._execution_executor.submit(
-                self._run_execution, serial, self._execution_stop
+                self._run_execution, serial, self._execution_stop, delay
             )
             self._execution_future = future
             self._future = future
@@ -1885,7 +1974,7 @@ class BoardInspectionBridge:
         action = payload.get("action", payload.get("command"))
         if action not in {
             "snapshot", "events", "drain_events", "stop_execution", "cancel_execution",
-            "export_rule_profile", "export_profile",
+            "export_rule_profile", "export_profile", "set_learning_enabled",
         }:
             with self._lock:
                 if self._execution_busy:
@@ -1900,6 +1989,24 @@ class BoardInspectionBridge:
             return self.snapshot()
         if action in {"events", "drain_events"}:
             return self.drain_events()
+        if action == "set_learning_enabled":
+            enabled = payload.get("enabled")
+            with self._lock:
+                self.controller.set_learning_enabled(enabled)
+                self._controller_snapshot = self._review_snapshot()
+                self._announce("info", "learning", f"AI 模型學習已{'開啟' if enabled else '關閉'}")
+                return self._view_locked()
+        if action == "set_board_size":
+            size = payload.get("size")
+            if size not in pad_router.BOARD_SIZES:
+                raise ValueError("盤面大小必須是 6x5 或 7x6")
+            with self._lock:
+                self._invalidate_generation()
+            return self._submit(
+                "calibration",
+                f"正在切換盤面大小：{size}",
+                lambda: self.controller.set_board_size(size),
+            )
         if action == "refresh_devices":
             return self._submit("devices", "正在更新 Android 裝置清單", self._device_lister)
         if action in {"export_rule_profile", "export_profile"}:
@@ -1926,15 +2033,6 @@ class BoardInspectionBridge:
                 self._selected_device = serial
                 self._announce("info", "device", f"已選擇裝置：{serial}")
                 return self._view_locked()
-        if action in {"approve", "approve_route"}:
-            with self._lock:
-                if self._execution_busy:
-                    self._announce("warning", "execution", "執行中；命令已拒絕")
-                    raise ValueError("執行中；請等待目前手勢安全結束")
-                self.controller.approve_route(explicit_confirmation=True)
-                self._controller_snapshot = self._review_snapshot()
-                self._announce("success", "approval", "目前路徑已核准")
-                return {"accepted": True, "snapshot": self._view_locked()}
         if action == "select_cell":
             if self.controller.state.board is None:
                 raise ValueError("請先擷取裝置畫面，再選取盤面格")
@@ -1999,6 +2097,7 @@ class BoardInspectionBridge:
                     infer_calibration(
                         self.controller.state.width or 0,
                         self.controller.state.height or 0,
+                        self.controller.state.pixels,
                     ),
                     auto_search=False,
                 ),
@@ -2031,7 +2130,8 @@ class BoardInspectionBridge:
         if action in {"execute", "execute_route"}:
             with self._lock:
                 serial = self._selected_device if payload.get("serial") is None else payload.get("serial")
-            return self._start_execution(serial)
+            delay = _move_delay_from_payload(payload)
+            return self._start_execution(serial, delay)
         if action in {"stop_execution", "cancel_execution"}:
             return self._stop_execution()
 
@@ -2046,7 +2146,7 @@ class BoardInspectionBridge:
                 self._invalidate_generation()
             return self._submit(
                 "capture",
-                f"正在擷取裝置畫面：{serial}",
+                f"正在擷取畫面並辨識盤面：{serial}",
                 lambda: (
                     self.controller.capture_device(serial, auto_search=False),
                     search_options,

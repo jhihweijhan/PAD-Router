@@ -550,7 +550,7 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         self.assertIn("0 combos; need at least 1", result.diagnostic)
         self.assertFalse(result.diagnostic_candidate.execution_eligible)
 
-    def test_controller_auto_confirms_clean_board_but_keeps_execution_locked_until_route_approval(self):
+    def test_controller_auto_confirms_clean_board_and_invalidates_routes_on_profile_change(self):
         board = ((1, 1, 1, 2, 2, 2), (3, 4, 5, 6, 3, 4),
                  (4, 5, 6, 3, 4, 5), (5, 6, 3, 4, 5, 6),
                  (6, 3, 4, 5, 6, 3))
@@ -564,15 +564,8 @@ class ManualRouteEvaluationTests(unittest.TestCase):
         controller.set_rule_profile(profile)
         confirmed = controller.evaluate_manual_route(((0, 0),))
         self.assertTrue(confirmed.execution_eligible)
-        with self.assertRaisesRegex(ValueError, "明確確認"):
-            controller.execute_route("test-device")
-        with self.assertRaises(ValueError):
-            controller.approve_route()
-        controller.approve_route(explicit_confirmation=True)
-        self.assertTrue(controller.state.route_approved)
         controller.set_rule_profile(RuleProfile("changed"))
         self.assertIsNone(controller.state.route_evaluation)
-        self.assertFalse(controller.state.route_approved)
 
 
 class SearchProgressTests(unittest.TestCase):
@@ -633,6 +626,47 @@ class SearchProgressTests(unittest.TestCase):
         self.assertIn(("conditions", 0, 1), progress)
         self.assertIn(("conditions", 1, 1), progress)
         self.assertEqual(progress[-1], ("complete", 1, 1))
+
+class ExpandedBoardTest(unittest.TestCase):
+    """The 7x6 Board a 76 leader grants: 42 orbs, so 14 Combos instead of 10."""
+
+    def tearDown(self):
+        pad_router.set_board_size(5, 6)
+
+    def test_standard_board_ceiling(self):
+        self.assertEqual((pad_router.board_label(), pad_router.max_combo_ceiling()), ("6\u00d75", 10))
+
+    def test_expanded_board_reaches_fourteen_combos(self):
+        pad_router.set_board_size(6, 7)
+        self.assertEqual((pad_router.board_label(), pad_router.max_combo_ceiling()), ("7\u00d76", 14))
+        two_colour = tuple(tuple(Orb("normal", 1 if row * 7 + col < 21 else 2) for col in range(7))
+                           for row in range(6))
+        combos, layout = pad_router.max_combo_layout(two_colour)
+        self.assertEqual(combos, 14)
+        self.assertEqual(len(pad_router.resolve_matches(layout, cascade=False)[0].matches), 14)
+
+    def test_expanded_board_parses_and_routes(self):
+        pad_router.set_board_size(6, 7)
+        board = pad_router.parse_board("".join(str((row * 7 + col) % 6 + 1) for row in range(6) for col in range(7)))
+        self.assertEqual((len(board), len(board[0])), (6, 7))
+        result = search_qualifying_route(
+            board,
+            RuleProfile("combo", condition_groups=(ConditionGroup.all_of((
+                LeaderCondition.combo_minimum(3),
+            )),)),
+            RouteSearchOptions(attempts=4, min_steps=1, max_steps=12, seed=1),
+            confirmed=True,
+        )
+        self.assertIsNotNone(result.candidate)
+
+    def test_standard_board_rejects_expanded_digits(self):
+        with self.assertRaises(ValueError):
+            pad_router.parse_board("1" * 42)
+
+    def test_unknown_board_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            pad_router.set_board_size(7, 7)
+
 
 if __name__ == "__main__":
     unittest.main()

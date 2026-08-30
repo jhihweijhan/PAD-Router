@@ -8,7 +8,7 @@
 
 workspace 負責裝置清單、裝置選取、螢幕擷取、受控來源 PNG、盤面校正、persistent status/console、5×6 board review、規則設定、Profile JSON 匯入／匯出、背景路徑搜尋、目前候選核准與安全執行。`BoardInspectionBridge` 以 board/rule generation 丟棄 stale candidates，並將 acceptance、gesture、verification、stop phase 及結果序列化。
 
-來源截圖在 webview workspace 依可視區域顯示，辨識與校正仍使用原始 BGRA 像素、`BoardCalibration` 與 `BoardInspectionController`。Browser UI 只更新受控 DTO；含 unknown、診斷或未核准候選時不可執行。支援的 desktop 尺寸為 1100×720、1366×768、1440×900 與 1920×1080，status 與 console 在各尺寸保持可見。
+來源截圖在 webview workspace 依可視區域顯示，辨識與校正仍使用 `adb screencap` 原始 RGBA_8888 像素（PNG 編解碼不換 R／B 通道）、`BoardCalibration` 與 `BoardInspectionController`。Browser UI 只更新受控 DTO；含 unknown、診斷或未核准候選時不可執行。支援的 desktop 尺寸為 1100×720、1366×768、1440×900 與 1920×1080，status 與 console 在各尺寸保持可見。
 
 ## Ubuntu webview setup
 
@@ -35,7 +35,7 @@ uv sync
 
 ## 規則與搜尋
 
-`RuleProfile` 包含條件群組、外部條件與危害策略；`RouteSearchOptions` 包含嘗試次數、seed、步數界限與 cascade。GUI 的執行步數上限預設 80：最大 Combo 的瓶頸是步數而非束寬，50 步會漏掉需要長路徑才能收尾的最後一組。Combo 下限的選項到「至少 10 Combo（5x6 上限）」為止，對應 5x6 盤面 3 顆一塊交錯排列的理論上限。搜尋保留固定 seed 可重現性，先服從條件／危害／shape 優先，再以直接 Match 數、扣除指定消法後的直接最大 Combo 預估、步數與路徑穩定性選擇結果；落珠連鎖的實際 Combo 不參與這個排序。一般條件束搜尋的同色珠距離勢能只是次級 tie-break，不取代直接最大 Combo，也不保證全域最佳。
+`RuleProfile` 包含條件群組、外部條件與危害策略；`RouteSearchOptions` 包含嘗試次數、seed、步數界限與 cascade。GUI 的執行步數上限預設 80：最大 Combo 的瓶頸是步數而非束寬，50 步會漏掉需要長路徑才能收尾的最後一組。Combo 下限的選項到「至少 14 Combo（7×6 上限）」為止；6×5 的理論上限是「至少 10 Combo（6×5 上限）」，兩者都對應 3 顆一塊交錯排列鋪滿盤面（ROWS×COLS//3）。搜尋保留固定 seed 可重現性，先服從條件／危害／shape 優先，再以直接 Match 數、扣除指定消法後的直接最大 Combo 預估、步數與路徑穩定性選擇結果；落珠連鎖的實際 Combo 不參與這個排序。一般條件束搜尋的同色珠距離勢能只是次級 tie-break，不取代直接最大 Combo，也不保證全域最佳。
 
 ## 安全條件
 
@@ -50,7 +50,7 @@ uv sync
 
 ## 不在範圍內
 
-- 非 6×5 Board、非 PNG 來源、雲端服務或角色／怪物資料庫。
+- 6×5 與 7×6 以外的 Board、非 PNG 來源、雲端服務或角色／怪物資料庫。
 - 完整辨識 HP、隊伍組成、技能、地城狀態與遊戲隨機天降。
 - ML、預訓練模型、OpenCV 或其他認知流程仍不在範圍內。
 - pywebview 不支援的其他平台 backend、遠端資產與本地 HTTP 服務。

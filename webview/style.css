@@ -210,6 +210,45 @@ h2 {
   background: #090c10;
 }
 
+.source-panel {
+  position: relative;
+}
+
+.action-rail {
+  position: absolute;
+  z-index: 1;
+  left: 22px;
+  top: 50%;
+  display: grid;
+  gap: 6px;
+  transform: translateY(-50%);
+}
+
+.action-rail button {
+  min-height: 34px;
+}
+
+.move-delay-control {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.move-delay-control input {
+  width: 84px;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--text);
+  padding: 0 8px;
+}
+
+#move-delay-note {
+  max-width: 170px;
+}
+
 #source-image {
   display: block;
   max-width: 100%;
@@ -590,22 +629,6 @@ legend {
   margin: 8px 0 0;
   color: var(--warning);
 }
-.execution-controls {
-  margin-top: 8px;
-}
-
-.execution-actions {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 4px;
-}
-
-.execution-actions button {
-  min-height: 34px;
-  padding: 0 4px;
-  font-size: 11px;
-}
-
 .execution-status {
   margin: 6px 0 0;
   color: var(--muted);

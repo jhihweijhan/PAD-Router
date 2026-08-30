@@ -10,6 +10,7 @@ import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import pad_router
 from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, ExternalCondition, Grid, LeaderCondition, Orb, PlayVerification,
                         RouteSearchOptions, RouteSearchResult, RuleProfile, _cell_features, _normal_color, detect_board_pixels,
                         search_qualifying_route,
@@ -17,7 +18,8 @@ from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, ExternalCondit
 
 
 from pad_router_gui import (BoardCalibration, BoardInspectionBridge, BoardInspectionController,
-                            OrbPrototypeModel, decode_png, rule_profile_from_selections)
+                            OrbPrototypeModel, _png_from_screenshot, decode_png, infer_calibration,
+                            rule_profile_from_selections)
 
 
 def png_bytes(width=12, height=10):
@@ -288,10 +290,17 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.addCleanup(lambda: os.close(handle))
         self.path = path
 
-    def test_png_loader_returns_bgra_pixels(self):
+    def test_png_loader_keeps_the_rgba_order_adb_screencap_uses(self):
         width, height, pixels = decode_png(self.path)
         self.assertEqual((width, height), (12, 10))
-        self.assertEqual(pixels[:4], bytes((60, 40, 20, 255)))
+        self.assertEqual(pixels[:4], bytes((20, 40, 60, 255)))
+
+    def test_screenshot_png_round_trips_without_swapping_channels(self):
+        source = (2, 1, bytes((10, 20, 30, 255)) + bytes((200, 100, 50, 255)))
+        encoded = tempfile.mkstemp(suffix=".png")[1]
+        self.addCleanup(lambda: Path(encoded).unlink(missing_ok=True))
+        Path(encoded).write_bytes(_png_from_screenshot(source))
+        self.assertEqual(decode_png(encoded), source)
 
     def test_load_exposes_calibration_overlay_and_uncertainty(self):
         state = self.controller.load_png(self.path)
@@ -406,13 +415,11 @@ class BoardInspectionControllerTests(unittest.TestCase):
         )
         controller.set_rule_profile(RuleProfile("preset"))
         controller.capture_device("first")
-        controller.approve_route(explicit_confirmation=True)
         protected = controller.state.route_evaluation.route[0]
 
         protected_state = controller.set_protected_cell(protected)
 
         self.assertEqual(protected_state.protected_cell, protected)
-        self.assertFalse(protected_state.route_approved)
         self.assertIsNotNone(protected_state.route_search)
         self.assertNotIn(protected, protected_state.route_evaluation.route)
         with self.assertRaisesRegex(ValueError, "保護"):
@@ -516,6 +523,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
             results = iter((board, unknown))
             controller = BoardInspectionController(detector=lambda *_args: next(results), model=model,
                                                   capture=lambda _serial: source)
+            controller.set_learning_enabled(True)
             controller.capture_device("one")
             state = controller.capture_device("two")
 
@@ -530,12 +538,165 @@ class BoardInspectionControllerTests(unittest.TestCase):
             model = OrbPrototypeModel(Path(directory) / "prototypes.json")
             controller = BoardInspectionController(detector=lambda *_args: unknown, model=model,
                                                   capture=lambda _serial: source)
+            controller.set_learning_enabled(True)
             controller.capture_device("one")
             controller.correct_cell(0, 0, "fire")
             state = controller.capture_device("two")
 
         self.assertEqual(state.board[0][0], Orb("normal", 1))
         self.assertTrue(state.confirmed)
+
+    def test_learning_defaults_off_and_can_resume_all_model_writes(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        with tempfile.TemporaryDirectory() as directory:
+            model = OrbPrototypeModel(Path(directory) / "prototypes.json")
+            controller = BoardInspectionController(
+                detector=lambda *_args: board, model=model, capture=lambda _serial: source,
+            )
+            self.assertFalse(controller.learning_enabled)
+            controller.capture_device("one")
+            controller.accept_current_board()
+            controller.correct_cell(0, 0, "fire")
+            controller.capture_device("two")
+            self.assertEqual(model.samples, [])
+
+            controller.set_learning_enabled(True)
+            controller.correct_cell(0, 0, "water")
+            self.assertEqual(len(model.samples), 1)
+            controller.accept_current_board()
+            self.assertEqual(len(model.samples), 31)
+
+    def test_bridge_disables_learning_during_an_inflight_implicit_write(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        with tempfile.TemporaryDirectory() as directory:
+            model = OrbPrototypeModel(Path(directory) / "prototypes.json")
+            controller = BoardInspectionController(
+                detector=lambda *_args: board, model=model, capture=lambda _serial: source,
+            )
+            controller.set_learning_enabled(True)
+            controller.capture_device("one")
+            learn = model.learn
+            write_started = threading.Event()
+            release_write = threading.Event()
+
+            def block_first_write(*args, **kwargs):
+                if not write_started.is_set():
+                    write_started.set()
+                    release_write.wait(1)
+                return learn(*args, **kwargs)
+
+            bridge = BoardInspectionBridge(controller=controller)
+            self.addCleanup(bridge.close)
+            worker = threading.Thread(target=controller.accept_current_board)
+            updated = {}
+            disable_done = threading.Event()
+
+            def disable() -> None:
+                updated["snapshot"] = bridge.command({"action": "set_learning_enabled", "enabled": False})
+                disable_done.set()
+
+            with patch.object(model, "learn", side_effect=block_first_write):
+                worker.start()
+                self.assertTrue(write_started.wait(1))
+                toggle = threading.Thread(target=disable)
+                toggle.start()
+                try:
+                    self.assertFalse(disable_done.wait(.1))
+                finally:
+                    release_write.set()
+                    worker.join(1)
+                    toggle.join(1)
+
+        self.assertEqual(len(model.samples), 1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(disable_done.is_set())
+        self.assertFalse(updated["snapshot"]["learning_enabled"])
+        self.assertFalse(controller.learning_enabled)
+
+    def test_overlapping_enable_waits_for_pending_disable(self):
+        board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
+        source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
+        with tempfile.TemporaryDirectory() as directory:
+            model = OrbPrototypeModel(Path(directory) / "prototypes.json")
+            controller = BoardInspectionController(
+                detector=lambda *_args: board, model=model, capture=lambda _serial: source,
+            )
+            controller.set_learning_enabled(True)
+            controller.capture_device("one")
+            learn = model.learn
+            write_started = threading.Event()
+            release_write = threading.Event()
+            disable_marked = threading.Event()
+            continue_disable = threading.Event()
+            disable_done = threading.Event()
+            enable_started = threading.Event()
+            enable_done = threading.Event()
+            completion_order = []
+            mark_disable = controller._learning_disable_requested.set
+
+            def block_first_write(*args, **kwargs):
+                if not write_started.is_set():
+                    write_started.set()
+                    release_write.wait(1)
+                return learn(*args, **kwargs)
+
+            def pause_after_marking_disable() -> None:
+                mark_disable()
+                disable_marked.set()
+                continue_disable.wait(1)
+
+            def disable() -> None:
+                controller.set_learning_enabled(False)
+                completion_order.append("off")
+                disable_done.set()
+
+            def enable() -> None:
+                enable_started.set()
+                controller.set_learning_enabled(True)
+                completion_order.append("on")
+                enable_done.set()
+
+            worker = threading.Thread(target=controller.accept_current_board)
+            disable_toggle = threading.Thread(target=disable)
+            enable_toggle = threading.Thread(target=enable)
+            with (patch.object(model, "learn", side_effect=block_first_write),
+                  patch.object(controller._learning_disable_requested, "set",
+                               side_effect=pause_after_marking_disable)):
+                worker.start()
+                self.assertTrue(write_started.wait(1))
+                disable_toggle.start()
+                self.assertTrue(disable_marked.wait(1))
+                enable_toggle.start()
+                self.assertTrue(enable_started.wait(1))
+                release_write.set()
+                try:
+                    self.assertFalse(enable_done.wait(.1))
+                finally:
+                    continue_disable.set()
+                    worker.join(1)
+                    disable_toggle.join(1)
+                    enable_toggle.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(disable_toggle.is_alive())
+        self.assertFalse(enable_toggle.is_alive())
+        self.assertTrue(disable_done.is_set())
+        self.assertTrue(enable_done.is_set())
+        self.assertEqual(completion_order, ["off", "on"])
+        self.assertEqual(len(model.samples), 1)
+        self.assertTrue(controller.learning_enabled)
+
+    def test_learning_command_updates_bridge_snapshot(self):
+        bridge = BoardInspectionBridge()
+        self.addCleanup(bridge.close)
+
+        snapshot = bridge.snapshot()
+        self.assertFalse(snapshot["learning_enabled"])
+        updated = bridge.command({"action": "set_learning_enabled", "enabled": True})
+
+        self.assertTrue(updated["learning_enabled"])
 
     def test_rule_profile_file_flow_and_manual_route(self):
         self.controller.load_png(self.path)
@@ -572,12 +733,9 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(marker["cell"], result.candidate.route[0])
         self.assertIn("x", marker)
         self.assertIn("y", marker)
-        self.controller.approve_route(explicit_confirmation=True)
-        self.assertTrue(self.controller.state.route_approved)
         self.controller.search_qualifying_route(
             RouteSearchOptions(attempts=1, seed=5, min_steps=0, max_steps=0)
         )
-        self.assertFalse(self.controller.state.route_approved)
 
         self.controller.set_rule_profile(RuleProfile("changed"))
         self.assertIsNone(self.controller.state.route_search)
@@ -597,10 +755,9 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(state.status, "Search settings changed; Route invalidated")
         self.assertIsNone(state.route_search)
         self.assertIsNone(state.route_evaluation)
-        self.assertFalse(state.route_approved)
         self.assertEqual(state.route_overlay, ())
 
-    def test_execution_requires_final_confirmation_and_reports_post_gesture_board(self):
+    def test_execution_runs_eligible_route_and_reports_post_gesture_board(self):
         board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
         source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
         calls = []
@@ -621,11 +778,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         controller.evaluate_manual_route(((0, 0), (0, 1)))
         post_route = expected_board_after_path(board, ((0, 0), (0, 1)))
 
-        with self.assertRaisesRegex(ValueError, "明確確認"):
-            controller.execute_route("test-device")
-        self.assertEqual(calls, [])
-
-        self.assertTrue(controller.execute_route("test-device", explicit_confirmation=True))
+        self.assertTrue(controller.execute_route("test-device"))
         self.assertEqual(calls[0][0], "test-device")
         self.assertEqual(calls[0][1], ((0, 0), (0, 1)))
         self.assertEqual(calls[0][2], board)
@@ -633,7 +786,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         self.assertEqual(controller.state.verification.mismatches, 0)
         self.assertIn("驗證成功", controller.state.status)
         with self.assertRaisesRegex(ValueError, "符合條件的路徑"):
-            controller.execute_route("test-device", explicit_confirmation=True)
+            controller.execute_route("test-device")
 
     def test_execution_exposes_actionable_post_gesture_mismatch(self):
         board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
@@ -653,7 +806,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         controller.confirm_board()
         controller.evaluate_manual_route(((0, 0),))
 
-        self.assertFalse(controller.execute_route("test-device", explicit_confirmation=True))
+        self.assertFalse(controller.execute_route("test-device"))
         self.assertEqual(controller.state.verification.detected_board, actual)
         self.assertEqual(controller.state.verification.mismatches, 2)
         self.assertIn("2 格不符", controller.state.status)
@@ -677,11 +830,22 @@ class BoardInspectionControllerTests(unittest.TestCase):
 
         self.assertFalse(result.qualifying)
         with self.assertRaisesRegex(ValueError, "符合條件的路徑"):
-            controller.execute_route("test-device", explicit_confirmation=True)
+            controller.execute_route("test-device")
         self.assertEqual(calls, [])
 
 
 class BoardInspectionBridgeTests(unittest.TestCase):
+    def test_identical_source_reuses_cached_png_encoding(self):
+        source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
+        _png_from_screenshot.cache_clear()
+        self.addCleanup(_png_from_screenshot.cache_clear)
+
+        first = _png_from_screenshot(source)
+        second = _png_from_screenshot((source[0], source[1], source[2]))
+
+        self.assertIs(first, second)
+        self.assertEqual(_png_from_screenshot.cache_info().hits, 1)
+
     def test_1080x2400_capture_defers_work_and_coalesces_updates(self):
         board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
         source = (1080, 2400, bytes((60, 40, 20, 255)) * (1080 * 2400))
@@ -780,7 +944,6 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertTrue(cells[(0, 2)]["protected"])
         self.assertTrue(cells[(0, 2)]["enhanced"])
         self.assertTrue(cells[(0, 2)]["locked"])
-        self.assertFalse(snapshot["approval_allowed"])
         with self.assertRaises(ValueError):
             controller.confirm_board()
 
@@ -802,7 +965,6 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         completed = bridge.command({"action": "correct_cell", "value": "water"})
         self.assertEqual(completed["snapshot"]["unknown_count"], 0)
         self.assertIsNone(completed["snapshot"]["selected_cell"])
-        self.assertTrue(completed["snapshot"]["approval_allowed"])
         self.assertEqual(completed["snapshot"]["source"]["image"], source_image)
         json.dumps(completed["snapshot"])
         controller.confirm_board()
@@ -990,11 +1152,8 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertFalse(candidate["execution_eligible"])
         self.assertFalse(candidate["confirmed"])
-        self.assertFalse(snapshot["approval_allowed"])
         self.assertFalse(snapshot["route_result"]["execution_eligible"])
-        with self.assertRaisesRegex(ValueError, "核准"):
-            bridge.command({"action": "approve_route"})
-        with self.assertRaisesRegex(ValueError, "核准"):
+        with self.assertRaisesRegex(ValueError, "確認且符合"):
             bridge.command({"action": "execute_route", "serial": "test-device"})
         json.dumps(snapshot)
 
@@ -1189,7 +1348,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertEqual(bridge.snapshot()["search"]["status"], "stale")
 
 
-    def test_web_approval_and_execution_learns_before_gesture_and_reports_verification(self):
+    def test_web_execution_runs_eligible_route_without_approval_and_reports_verification(self):
         board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
                       for row in range(ROWS))
         source = (144, 120, bytes((60, 40, 20, 255)) * (144 * 120))
@@ -1198,7 +1357,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
                     max_corrections, on_verification):
-            execution_calls.append((serial, len(model.samples)))
+            execution_calls.append((serial, len(model.samples), delay))
             on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
             return True
 
@@ -1216,6 +1375,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             executor=execute,
             model=model,
         )
+        controller.set_learning_enabled(True)
         controller.capture_device("test-device", auto_search=False)
         controller.set_rule_profile(RuleProfile("safe"))
         controller.confirm_board()
@@ -1223,18 +1383,10 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
         self.addCleanup(bridge.close)
 
-        with self.assertRaisesRegex(ValueError, "核准"):
-            bridge.command({"action": "execute_route", "serial": "test-device"})
-
-        approved = bridge.command({"action": "approve_route"})
-        self.assertTrue(approved["snapshot"]["route_approved"])
-        executed = bridge.command({"action": "execute_route", "serial": "test-device"})
-
+        executed = bridge.command({"action": "execute_route", "serial": "test-device", "delay": 0.08})
         self.assertTrue(executed["accepted"])
-        self.assertEqual(execution_calls, [("test-device", 30)])
-        self.assertEqual(executed["snapshot"]["execution"]["status"], "success")
+        self.assertEqual(execution_calls, [("test-device", 30, 0.08)])
         self.assertEqual(executed["snapshot"]["execution"]["verification"]["status"], "verified")
-        self.assertFalse(executed["snapshot"]["route_approved"])
         json.dumps(executed["snapshot"])
     def test_learning_failure_stops_before_adb_gesture(self):
         board = tuple(tuple(Orb("normal", (row + col) % 6 + 1) for col in range(COLS))
@@ -1261,14 +1413,13 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             executor=execute,
             model=model,
         )
+        controller.set_learning_enabled(True)
         controller.capture_device("test-device", auto_search=False)
         controller.set_rule_profile(RuleProfile("safe"))
         controller.confirm_board()
         controller.evaluate_manual_route(((0, 0),))
         bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
         self.addCleanup(bridge.close)
-        bridge.command({"action": "approve_route"})
-
         with patch.object(model, "learn", side_effect=OSError("learning failed")):
             result = bridge.command({"action": "execute_route", "serial": "test-device"})
 
@@ -1323,6 +1474,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             executor=execute,
             model=model,
         )
+        controller.set_learning_enabled(True)
         controller.capture_device("test-device", auto_search=False)
         controller.set_rule_profile(RuleProfile("safe"))
         controller.confirm_board()
@@ -1335,7 +1487,6 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         )
         self.addCleanup(bridge.close)
 
-        bridge.command({"action": "approve_route"})
         started = bridge.command({"action": "execute_route", "serial": "test-device"})
         self.assertTrue(started["accepted"])
         self.assertTrue(started["snapshot"]["execution"]["busy"])
@@ -1403,7 +1554,6 @@ class BoardInspectionBridgeTests(unittest.TestCase):
             executor=ImmediateExecutor(),
             execution_executor=execution_executor,
         )
-        bridge.command({"action": "approve_route"})
         started = bridge.command({"action": "execute_route", "serial": "test-device"})
         self.assertTrue(started["snapshot"]["execution"]["busy"])
 
@@ -1414,10 +1564,22 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertTrue(execution_executor.shutdown_called)
         with self.assertRaisesRegex(ValueError, "執行中"):
             bridge.command({"action": "select_cell", "cell": [0, 0]})
-        execution_executor.run_next()
+        acceptance_status = []
+        accept_current_board = controller.accept_current_board
+
+        def capture_acceptance_status():
+            acceptance_status.append(bridge.snapshot()["status"])
+            return accept_current_board()
+
+        with patch.object(controller, "accept_current_board", side_effect=capture_acceptance_status):
+            execution_executor.run_next()
         result = bridge.snapshot()
         self.assertEqual(result["execution"]["status"], "stopped")
         self.assertEqual(gestures, [])
+        self.assertIn("正在接受目前盤面", acceptance_status[0])
+        self.assertNotIn("學習", acceptance_status[0])
+        self.assertIn("尚未開始手勢", result["status"])
+        self.assertNotIn("學習", result["status"])
 
     def test_device_and_calibration_operations_report_async_success_and_error(self):
         board = tuple(tuple(Orb("normal", 1) for _ in range(COLS)) for _ in range(ROWS))
@@ -1855,6 +2017,77 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         self.assertEqual(snapshot["route_overlay"][1]["step"], 2)
         json.dumps(snapshot)
 
+class ExpandedBoardBridgeTests(unittest.TestCase):
+    """Switching to the 7x6 Board reshapes the reviewed board and the snapshot."""
+
+    def setUp(self):
+        self.addCleanup(pad_router.set_board_size, 5, 6)
+
+        def detect(width, height, pixels, grid):
+            return tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(pad_router.COLS))
+                         for r in range(pad_router.ROWS))
+
+        self.bridge = BoardInspectionBridge(BoardInspectionController(
+            detector=detect, capture=lambda serial: (7 * 85, 6 * 85, bytes(7 * 85 * 6 * 85 * 4))))
+        self.addCleanup(self.bridge.close)
+        self.bridge.command({"action": "select_device", "serial": "device"})
+        self.bridge.command({"action": "capture", "serial": "device"})
+        self.bridge.wait_for_idle(30)
+
+    def test_switch_reshapes_board_and_reports_the_new_ceiling(self):
+        before = self.bridge.command({"action": "snapshot"})
+        self.assertEqual(before["board_size"]["max_combo"], 10)
+        self.assertEqual(len(before["board"]), 30)
+
+        self.bridge.command({"action": "set_board_size", "size": "7x6"})
+        self.bridge.wait_for_idle(30)
+
+        after = self.bridge.command({"action": "snapshot"})
+        self.assertEqual(after["board_size"],
+                         {"name": "7x6", "label": "7\u00d76", "rows": 6, "cols": 7, "max_combo": 14})
+        self.assertEqual(len(after["board"]), 42)
+
+    def test_unknown_board_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.bridge.command({"action": "set_board_size", "size": "9x9"})
+            self.bridge.wait_for_idle(30)
+
+
+class InferCalibrationTests(unittest.TestCase):
+    """PAD pins the Board to the bottom of the play area, whatever its size."""
+
+    @staticmethod
+    def _screenshot(width: int, height: int, lit_below: int) -> bytes:
+        pixels = bytearray(width * height * 4)
+        for y in range(lit_below):
+            for x in range(width):
+                pixels[(y * width + x) * 4:(y * width + x) * 4 + 3] = b"\x80\x80\x80"
+        return bytes(pixels)
+
+    def tearDown(self):
+        pad_router.set_board_size(5, 6)
+
+    def test_calibrated_device_reproduces_the_recorded_standard_calibration(self):
+        pixels = self._screenshot(1080, 2340, 2280)
+        self.assertEqual(infer_calibration(1080, 2340, pixels), BoardCalibration(0, 1380, 180))
+
+    def test_expanded_board_is_measured_not_assumed_to_span_the_width(self):
+        # Measured off a live SM-A1560 7x6 capture: the Board is framed in black
+        # at x 23..1052 and y 1381..2262, so it is narrower than the screen.
+        pixels = bytearray(1080 * 2340 * 4)
+        for y in range(1381, 2263):
+            for x in range(23, 1053):
+                pixels[(y * 1080 + x) * 4:(y * 1080 + x) * 4 + 3] = b"\x80\x80\x80"
+        pad_router.set_board_size(6, 7)
+        self.assertEqual(infer_calibration(1080, 2340, bytes(pixels)),
+                         BoardCalibration(23, 1381, 147))
+
+    def test_tight_board_crop_starts_at_the_top(self):
+        pad_router.set_board_size(6, 7)
+        calibration = infer_calibration(7 * 82, 6 * 82, self._screenshot(7 * 82, 6 * 82, 6 * 82))
+        self.assertEqual(calibration, BoardCalibration(0, 0, 82))
+
+
 class WebviewAssetTests(unittest.TestCase):
     def test_workspace_uses_only_adjacent_local_assets(self):
         from pad_router_webview import ASSET_ROOT
@@ -1880,9 +2113,19 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('<option selected>30</option>', html)
         self.assertIn('id="start-search"', html)
         self.assertIn('id="cancel-search"', html)
-        self.assertIn('id="approve-route"', html)
+        self.assertNotIn('id="approve-route"', html)
+        self.assertIn('id="action-rail"', html)
         self.assertIn('id="execute-route"', html)
         self.assertIn('id="stop-execution"', html)
+        self.assertIn('id="move-delay"', html)
+        self.assertIn('value="0.04"', html)
+        self.assertIn('id="learning-enabled"', html)
+        self.assertIn('id="learning-status"', html)
+        self.assertIn('AI 模型學習', html)
+        rail_start = html.index('<div id="action-rail"')
+        rail = html[rail_start:html.index("</div>", rail_start)]
+        for control in ('id="capture"', 'id="execute-route"', 'id="stop-execution"', 'id="move-delay"'):
+            self.assertIn(control, rail)
         for marker in (
                 'id="source-stage"', 'id="route-overlay"', 'id="route-preview"',
                 'id="route-preview-grid"', 'id="projected-combo"', 'id="route-preview-status"',
@@ -1904,9 +2147,13 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('command("set_rule_profile"', client)
         self.assertIn('command("search_route"', client)
         self.assertIn('command("cancel_search"', client)
-        self.assertIn('command("approve_route"', client)
+        self.assertNotIn('command("approve_route"', client)
         self.assertIn('command("execute_route"', client)
-        self.assertIn('command("stop_execution"', client)
+        self.assertIn('delay: moveDelay.valueAsNumber', client)
+        self.assertIn('command("set_learning_enabled"', client)
+        for phase in ("正在擷取畫面", "盤面辨識完成", "正在計算並搜尋路徑",
+                      "正在執行手勢", "正在驗證結果"):
+            self.assertIn(phase, gui_source)
         self.assertIn('command("set_protected_cell"', client)
         for marker in (
                 'command("calibrate"', 'command("auto_calibrate"',
@@ -1929,8 +2176,28 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn("@media (max-height: 740px)", styles)
         for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
                        ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid",
-                       ".route-preview", ".route-line", ".route-marker", ".combo-badge"):
+                       ".route-preview", ".route-line", ".route-marker", ".combo-badge",
+                       ".move-delay-control"):
             self.assertIn(marker, styles)
+        rail_style_start = styles.index(".action-rail {")
+        rail_style = styles[rail_style_start:styles.index("}", rail_style_start)]
+        for declaration in ("position: absolute", "left:", "top: 50%", "translateY(-50%)"):
+            self.assertIn(declaration, rail_style)
+
+    def test_learning_toggle_waits_for_confirmed_backend_snapshot(self):
+        from pad_router_webview import ASSET_ROOT
+
+        client = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
+        handler_start = client.index('learningEnabled.addEventListener("change"')
+        handler_end = client.index('protect.addEventListener("click"', handler_start)
+        handler = client[handler_start:handler_end]
+
+        self.assertIn('learningEnabled.addEventListener("change", async () => {', handler)
+        self.assertIn("learningEnabled.checked = confirmedLearningEnabled", handler)
+        self.assertIn("learningEnabled.disabled = true", handler)
+        self.assertIn('learningStatus.textContent = "AI 模型學習：更新中…"', handler)
+        self.assertIn('await command("set_learning_enabled"', handler)
+        self.assertIn("renderSnapshot(reply.snapshot || reply)", handler)
 
 
 class EntrypointTests(unittest.TestCase):

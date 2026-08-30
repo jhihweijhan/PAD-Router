@@ -40,6 +40,7 @@
   const consoleList = document.querySelector("#console-list");
   const consoleCount = document.querySelector("#console-count");
   const boardGrid = document.querySelector("#board-grid");
+  const boardSize = document.querySelector("#board-size");
   const reviewStatus = document.querySelector("#review-status");
   const unknownCount = document.querySelector("#unknown-count");
   const selectedCellLabel = document.querySelector("#selected-cell");
@@ -65,16 +66,20 @@
   const activeProfile = document.querySelector("#active-profile");
   const searchProgress = document.querySelector("#search-progress");
   const searchResult = document.querySelector("#search-result");
-  const approveRoute = document.querySelector("#approve-route");
   const executeRoute = document.querySelector("#execute-route");
   const stopExecution = document.querySelector("#stop-execution");
   const executionStatus = document.querySelector("#execution-status");
+  const moveDelay = document.querySelector("#move-delay");
+  const learningEnabled = document.querySelector("#learning-enabled");
+  const learningStatus = document.querySelector("#learning-status");
 
   let pendingSnapshot = null;
   let renderFrame = null;
   let pollTimer = null;
   let currentSnapshot = null;
   let selectedOrb = "fire";
+  let confirmedLearningEnabled = false;
+  let learningChangePending = false;
   const hazardOrbs = new Set(["jammer", "poison", "mortal_poison", "bomb"]);
 
   function cellParts(cell) {
@@ -104,14 +109,28 @@
     });
   }
 
+  function boardShape(snapshot) {
+    const size = snapshot && snapshot.board_size;
+    return {
+      rows: Number.isInteger(size && size.rows) ? size.rows : 5,
+      cols: Number.isInteger(size && size.cols) ? size.cols : 6,
+      label: (size && size.label) || "6\u00d75",
+      name: (size && size.name) || "6x5",
+    };
+  }
+
   function renderBoard(snapshot) {
     const entries = Array.isArray(snapshot.board) ? snapshot.board : [];
     const selected = cellParts(snapshot.selected_cell);
+    const shape = boardShape(snapshot);
+    boardGrid.style.gridTemplateColumns = `repeat(${shape.cols}, minmax(0, 1fr))`;
+    routePreviewGrid.style.gridTemplateColumns = boardGrid.style.gridTemplateColumns;
+    boardGrid.setAttribute("aria-label", `${shape.rows} 列 ${shape.cols} 欄盤面`);
     boardGrid.replaceChildren();
     if (entries.length === 0) {
       const empty = document.createElement("span");
       empty.className = "board-empty";
-      empty.textContent = "擷取畫面後顯示 5 × 6 盤面";
+      empty.textContent = `擷取畫面後顯示 ${shape.label} 盤面`;
       boardGrid.append(empty);
       return;
     }
@@ -162,7 +181,7 @@
         if (!movement) return;
         const row = cell[0] + movement[0];
         const col = cell[1] + movement[1];
-        if (row < 0 || row >= 5 || col < 0 || col >= 6) return;
+        if (row < 0 || row >= shape.rows || col < 0 || col >= shape.cols) return;
         event.preventDefault();
         const target = boardGrid.querySelector(`[data-row="${row}"][data-col="${col}"]`);
         if (target) target.focus();
@@ -330,7 +349,7 @@
     searchResult.className = `result-card ${executable ? "qualifying" : "diagnostic"}`;
     const label = executable
       ? "符合條件候選（可進入後續 Python 安全流程）"
-      : "診斷預覽（不可核准或執行）";
+      : "診斷預覽（不可執行）";
     const route = Array.isArray(candidate.route)
       ? candidate.route.map((cell) => cellText(cell)).join(" → ")
       : "無路徑";
@@ -362,6 +381,8 @@
     busyLabel.textContent = executionBusy ? "執行中"
       : operationalBusy ? "裝置作業中" : busy ? "處理中" : "閒置";
     refresh.disabled = busy || operationalBusy;
+    boardSize.value = boardShape(snapshot).name;
+    boardSize.disabled = busy || operationalBusy;
     device.disabled = busy || operationalBusy || devices.length === 0;
     capture.disabled = busy || operationalBusy || !selected;
 
@@ -450,22 +471,25 @@
       : unknown > 0
         ? `模型無法判斷 ${unknown} 格；選取後修正，修正未知格會前往下一格。`
         : "盤面已辨識；可選取任一格檢查或修正。";
-    const approved = Boolean(snapshot.route_approved);
     const executable = Boolean(routeResult && routeResult.execution_eligible && snapshot.confirmed);
     executionGate.textContent = !hasBoard
       ? "尚未載入盤面。"
       : unknown > 0
         ? `含 ${unknown} 個未知格；不可確認或執行。`
         : routeResult && !routeResult.execution_eligible
-          ? "目前候選是診斷預覽；不可核准或執行。"
-          : routeResult && !approved
-            ? "目前候選符合條件；請先核准後執行。"
-            : routeResult && approved
-              ? "目前路徑已核准；可執行安全手勢流程。"
+          ? "目前候選是診斷預覽；不可執行。"
+          : routeResult
+            ? "目前路徑符合條件；可執行安全手勢流程。"
               : "尚無目前可執行候選。";
     correct.disabled = primaryMutationBusy || !hasSelection;
     protect.disabled = primaryMutationBusy || !hasSelection;
     clearProtect.disabled = primaryMutationBusy || !snapshot.protected_cell;
+    if (!learningChangePending) confirmedLearningEnabled = Boolean(snapshot.learning_enabled);
+    learningEnabled.checked = confirmedLearningEnabled;
+    learningEnabled.disabled = learningChangePending;
+    learningStatus.textContent = learningChangePending
+      ? "AI 模型學習：更新中…"
+      : `AI 模型學習：${confirmedLearningEnabled ? "開啟" : "關閉"}`;
     for (const button of orbPalette.querySelectorAll("button[data-orb]")) {
       button.disabled = primaryMutationBusy || !hasSelection;
       button.setAttribute("aria-pressed", String(button.dataset.orb === selectedOrb));
@@ -474,9 +498,9 @@
     locked.checked = Boolean(selectedEntry && selectedEntry.locked);
     syncOrbFlags(hasSelection, primaryMutationBusy);
     renderSearch(snapshot, hasBoard, busy);
-    approveRoute.disabled = primaryMutationBusy || !executable || approved;
-    executeRoute.disabled = primaryMutationBusy || !executable || !approved;
+    executeRoute.disabled = primaryMutationBusy || !executable;
     stopExecution.disabled = !executionBusy;
+    moveDelay.disabled = primaryMutationBusy || executionBusy;
     stopExecution.textContent = executionBusy && execution.stop_requested
       ? "等待安全放手…"
       : "停止（安全放手後生效）";
@@ -619,6 +643,25 @@
     const cell = currentSnapshot && currentSnapshot.selected_cell;
     if (cellParts(cell)) command("correct_cell", { cell, value: correctionValue() });
   });
+  learningEnabled.addEventListener("change", async () => {
+    if (learningChangePending) {
+      learningEnabled.checked = confirmedLearningEnabled;
+      return;
+    }
+    const enabled = learningEnabled.checked;
+    learningChangePending = true;
+    learningEnabled.checked = confirmedLearningEnabled;
+    learningEnabled.disabled = true;
+    learningStatus.textContent = "AI 模型學習：更新中…";
+    const reply = await command("set_learning_enabled", { enabled });
+    learningChangePending = false;
+    if (reply) {
+      renderSnapshot(reply.snapshot || reply);
+    } else {
+      learningEnabled.disabled = false;
+      learningStatus.textContent = `AI 模型學習：${confirmedLearningEnabled ? "開啟" : "關閉"}`;
+    }
+  });
   protect.addEventListener("click", () => {
     const cell = currentSnapshot && currentSnapshot.selected_cell;
     if (cellParts(cell)) command("set_protected_cell", { cell });
@@ -630,14 +673,14 @@
   }
   startSearch.addEventListener("click", () => command("search_route", searchPayload()));
   cancelSearch.addEventListener("click", () => command("cancel_search"));
-  approveRoute.addEventListener("click", () => command("approve_route"));
   executeRoute.addEventListener("click", () => {
     const serial = currentSnapshot && currentSnapshot.selected_device;
-    if (serial) command("execute_route", { serial });
+    if (serial) command("execute_route", { serial, delay: moveDelay.valueAsNumber });
   });
   stopExecution.addEventListener("click", () => command("stop_execution"));
   refresh.addEventListener("click", () => command("refresh_devices"));
   device.addEventListener("change", () => command("select_device", { serial: device.value }));
+  boardSize.addEventListener("change", () => command("set_board_size", { size: boardSize.value }));
   capture.addEventListener("click", () => command("capture_screen", { search: searchPayload() }));
   applyCalibration.addEventListener("click", () => command("calibrate", calibrationPayload()));
   autoCalibration.addEventListener("click", () => command("auto_calibrate"));

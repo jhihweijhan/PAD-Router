@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Solve the visible 5x6 PAD board, then optionally play its route over ADB."""
+"""Solve the visible PAD board (6x5 Standard or 7x6), then optionally play its route over ADB."""
 
 from __future__ import annotations
 
@@ -23,15 +23,45 @@ from typing import Callable, Iterable
 
 
 ROWS, COLS = 5, 6
+# PAD names a Board columns x rows.  The Standard Board is 6x5, and a 7x6
+# Board leader expands it to 42 orbs, lifting the Combo ceiling 10 -> 14.
+BOARD_SIZES = {"6x5": (5, 6), "7x6": (6, 7)}
+
+
+def set_board_size(rows: int, cols: int) -> None:
+    """Switch the Board shape every function in this module reads."""
+    global ROWS, COLS
+    if (rows, cols) not in BOARD_SIZES.values():
+        raise ValueError("Only the 6x5 Standard Board and the 7x6 Board are supported")
+    ROWS, COLS = rows, cols
+    _minimum_full_row_distance.cache_clear()
+    max_combo_layout.cache_clear()
+
+
+def board_label() -> str:
+    """Return the Board's PAD-style columns x rows name."""
+    return f"{COLS}\u00d7{ROWS}"
+
+
+def max_combo_ceiling() -> int:
+    """Every Combo costs 3 orbs, so a full cover of the Board is the ceiling."""
+    return ROWS * COLS // 3
+
 # Block plans kept per cover before the leftover orbs decide the real Combo count.
 _LAYOUT_PLANS = 6
+# Assignment nodes explored per cover.  Keys are tried best-agreement first, so
+# the first leaf of every cover is already a greedy plan; the cap only bounds
+# how far the exhaustive tail runs, which a 7x6 Board would otherwise not end.
+_LAYOUT_NODES = 3000
 # Shaping steps searched with the full per-node evaluation before the Combo pass.
 CONDITION_SEARCH_STEPS = 40
 DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
-# Calibrated from the current SM-A1560 screenshot. Raw Android RGBA_8888 is
-# little-endian BGRA, hence these values are sampled after swapping R and B.
-# Each entry is (hue, saturation, value, maximum distance). These labels are
-# fixed; a board cannot create a new normal colour from its own pixels.
+# Calibrated from the current SM-A1560 screenshot. adb screencap hands back
+# RGBA_8888 in that byte order, and `_cell_features` feeds hue/saturation/value
+# the channels reversed, so these prototypes live in that swapped space -- fire
+# lands on blue's hue and light on cyan's. Each entry is
+# (hue, saturation, value, maximum distance). These labels are fixed; a board
+# cannot create a new normal colour from its own pixels.
 ORB_PROTOTYPES = {
     1: (0.66, 0.82, 0.86, 0.30),  # fire
     2: (0.09, 0.82, 0.86, 0.30),  # water
@@ -488,7 +518,7 @@ class RouteEvaluation:
 
 def _validate_board(board: tuple[tuple[object, ...], ...]) -> None:
     if len(board) != ROWS or any(len(row) != COLS for row in board):
-        raise ValueError("Expected a 5x6 board")
+        raise ValueError(f"Expected a {board_label()} board")
 
 
 def _normalise_orb_type(value: object) -> int | str | None:
@@ -794,7 +824,7 @@ def evaluate_manual_route(
         raise ValueError("Route must contain at least one Board cell")
     if any(len(point) != 2 or not all(isinstance(value, int) for value in point)
            or not (0 <= point[0] < ROWS and 0 <= point[1] < COLS) for point in route):
-        raise ValueError("Route points must be inside the 5x6 Standard Board")
+        raise ValueError(f"Route points must be inside the {board_label()} Board")
     if any(abs(first[0] - second[0]) + abs(first[1] - second[1]) != 1 for first, second in zip(route, route[1:])):
         raise ValueError("Route points must be adjacent Board cells")
     expected = expected_board_after_path(board, route)
@@ -978,15 +1008,17 @@ def _max_combo_route(board: tuple[tuple[object, ...], ...], options: "RouteSearc
 
 
 @functools.cache
-def _block_tilings() -> tuple[tuple[tuple[tuple[tuple[int, int], ...], ...],
+def _block_tilings(rows: int = 0, cols: int = 0) -> tuple[tuple[tuple[tuple[tuple[int, int], ...], ...],
                                     tuple[tuple[int, ...], ...]], ...]:
     """Return every way to cover the Board with straight 3-orb blocks.
 
-    A maximum-Combo Board is exactly such a cover, and a 5x6 Board admits only
-    22 of them, so the whole family of reference layouts can simply be listed.
-    Each entry pairs the blocks with, per block, the indices it touches.
+    A maximum-Combo Board is exactly such a cover, and a 6x5 Board admits only
+    22 of them (a 7x6 Board 155), so the whole family of reference layouts can
+    simply be listed.  Each entry pairs the blocks with, per block, the indices
+    it touches.  ``rows``/``cols`` only key the cache; leave them at 0.
     """
-    cells = tuple((row, col) for row in range(ROWS) for col in range(COLS))
+    rows, cols = rows or ROWS, cols or COLS
+    cells = tuple((row, col) for row in range(rows) for col in range(cols))
     covers: list[tuple[tuple[tuple[int, int], ...], ...]] = []
 
     def extend(used: frozenset[tuple[int, int]], blocks: tuple[tuple[tuple[int, int], ...], ...]) -> None:
@@ -997,7 +1029,7 @@ def _block_tilings() -> tuple[tuple[tuple[tuple[tuple[int, int], ...], ...],
         row, col = remaining[0]
         for dr, dc in ((0, 1), (1, 0)):
             block = tuple((row + dr * step, col + dc * step) for step in range(3))
-            if (block[-1][0] < ROWS and block[-1][1] < COLS
+            if (block[-1][0] < rows and block[-1][1] < cols
                     and not used.intersection(block)):
                 extend(used.union(block), blocks + (block,))
 
@@ -1039,7 +1071,7 @@ def _fill_layout(layout: list[list[object]], leftovers: Counter) -> tuple[tuple[
 def max_combo_layout(board: tuple[tuple[object, ...], ...]) -> tuple[int, tuple[tuple[object, ...], ...]]:
     """Return the reference-style block layout with the most Combos this Board's orbs reach.
 
-    Every one of the 22 covers is tried with every legal key assignment: a key
+    Every one of every cover is tried with every legal key assignment: a key
     may fill at most ``count // 3`` blocks and never two touching ones.  The
     best plans are then completed with the orbs no block claimed and scored by
     the Matches the finished Board actually holds, so the number is one a real
@@ -1061,35 +1093,48 @@ def max_combo_layout(board: tuple[tuple[object, ...], ...]) -> tuple[int, tuple[
     def beaten(rank: tuple[int, int]) -> bool:
         return len(plans) == _LAYOUT_PLANS and rank >= plans[-1][:2]
 
-    for cover, (blocks, neighbours) in enumerate(_block_tilings()):
+    for cover, (blocks, neighbours) in enumerate(_block_tilings(ROWS, COLS)):
         agreement = [{key: (sum(keys[row][col] == key for row, col in block) if key is not None else 0)
                       for key in order} for block in blocks]
         chosen: list[object] = [None] * len(blocks)
         budget = dict(caps)
+        # Optimistic remainders: no branch can beat filling every later block
+        # with its best-agreeing key, so a node whose ceiling is already worse
+        # than the worst kept plan is dead.  A 7x6 Board has 155 covers of 14
+        # blocks, and the loose "3 per block" ceiling never closes that search.
+        best_rest = [0] * (len(blocks) + 1)
+        for index in reversed(range(len(blocks))):
+            best_rest[index] = best_rest[index + 1] + max(agreement[index].values())
 
-        def assign(index: int, used: int, score: int) -> None:
-            left = len(blocks) - index
-            if beaten((-(used + left), -(score + 3 * left))):
+        nodes = 0
+
+        def assign(index: int, used: int, score: int, available: int) -> None:
+            nonlocal nodes
+            nodes += 1
+            if nodes > _LAYOUT_NODES:
+                return
+            if beaten((-(used + min(len(blocks) - index, available)), -(score + best_rest[index]))):
                 return
             if index == len(blocks):
                 offer((-used, -score), cover, tuple(chosen))
                 return
-            for key in order:
+            for key in sorted(order, key=lambda option: -agreement[index][option]):
                 if key is not None:
                     if not budget[key] or any(chosen[other] == key for other in neighbours[index]):
                         continue
                     budget[key] -= 1
                 chosen[index] = key
-                assign(index + 1, used + (key is not None), score + agreement[index][key])
+                assign(index + 1, used + (key is not None), score + agreement[index][key],
+                       available - (key is not None))
                 chosen[index] = None
                 if key is not None:
                     budget[key] += 1
 
-        assign(0, 0, 0)
+        assign(0, 0, 0, sum(caps.values()))
 
     best = (-1, 0, board)
     for _used, score, cover, plan in plans:
-        blocks = _block_tilings()[cover][0]
+        blocks = _block_tilings(ROWS, COLS)[cover][0]
         layout: list[list[object]] = [[None] * COLS for _ in range(ROWS)]
         leftovers = Counter(counts)
         for block, key in zip(blocks, plan):
@@ -1324,7 +1369,7 @@ def _validate_protected_cell(cell: tuple[int, int] | None) -> tuple[int, int] | 
     if cell is not None and (not isinstance(cell, tuple) or len(cell) != 2
                              or any(type(value) is not int for value in cell)
                              or not (0 <= cell[0] < ROWS and 0 <= cell[1] < COLS)):
-        raise ValueError("protected_cell must be inside the 5x6 Standard Board")
+        raise ValueError(f"protected_cell must be inside the {board_label()} Board")
     return cell
 
 
@@ -1435,7 +1480,7 @@ def board_mismatch_count(
     if len(actual) != ROWS or len(expected) != ROWS or any(
         len(row) != COLS for row in (*actual, *expected)
     ):
-        raise ValueError("Expected a 5x6 board")
+        raise ValueError(f"Expected a {board_label()} board")
     return sum(
         _board_cell_key(actual[r][c]) != _board_cell_key(expected[r][c])
         for r in range(ROWS) for c in range(COLS)
@@ -1545,7 +1590,7 @@ def _palette_hue(samples: list[tuple[float, float, float]]) -> float:
 def _cell_features(
     width: int, height: int, pixels: bytes, point: tuple[int, int], cell: int = 180
 ) -> CellFeatures:
-    """Extract robust palette and separate icon features from one BGRA cell."""
+    """Extract robust palette and separate icon features from one RGBA cell."""
     x, y = point
     radius = min(55, max(12, round(cell * 0.42)))
     samples: list[tuple[int, int, float, float, float]] = []
@@ -1779,7 +1824,7 @@ def _board_is_blind(board: tuple[tuple[object, ...], ...]) -> bool:
 def parse_board(text: str) -> tuple[tuple[int, ...], ...]:
     digits = [int(char) for char in text if char.isdigit()]
     if len(digits) != ROWS * COLS or not all(1 <= color <= 6 for color in digits):
-        raise ValueError("--board needs exactly 30 digits, using colours 1 through 6")
+        raise ValueError(f"--board needs exactly {ROWS * COLS} digits, using colours 1 through 6")
     return tuple(tuple(digits[r * COLS:(r + 1) * COLS]) for r in range(ROWS))
 
 
@@ -1789,7 +1834,7 @@ def send_motion(serial: str, action: str, point: tuple[int, int]) -> None:
 
 
 def blind_scan_path() -> tuple[tuple[int, int], ...]:
-    """One continuous serpentine pass over all 30 cells."""
+    """One continuous serpentine pass over every cell."""
     return tuple((row, col if row % 2 == 0 else COLS - 1 - col)
                  for row in range(ROWS) for col in range(COLS))
 
@@ -2079,7 +2124,9 @@ def self_check() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--serial", default="R5CX42SQRBR")
-    parser.add_argument("--board", help="30 digits, row-major: 1 fire, 2 water, 3 wood, 4 light, 5 dark, 6 heart")
+    parser.add_argument("--board-size", choices=sorted(BOARD_SIZES), default="6x5",
+                        help="6x5 Standard Board, or the 7x6 Board a 76 leader grants")
+    parser.add_argument("--board", help="ROWS*COLS digits, row-major: 1 fire, 2 water, 3 wood, 4 light, 5 dark, 6 heart")
     parser.add_argument("--beam-width", type=int, default=80)
     parser.add_argument("--min-steps", type=int, default=5,
                         help="Minimum drag steps before a solution can be selected")
@@ -2102,7 +2149,7 @@ def main() -> None:
     parser.add_argument("--max-corrections", type=int, default=2,
                         help="Maximum conservative MOVE corrections before releasing")
     parser.add_argument("--blind-scan", action="store_true",
-                        help="When all 30 cells are hidden, hold and sweep once before routing")
+                        help="When every cell is hidden, hold and sweep once before routing")
     parser.add_argument("--scan-delay", type=float, default=0.01,
                         help="Seconds between blind-scan cells while held")
     parser.add_argument("--scan-capture-delay", type=float, default=0.12,
@@ -2115,6 +2162,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.gui and args.webview:
         parser.error("--gui and --webview are mutually exclusive")
+    set_board_size(*BOARD_SIZES[args.board_size])
     if args.gui or args.webview:
         from pad_router_webview import main as gui_main
         gui_main()
