@@ -273,6 +273,55 @@ class PrototypeCompatibilityTests(unittest.TestCase):
         self.assertEqual(detected, baseline)
 
 
+class VerifyAfterGestureToggleTests(unittest.TestCase):
+    """The switch reaches the executor and never claims an unmade check."""
+
+    def _ready_controller(self):
+        calls = []
+        board = tuple(tuple(Orb("normal", (r + c) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
+
+        def execute(*_args, on_verification, screen_size=None, verify=True):
+            calls.append(verify)
+            on_verification(PlayVerification(
+                None, None, 0 if verify else None, True,
+                "verified" if verify else "released_without_verification"))
+            return True
+
+        controller = BoardInspectionController(
+            detector=lambda *_args: board, executor=execute,
+            capture=lambda serial: (12, 10, bytes((60, 40, 20, 255)) * (12 * 10)))
+        controller.capture_device("device")
+        controller.set_rule_profile(RuleProfile("safe"))
+        controller.confirm_board()
+        controller.evaluate_manual_route(((0, 0), (0, 1)))
+        return controller, calls
+
+    def test_verifying_is_the_default_and_reaches_the_executor(self):
+        controller, calls = self._ready_controller()
+        self.assertTrue(controller.verify_after_gesture)
+        controller.execute_route("device")
+        self.assertEqual(calls, [True])
+
+    def test_the_switch_turns_verification_off_for_the_executor(self):
+        controller, calls = self._ready_controller()
+        controller.set_verify_after_gesture(False)
+        controller.execute_route("device")
+        self.assertEqual(calls, [False])
+        self.assertEqual(controller.state.verification.status, "released_without_verification")
+        self.assertIsNone(controller.state.verification.mismatches)
+
+    def test_the_bridge_exposes_and_flips_the_switch(self):
+        bridge = BoardInspectionBridge(BoardInspectionController(
+            capture=lambda serial: (12, 10, bytes(12 * 10 * 4))))
+        self.addCleanup(bridge.close)
+        self.assertTrue(bridge.command({"action": "snapshot"})["verify_after_gesture"])
+        snapshot = bridge.command({"action": "set_verify_after_gesture", "enabled": False})
+        self.assertFalse(snapshot["verify_after_gesture"])
+        self.assertFalse(bridge.controller.verify_after_gesture)
+        with self.assertRaises(ValueError):
+            bridge.command({"action": "set_verify_after_gesture", "enabled": "yes"})
+
+
 class PrototypeStoreTests(unittest.TestCase):
     """The store is rewritten whole, so repeats and per-cell writes both hurt."""
 
@@ -813,7 +862,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         calls = []
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
-                    max_corrections, on_verification, screen_size=None):
+                    max_corrections, on_verification, screen_size=None, verify=True):
             calls.append((serial, path, expected_board))
             actual = expected_board_after_path(expected_board, path)
             on_verification(PlayVerification(actual, actual, 0, True, "verified"))
@@ -843,7 +892,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         actual = tuple(tuple(Orb("normal", (r + c + 1) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
         source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
 
-        def execute(*args, on_verification, screen_size=None):
+        def execute(*args, on_verification, screen_size=None, verify=True):
             expected = args[6]
             on_verification(PlayVerification(expected, actual, 2, False, "post_gesture_mismatch"))
             return False
@@ -1406,7 +1455,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         execution_calls = []
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
-                    max_corrections, on_verification, screen_size=None):
+                    max_corrections, on_verification, screen_size=None, verify=True):
             execution_calls.append((serial, len(model.samples), delay))
             on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
             return True
@@ -1512,7 +1561,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         bridge = None
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
-                    max_corrections, on_verification, screen_size=None):
+                    max_corrections, on_verification, screen_size=None, verify=True):
             gesture_calls.append((serial, len(model.samples)))
             stop_replies.append(bridge.command({"action": "stop_execution"}))
             on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
@@ -2170,6 +2219,7 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('id="move-delay"', html)
         self.assertIn('value="0.04"', html)
         self.assertIn('id="learning-enabled"', html)
+        self.assertIn('id="verify-after-gesture"', html)
         self.assertIn('id="learning-status"', html)
         self.assertIn('AI 模型學習', html)
         rail_start = html.index('<div id="action-rail"')
@@ -2328,7 +2378,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         routes = []
 
-        def executor(*args, on_verification, screen_size=None):
+        def executor(*args, on_verification, screen_size=None, verify=True):
             routes.append(args[1])
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))
@@ -2364,7 +2414,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification, screen_size=None):
+        def executor(*args, on_verification, screen_size=None, verify=True):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, args[6], 2, False,
@@ -2382,7 +2432,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification, screen_size=None):
+        def executor(*args, on_verification, screen_size=None, verify=True):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))
@@ -2405,7 +2455,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification, screen_size=None):
+        def executor(*args, on_verification, screen_size=None, verify=True):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))
@@ -2425,7 +2475,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification, screen_size=None):
+        def executor(*args, on_verification, screen_size=None, verify=True):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))

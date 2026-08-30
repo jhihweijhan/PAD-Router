@@ -682,6 +682,47 @@ class ScreenshotBandTest(unittest.TestCase):
         self.assertEqual(pad_router.cell_rows((100, 500)), range(470, 531))
 
 
+class ReleaseWithoutVerificationTest(unittest.TestCase):
+    """`verify=False` releases as soon as the gesture is sent."""
+
+    BOARD = ((1, 2, 3, 4, 5, 6), (2, 3, 4, 5, 6, 1), (3, 4, 5, 6, 1, 2),
+             (4, 5, 6, 1, 2, 3), (5, 6, 1, 2, 3, 4))
+
+    def _play(self, verify):
+        motions, reports = [], []
+        frame = (2, 2, bytes(2 * 2 * 4))
+
+        def send_motion(_serial, action, point):
+            motions.append(action)
+
+        with patch("pad_router.screenshot", lambda _serial: frame), \
+                patch("pad_router.send_motion", send_motion), \
+                patch("pad_router.send_moves", lambda *_args: None), \
+                patch("pad_router.cell_visual_change", lambda *_args: 99.0), \
+                patch("pad_router.detect_board", lambda *_args: self.fail("verified anyway")):
+            played = pad_router.play(
+                "serial", ((0, 0), (0, 1)), pad_router.Grid(0, 0, 1), 0.0,
+                expected_board=self.BOARD, verify=verify,
+                on_verification=reports.append,
+            )
+        return played, motions, reports
+
+    def test_release_without_verification_reports_what_it_did(self):
+        played, motions, reports = self._play(verify=False)
+        self.assertTrue(played)
+        self.assertEqual(motions, ["DOWN", "UP"])
+        self.assertEqual([report.status for report in reports], ["released_without_verification"])
+        report = reports[0]
+        self.assertTrue(report.success)
+        # Nothing was read back, so nothing may be claimed about the board.
+        self.assertIsNone(report.detected_board)
+        self.assertIsNone(report.mismatches)
+
+    def test_verifying_still_reads_the_board_back(self):
+        with self.assertRaises(AssertionError):
+            self._play(verify=True)
+
+
 class ExpandedBoardTest(unittest.TestCase):
     """The 7x6 Board a 76 leader grants: 42 orbs, so 14 Combos instead of 10."""
 

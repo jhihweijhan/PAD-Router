@@ -1921,6 +1921,7 @@ def play(
     cascade: bool = True,
     on_verification: Callable[[PlayVerification], None] | None = None,
     screen_size: tuple[int, int] | None = None,
+    verify: bool = True,
 ) -> bool:
     path = tuple(path or ())
 
@@ -1991,6 +1992,14 @@ def play(
             cursor, cursor_cell = points[-1], path[-1]
 
         expected = expected_board_after_path(expected_board, path)
+        if not verify:
+            # Released on the caller's say-so: the gesture is reported as sent,
+            # never as checked, and no correction can follow a released orb.
+            send_motion(serial, "UP", cursor)
+            down = False
+            print("Released without post-gesture verification")
+            report_verification("released_without_verification", success=True, expected=expected)
+            return True
         try:
             current = detect_board(serial, grid, screen_size)
             if not _board_is_routeable(current):
@@ -2209,6 +2218,8 @@ def main() -> None:
                         help="Seconds to wait for revealed cells before recognition")
     parser.add_argument("--round-limit", type=int, default=0, help="Stop after this many rounds; 0 means unlimited")
     parser.add_argument("--play", action="store_true", help="Actually send the gesture; default only prints it")
+    parser.add_argument("--no-verify", dest="verify", action="store_false",
+                        help="Release as soon as the gesture is sent, skipping the post-gesture board check")
     parser.add_argument("--gui", action="store_true", help="Open the supported offline web workspace")
     parser.add_argument("--webview", action="store_true", help="Deprecated alias for --gui")
     parser.add_argument("--self-check", action="store_true")
@@ -2278,7 +2289,7 @@ def main() -> None:
         print("Path:", " -> ".join(f"({r + 1},{c + 1})" for r, c in solution.path))
         if args.play:
             if not play(args.serial, solution.path, grid, args.move_delay, args.hold_delay,
-                        args.lift_threshold, board, args.max_corrections):
+                        args.lift_threshold, board, args.max_corrections, verify=args.verify):
                 print("Releasing and returning to readiness polling.")
                 if args.board:
                     return

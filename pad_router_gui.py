@@ -619,6 +619,7 @@ class BoardInspectionController:
         self._learning_write_lock = threading.Lock()
         self._learning_enabled = False
         self._learning_disable_requested = threading.Event()
+        self._verify_after_gesture = True
         self._max_recognition_attempts = 2
         self.max_recognition_attempts = max_recognition_attempts
         self.state = BoardInspectionState()
@@ -632,6 +633,19 @@ class BoardInspectionController:
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
             raise ValueError("主動辨識次數必須是 1 到 5 的整數")
         self._max_recognition_attempts = value
+
+    @property
+    def verify_after_gesture(self) -> bool:
+        return self._verify_after_gesture
+
+    def set_verify_after_gesture(self, enabled: bool) -> BoardInspectionState:
+        """Choose whether a finished gesture is checked before the orb is released."""
+        if not isinstance(enabled, bool):
+            raise ValueError("放手前確認設定必須是布林值")
+        self._verify_after_gesture = enabled
+        self.state = replace(self.state, status=(
+            "轉珠後將停手確認盤面，再放手" if enabled else "轉珠後直接放手，不做盤面確認"))
+        return self.state
 
     @property
     def learning_enabled(self) -> bool:
@@ -988,7 +1002,7 @@ class BoardInspectionController:
         outcome = self._executor(
             serial, result.route, calibration.to_grid(), delay, hold_delay, lift_threshold,
             self.state.confirmed_board, max_corrections, on_verification=receive,
-            screen_size=screen_size,
+            screen_size=screen_size, verify=self._verify_after_gesture,
         )
         if isinstance(outcome, PlayVerification):
             verification = outcome
@@ -1458,6 +1472,7 @@ class BoardInspectionBridge:
             "protected_cell": list(protected) if protected is not None else None,
             "calibration": _calibration_snapshot(state.calibration),
             "learning_enabled": self.controller.learning_enabled,
+            "verify_after_gesture": self.controller.verify_after_gesture,
             "learning_status": state.learning_status,
             "rule_profile": profile.to_dict() if profile is not None else None,
             "route_result": _route_evaluation_snapshot(state.route_evaluation),
@@ -1760,10 +1775,13 @@ class BoardInspectionBridge:
                 with self._lock:
                     self._execution_verification = verification
                 mismatch = verification["mismatches"]
-                detail = ("成功（0 格不符）" if verification["success"]
-                          else f"失敗（{mismatch if mismatch is not None else '未知'} 格不符）")
-                self._execution_announce("verification", f"正在驗證結果：手勢後盤面驗證：{detail}",
-                                         "success" if verification["success"] else "warning")
+                if verification["status"] == "released_without_verification":
+                    self._execution_announce("verification", "手勢已送出並直接放手；未做盤面確認", "warning")
+                else:
+                    detail = ("成功（0 格不符）" if verification["success"]
+                              else f"失敗（{mismatch if mismatch is not None else '未知'} 格不符）")
+                    self._execution_announce("verification", f"正在驗證結果：手勢後盤面驗證：{detail}",
+                                             "success" if verification["success"] else "warning")
             if stop_event.is_set():
                 self._finish_execution(
                     "stopped",
@@ -1773,7 +1791,10 @@ class BoardInspectionBridge:
             elif succeeded:
                 self._finish_execution(
                     "success",
-                    "執行成功：手勢後盤面驗證完成。",
+                    ("執行完成：手勢已送出並直接放手，未做盤面確認。"
+                     if verification is not None
+                     and verification["status"] == "released_without_verification"
+                     else "執行成功：手勢後盤面驗證完成。"),
                     verification,
                 )
             else:
@@ -2039,6 +2060,7 @@ class BoardInspectionBridge:
         if action not in {
             "snapshot", "events", "drain_events", "stop_execution", "cancel_execution",
             "export_rule_profile", "export_profile", "set_learning_enabled",
+            "set_verify_after_gesture",
         }:
             with self._lock:
                 if self._execution_busy:
@@ -2071,6 +2093,16 @@ class BoardInspectionBridge:
                 f"正在切換盤面大小：{size}",
                 lambda: self.controller.set_board_size(size),
             )
+        if action == "set_verify_after_gesture":
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError("放手前確認設定必須是布林值")
+            with self._lock:
+                self.controller.set_verify_after_gesture(enabled)
+                self._controller_snapshot = self._review_snapshot()
+                self._announce("info", "execution",
+                               "轉珠後將停手確認盤面" if enabled else "轉珠後直接放手，不做盤面確認")
+                return self._view_locked()
         if action == "refresh_devices":
             return self._submit("devices", "正在更新 Android 裝置清單", self._device_lister)
         if action in {"export_rule_profile", "export_profile"}:

@@ -71,6 +71,8 @@
   const executionStatus = document.querySelector("#execution-status");
   const moveDelay = document.querySelector("#move-delay");
   const learningEnabled = document.querySelector("#learning-enabled");
+  const verifyAfterGesture = document.querySelector("#verify-after-gesture");
+  const verifyStatus = document.querySelector("#verify-status");
   const learningStatus = document.querySelector("#learning-status");
 
   let pendingSnapshot = null;
@@ -484,6 +486,10 @@
     correct.disabled = primaryMutationBusy || !hasSelection;
     protect.disabled = primaryMutationBusy || !hasSelection;
     clearProtect.disabled = primaryMutationBusy || !snapshot.protected_cell;
+    const verify = snapshot.verify_after_gesture !== false;
+    verifyAfterGesture.checked = verify;
+    verifyAfterGesture.disabled = executionBusy;
+    verifyStatus.textContent = verify ? "轉珠後：停手確認盤面" : "轉珠後：直接放手（不確認）";
     if (!learningChangePending) confirmedLearningEnabled = Boolean(snapshot.learning_enabled);
     learningEnabled.checked = confirmedLearningEnabled;
     learningEnabled.disabled = learningChangePending;
@@ -643,6 +649,8 @@
     const cell = currentSnapshot && currentSnapshot.selected_cell;
     if (cellParts(cell)) command("correct_cell", { cell, value: correctionValue() });
   });
+  verifyAfterGesture.addEventListener("change", () =>
+    command("set_verify_after_gesture", { enabled: verifyAfterGesture.checked }));
   learningEnabled.addEventListener("change", async () => {
     if (learningChangePending) {
       learningEnabled.checked = confirmedLearningEnabled;
