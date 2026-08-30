@@ -763,7 +763,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         calls = []
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
-                    max_corrections, on_verification):
+                    max_corrections, on_verification, screen_size=None):
             calls.append((serial, path, expected_board))
             actual = expected_board_after_path(expected_board, path)
             on_verification(PlayVerification(actual, actual, 0, True, "verified"))
@@ -793,7 +793,7 @@ class BoardInspectionControllerTests(unittest.TestCase):
         actual = tuple(tuple(Orb("normal", (r + c + 1) % 6 + 1) for c in range(COLS)) for r in range(ROWS))
         source = (12, 10, bytes((60, 40, 20, 255)) * (12 * 10))
 
-        def execute(*args, on_verification):
+        def execute(*args, on_verification, screen_size=None):
             expected = args[6]
             on_verification(PlayVerification(expected, actual, 2, False, "post_gesture_mismatch"))
             return False
@@ -1356,7 +1356,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         execution_calls = []
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
-                    max_corrections, on_verification):
+                    max_corrections, on_verification, screen_size=None):
             execution_calls.append((serial, len(model.samples), delay))
             on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
             return True
@@ -1462,7 +1462,7 @@ class BoardInspectionBridgeTests(unittest.TestCase):
         bridge = None
 
         def execute(serial, path, grid, delay, hold_delay, lift_threshold, expected_board,
-                    max_corrections, on_verification):
+                    max_corrections, on_verification, screen_size=None):
             gesture_calls.append((serial, len(model.samples)))
             stop_replies.append(bridge.command({"action": "stop_execution"}))
             on_verification(PlayVerification(expected_board, expected_board, 0, True, "verified"))
@@ -2278,7 +2278,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         routes = []
 
-        def executor(*args, on_verification):
+        def executor(*args, on_verification, screen_size=None):
             routes.append(args[1])
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))
@@ -2314,7 +2314,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification):
+        def executor(*args, on_verification, screen_size=None):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, args[6], 2, False,
@@ -2332,7 +2332,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification):
+        def executor(*args, on_verification, screen_size=None):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))
@@ -2355,7 +2355,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification):
+        def executor(*args, on_verification, screen_size=None):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))
@@ -2375,7 +2375,7 @@ class ContinuousExecutionTests(unittest.TestCase):
         capture_calls = []
         executions = []
 
-        def executor(*args, on_verification):
+        def executor(*args, on_verification, screen_size=None):
             executions.append(True)
             expected = expected_board_after_path(args[6], args[1])
             on_verification(PlayVerification(expected, expected, 0, True, "verified"))

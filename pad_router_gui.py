@@ -922,9 +922,14 @@ class BoardInspectionController:
             nonlocal verification
             verification = report
 
+        # The captured frame already told us the screen size, so every check
+        # inside play() can pull just its own band instead of a whole frame.
+        screen_size = (None if self.state.width is None or self.state.height is None
+                       else (self.state.width, self.state.height))
         outcome = self._executor(
             serial, result.route, calibration.to_grid(), delay, hold_delay, lift_threshold,
             self.state.confirmed_board, max_corrections, on_verification=receive,
+            screen_size=screen_size,
         )
         if isinstance(outcome, PlayVerification):
             verification = outcome

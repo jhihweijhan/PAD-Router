@@ -41,6 +41,8 @@ flowchart LR
 
 - `Orb`：基本色／危害珠及 `enhanced`、`locked` 等可觀察狀態。
 - `Grid`：把盤面格子映射到截圖像素座標。
+- `screenshot_band`：`adb exec-out screencap` 一張 1080×2340 畫面是 10.1 MB 未壓縮，WiFi adb 實測 2～83 秒，而 `adb shell` 往返只要 0.11 秒。每個檢查其實只讀一段列（hold 檢查 61 列＝0.26 MB，盤面驗證 992 列＝4.3 MB），因此裁切在裝置端完成，只有該段列過網路；回傳時補零成完整畫面，所有呼叫端的座標運算不變。`board_rows`／`cell_rows` 是各檢查取樣範圍的唯一真值來源。
+- `play(screen_size=...)`：帶入畫面尺寸後三次驗證截圖全部改走 band。實測按下執行到珠子開始動 4.4→1.2 秒；連線越差差距越大（資料量差 39 倍，快速連線時受裝置端 screencap 固定成本限制約 4 倍）。
 - `infer_calibration` / `_measure_board`：PAD 用黑底框住盤面，因此直接從像素量測盤面邊界——最後一列有內容的位置即底邊，該區帶內亮像素的左右界即側邊，cell = 寬度 ÷ COLS。實機量測（SM-A1560）證實 7×6 盤面**不會**像 6×5 那樣占滿寬度：實際為 left 23、top 1381、cell 147（真值 23–26 / 1381 / 146.5），量測結果 42 格辨識全對。量不到時才退回置中並貼齊底部的推估值。
 - `detect_board_pixels`／`detect_board`：先判斷危害珠，再用固定 HSV prototype 與局部中心特徵辨識基本色；信心不足回傳 `unknown`。
 - `resolve_matches`、`settle`：依橫／縱三連與既有連通規則計算 Match，`cascade` 決定是否繼續處理落下後的 Match。

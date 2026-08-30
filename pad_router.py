@@ -1740,6 +1740,49 @@ def screenshot(serial: str) -> tuple[int, int, bytes]:
     return width, height, raw[16:]
 
 
+def screenshot_band(serial: str, size: tuple[int, int], rows: range) -> tuple[int, int, bytes]:
+    """Fetch only ``rows`` of the screen, zero-padded back to the full frame.
+
+    A frame is width*height*4 uncompressed bytes -- 10MB on a 1080x2340 phone --
+    and adb over Wi-Fi needs tens of seconds for that, while a shell round trip
+    costs 0.1s.  Every check here reads one band of rows, so the crop happens on
+    the device and only the band crosses the link.  Padding the result back to
+    the full frame keeps screen coordinates valid for every caller.
+    """
+    width, height = size
+    start = max(0, min(rows.start, height))
+    count = max(0, min(rows.stop, height) - start)
+    stride = width * 4
+    frame = "/data/local/tmp/pad-router-frame.raw"
+    raw = subprocess.check_output(["adb", "-s", serial, "exec-out", (
+        f"screencap > {frame}; head -c 16 {frame}; "
+        f"tail -c +{16 + start * stride + 1} {frame} | head -c {count * stride}; rm -f {frame}"
+    )])
+    if len(raw) != 16 + count * stride:
+        raise RuntimeError("Expected a full row band from adb screencap")
+    frame_width, frame_height, pixel_format, _color_space = struct.unpack_from("<IIII", raw)
+    if pixel_format != 1 or (frame_width, frame_height) != size:
+        raise RuntimeError("The screen no longer matches the captured frame")
+    return width, height, bytes(start * stride) + raw[16:] + bytes((height - start - count) * stride)
+
+
+# _cell_features samples at most this far from a cell centre, and
+# cell_visual_change this far from its point; a band must carry both margins.
+CELL_SAMPLE_RADIUS = 55
+CHANGE_SAMPLE_RADIUS = 30
+
+
+def board_rows(grid: Grid) -> range:
+    """Rows a Board recognition reads, centres plus the sampling margin."""
+    return range(grid.top - CELL_SAMPLE_RADIUS,
+                 grid.top + ROWS * grid.cell + CELL_SAMPLE_RADIUS)
+
+
+def cell_rows(point: tuple[int, int]) -> range:
+    """Rows one cell's visual-change check reads."""
+    return range(point[1] - CHANGE_SAMPLE_RADIUS, point[1] + CHANGE_SAMPLE_RADIUS + 1)
+
+
 def board_brightness(width: int, height: int, pixels: bytes, grid: Grid) -> float:
     """Return mean cell-center luminance (0-255) for the visible board."""
     luminance = []
@@ -1764,8 +1807,9 @@ def cell_visual_change(
     width, height = before_width, before_height
     x, y = point
     deltas = []
-    for dy in (-30, -15, 0, 15, 30):
-        for dx in (-30, -15, 0, 15, 30):
+    offsets = tuple(range(-CHANGE_SAMPLE_RADIUS, CHANGE_SAMPLE_RADIUS + 1, CHANGE_SAMPLE_RADIUS // 2))
+    for dy in offsets:
+        for dx in offsets:
             sx, sy = x + dx, y + dy
             if not (0 <= sx < width and 0 <= sy < height):
                 raise ValueError("Grid is outside the screenshot; pass --left, --top, and --cell after calibration")
@@ -1803,8 +1847,10 @@ def detect_board_pixels(width: int, height: int, pixels: bytes, grid: Grid) -> t
     return tuple(board)
 
 
-def detect_board(serial: str, grid: Grid) -> tuple[tuple[Orb, ...], ...]:
-    width, height, pixels = screenshot(serial)
+def detect_board(serial: str, grid: Grid,
+                 screen_size: tuple[int, int] | None = None) -> tuple[tuple[Orb, ...], ...]:
+    width, height, pixels = (screenshot(serial) if screen_size is None
+                             else screenshot_band(serial, screen_size, board_rows(grid)))
     return detect_board_pixels(width, height, pixels, grid)
 
 
@@ -1874,6 +1920,7 @@ def play(
     max_steps: int = 25,
     cascade: bool = True,
     on_verification: Callable[[PlayVerification], None] | None = None,
+    screen_size: tuple[int, int] | None = None,
 ) -> bool:
     path = tuple(path or ())
 
@@ -1904,14 +1951,20 @@ def play(
             or scan_delay < 0 or scan_capture_delay < 0):
         raise ValueError("delay and hold delay must be non-negative; lift threshold must be positive; max corrections must be non-negative")
 
-    baseline = screenshot(serial)
+    def frame(rows: range) -> tuple[int, int, bytes]:
+        """Read just the rows a check looks at, once the screen size is known."""
+        return (screenshot(serial) if screen_size is None
+                else screenshot_band(serial, screen_size, rows))
+
+    hold_band = cell_rows(points[0])
+    baseline = frame(hold_band)
     send_motion(serial, "DOWN", points[0])
     down = True
     cursor = points[0]
     cursor_cell = path[0]
     try:
         time.sleep(hold_delay)
-        held = screenshot(serial)
+        held = frame(hold_band)
         change = cell_visual_change(baseline, held, points[0])
         if change < lift_threshold:
             print(f"Start orb hold not verified (cell RGB change {change:.1f} < {lift_threshold:.1f})")
@@ -1922,7 +1975,7 @@ def play(
             send_moves(serial, points[1:], scan_delay)
             cursor, cursor_cell = points[-1], path[-1]
             time.sleep(scan_capture_delay)
-            expected_board = detect_board(serial, grid)
+            expected_board = detect_board(serial, grid, screen_size)
             if not _board_is_routeable(expected_board):
                 print("Blind scan did not reveal a complete board; releasing")
                 report_verification("blind_scan_board_uncertain", expected_board)
@@ -1939,7 +1992,7 @@ def play(
 
         expected = expected_board_after_path(expected_board, path)
         try:
-            current = detect_board(serial, grid)
+            current = detect_board(serial, grid, screen_size)
             if not _board_is_routeable(current):
                 print("Final board verification uncertain; releasing without correction")
                 report_verification("post_gesture_board_uncertain", current, expected=expected)
@@ -1964,7 +2017,7 @@ def play(
             corrections += 1
             time.sleep(delay)
             try:
-                current = detect_board(serial, grid)
+                current = detect_board(serial, grid, screen_size)
                 if not _board_is_routeable(current):
                     print("Board correction verification uncertain; releasing")
                     report_verification("board_correction_verification_uncertain", current, expected=expected)

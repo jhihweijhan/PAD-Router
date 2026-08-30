@@ -1,3 +1,4 @@
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -626,6 +627,60 @@ class SearchProgressTests(unittest.TestCase):
         self.assertIn(("conditions", 0, 1), progress)
         self.assertIn(("conditions", 1, 1), progress)
         self.assertEqual(progress[-1], ("complete", 1, 1))
+
+class ScreenshotBandTest(unittest.TestCase):
+    """A full frame is 10MB over adb; every check reads one band of rows."""
+
+    WIDTH, HEIGHT = 8, 20
+
+    def _frame(self) -> bytes:
+        body = bytes((y * 7 + channel) % 256
+                     for y in range(self.HEIGHT) for x in range(self.WIDTH) for channel in range(4))
+        return struct.pack("<IIII", self.WIDTH, self.HEIGHT, 1, 0) + body
+
+    def _band(self, rows: range):
+        frame = self._frame()
+        stride = self.WIDTH * 4
+        commands = []
+
+        def check_output(argv):
+            commands.append(argv[-1])
+            start = int(argv[-1].split("tail -c +")[1].split()[0]) - 1
+            count = int(argv[-1].split("| head -c ")[1].split(";")[0])
+            return frame[:16] + frame[start:start + count]
+
+        with patch("pad_router.subprocess.check_output", check_output):
+            result = pad_router.screenshot_band("serial", (self.WIDTH, self.HEIGHT), rows)
+        return result, commands[0], frame[16:], stride
+
+    def test_band_matches_the_frame_and_is_padded_around_it(self):
+        (width, height, pixels), _command, body, stride = self._band(range(5, 9))
+        self.assertEqual((width, height), (self.WIDTH, self.HEIGHT))
+        self.assertEqual(len(pixels), len(body))
+        self.assertEqual(pixels[5 * stride:9 * stride], body[5 * stride:9 * stride])
+        self.assertEqual(pixels[:5 * stride], bytes(5 * stride))
+        self.assertEqual(pixels[9 * stride:], bytes(len(body) - 9 * stride))
+
+    def test_band_is_clamped_to_the_screen(self):
+        (_width, _height, pixels), command, body, stride = self._band(range(-4, self.HEIGHT + 4))
+        self.assertEqual(pixels, body)
+        self.assertIn(f"tail -c +{16 + 1}", command)
+        self.assertIn(f"| head -c {self.HEIGHT * stride}", command)
+
+    def test_a_resized_screen_is_refused_rather_than_misread(self):
+        with patch("pad_router.subprocess.check_output",
+                   lambda argv: struct.pack("<IIII", 4, 4, 1, 0) + bytes(2 * 4 * 4)):
+            with self.assertRaises(RuntimeError):
+                pad_router.screenshot_band("serial", (self.WIDTH, self.HEIGHT), range(0, 2))
+
+    def test_bands_cover_what_the_samplers_read(self):
+        grid = pad_router.Grid(23, 1381, 147)
+        rows = pad_router.board_rows(grid)
+        self.assertLessEqual(rows.start, grid.top - pad_router.CELL_SAMPLE_RADIUS)
+        self.assertGreaterEqual(rows.stop, grid.point(pad_router.ROWS - 1, 0)[1]
+                                + pad_router.CELL_SAMPLE_RADIUS)
+        self.assertEqual(pad_router.cell_rows((100, 500)), range(470, 531))
+
 
 class ExpandedBoardTest(unittest.TestCase):
     """The 7x6 Board a 76 leader grants: 42 orbs, so 14 Combos instead of 10."""
