@@ -64,6 +64,9 @@ Executor = Callable[..., bool | PlayVerification]
 
 # Keep the measured 0.04-second pacing until a real-device run justifies changing it.
 DEFAULT_MOVE_DELAY = 0.04
+WORKSPACE_SETTINGS_PATH = (
+    Path(__file__).resolve().parent / ".pad-router" / "workspace-settings.json"
+)
 
 
 class OrbPrototypeModel:
@@ -1037,7 +1040,8 @@ class BoardInspectionController:
         return succeeded
 
     def execute_continuously(self, serial: str, stop_event: threading.Event,
-                             on_state: Callable[[BoardInspectionState], None] | None = None) -> str:
+                             on_state: Callable[[BoardInspectionState], None] | None = None,
+                             delay: float = DEFAULT_MOVE_DELAY) -> str:
         """Execute, release, recapture, and replan until stopped or unsafe."""
         def publish(status: str) -> str:
             self.state = replace(self.state, status=status)
@@ -1054,7 +1058,7 @@ class BoardInspectionController:
                 route = self.state.route_evaluation
                 if route is None or not route.execution_eligible:
                     return publish("連續執行已停止：沒有可執行且符合條件的路徑")
-                if not self.execute_route(serial):
+                if not self.execute_route(serial, delay=delay):
                     return publish("連續執行已因執行或驗證失敗停止")
                 if on_state is not None:
                     on_state(self.state)
@@ -1385,7 +1389,8 @@ class BoardInspectionBridge:
                  executor: Executor | None = None,
                  search_executor: Executor | None = None,
                  execution_executor: Executor | None = None,
-                 operational_executor: Executor | None = None):
+                 operational_executor: Executor | None = None,
+                 settings_path: Path | None = None):
         self.controller = controller or BoardInspectionController(model=OrbPrototypeModel.default())
         self._device_lister = device_lister or _list_adb_devices
         self._lock = threading.RLock()
@@ -1409,6 +1414,9 @@ class BoardInspectionBridge:
             (executor if executor is not None else ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="pad-router-operational"
             ))
+        )
+        self._settings_path = (
+            Path(settings_path) if settings_path is not None else WORKSPACE_SETTINGS_PATH
         )
         self._future: Future | None = None
         self._interaction_future: Future | None = None
@@ -1564,6 +1572,54 @@ class BoardInspectionBridge:
                       if isinstance(snapshot.get("debug"), dict) else {}),
             "console": [dict(item) for item in snapshot.get("console", ())],
         }
+
+    def _load_settings(self) -> dict[str, object]:
+        try:
+            settings = json.loads(self._settings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            self._announce("info", "settings", "工作區設定無效，已回到預設值")
+            return {}
+        if (
+            not isinstance(settings, dict)
+            or isinstance(settings.get("version"), bool)
+            or not isinstance(settings.get("version"), int)
+            or settings["version"] != 1
+            or any(key not in settings for key in (
+                "rule_profile", "search", "board_size", "move_delay",
+                "learning_enabled", "verify_after_gesture",
+            ))
+        ):
+            self._announce("info", "settings", "工作區設定無效，已回到預設值")
+            return {}
+        return settings
+
+    def _save_settings(self, settings: object) -> None:
+        if not isinstance(settings, dict):
+            raise ValueError("工作區設定必須是 JSON 物件")
+        temporary: Path | None = None
+        try:
+            payload = json.dumps(settings, ensure_ascii=False)
+            self._settings_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self._settings_path.parent,
+                prefix=f".{self._settings_path.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+            temporary.replace(self._settings_path)
+        except Exception as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if isinstance(exc, OSError):
+                raise
+            raise OSError("工作區設定暫存檔寫入或取代失敗") from exc
+
 
     def _debug_snapshot_locked(self) -> dict[str, object]:
         state = self.controller.state
@@ -1806,7 +1862,23 @@ class BoardInspectionBridge:
         except Exception as exc:
             self._finish_execution("failed", f"執行失敗：{exc}", verification)
 
-    def _start_execution(self, serial: object, delay: float = DEFAULT_MOVE_DELAY) -> dict[str, object]:
+    def _run_continuous_execution(self, serial: str, stop_event: threading.Event,
+                                  delay: float = DEFAULT_MOVE_DELAY) -> None:
+        self._execution_announce(
+            "gesture",
+            "連續執行中；停止要求將於目前手勢安全放手後生效",
+        )
+        status = self.controller.execute_continuously(
+            serial, stop_event, delay=delay,
+            on_state=lambda state: self._execution_announce("gesture", state.status),
+        )
+        self._finish_execution(
+            "stopped" if stop_event.is_set() else "failed", status,
+            _verification_snapshot(self.controller.state.verification),
+        )
+
+    def _start_execution(self, serial: object, delay: float = DEFAULT_MOVE_DELAY,
+                         continuous: bool = False) -> dict[str, object]:
         with self._lock:
             if self._execution_busy:
                 self._announce("warning", "execution", "執行中；命令已拒絕")
@@ -1834,10 +1906,12 @@ class BoardInspectionBridge:
             self._announce(
                 "info",
                 "execution",
-                "執行準備：接受目前路徑；ADB 手勢尚未開始",
+                ("連續執行準備：接受目前路徑；停止前會持續擷取並轉珠"
+                 if continuous else "執行準備：接受目前路徑；ADB 手勢尚未開始"),
             )
             future = self._execution_executor.submit(
-                self._run_execution, serial, self._execution_stop, delay
+                self._run_continuous_execution if continuous else self._run_execution,
+                serial, self._execution_stop, delay,
             )
             self._execution_future = future
             self._future = future
@@ -2060,7 +2134,7 @@ class BoardInspectionBridge:
         if action not in {
             "snapshot", "events", "drain_events", "stop_execution", "cancel_execution",
             "export_rule_profile", "export_profile", "set_learning_enabled",
-            "set_verify_after_gesture",
+            "set_verify_after_gesture", "load_settings", "save_settings",
         }:
             with self._lock:
                 if self._execution_busy:
@@ -2075,6 +2149,16 @@ class BoardInspectionBridge:
             return self.snapshot()
         if action in {"events", "drain_events"}:
             return self.drain_events()
+        if action == "load_settings":
+            with self._lock:
+                return self._load_settings()
+        if action == "save_settings":
+            with self._lock:
+                try:
+                    self._save_settings(payload.get("settings"))
+                except Exception as exc:
+                    self._announce("warning", "settings", f"設定寫入失敗：{exc}")
+                return self._view_locked()
         if action == "set_learning_enabled":
             enabled = payload.get("enabled")
             with self._lock:
@@ -2223,11 +2307,13 @@ class BoardInspectionBridge:
                 self._search_progress = None
                 self._announce("info", "search", "正在取消搜尋")
                 return self._view_locked()
-        if action in {"execute", "execute_route"}:
+        if action in {"execute", "execute_route", "execute_continuously",
+                      "start_continuous_execution"}:
             with self._lock:
                 serial = self._selected_device if payload.get("serial") is None else payload.get("serial")
             delay = _move_delay_from_payload(payload)
-            return self._start_execution(serial, delay)
+            return self._start_execution(serial, delay,
+                                         continuous=action not in {"execute", "execute_route"})
         if action in {"stop_execution", "cancel_execution"}:
             return self._stop_execution()
 

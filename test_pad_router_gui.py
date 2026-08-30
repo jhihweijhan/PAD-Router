@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import pad_router
 from pad_router import (COLS, ROWS, CellFeatures, ConditionGroup, ExternalCondition, Grid, LeaderCondition, Orb, PlayVerification,
-                        RouteSearchOptions, RouteSearchResult, RuleProfile, _cell_features, _normal_color, detect_board_pixels,
-                        search_qualifying_route,
+                        RouteSearchOptions, RouteSearchResult, RuleProfile, _cell_features, _hazard_kind, _normal_color,
+                        detect_board_pixels, resolve_matches, search_qualifying_route,
                         expected_board_after_path)
 
 
@@ -50,6 +50,31 @@ class NormalColorTextureTests(unittest.TestCase):
 
     def test_ambiguous_center_pattern_remains_unknown(self):
         self.assertIsNone(_normal_color(self._feature(.85)))
+
+
+class HazardRecognitionTests(unittest.TestCase):
+    def test_distinguishes_poison_from_mortal_poison(self):
+        # Feature values sampled from the supplied normal-poison and mortal-poison images.
+        poison = CellFeatures(.795, .419, .312, .168, .375, 0, .375, .020, 0, 0)
+        mortal_poison = CellFeatures(.745, .419, .890, .360, .183, 0, .401, .020, 0, 0)
+        magenta_poison = CellFeatures(.869, .469, .306, .191, .320, 0, .441, .020, 0, 0)
+        magenta_mortal_poison = CellFeatures(.922, .339, .847, .312, .173, 0, .373, .102, 0, 0)
+        flashing_dark = CellFeatures(.855, .39, .98, .09, .25, 0, .39, .10, 0, 1)
+
+        self.assertEqual(_hazard_kind(poison), "poison")
+        self.assertEqual(_hazard_kind(mortal_poison), "mortal_poison")
+        self.assertEqual(_hazard_kind(magenta_poison), "poison")
+        for dimmed in (CellFeatures(.869, .56, .25, .278, .361, 0, .250, .250, 0, 0),
+                       CellFeatures(.868, .63, .28, .194, .389, 0, .250, .278, 0, 0),
+                       CellFeatures(.879, .50, .29, .111, .278, 0, .306, .139, 0, 0)):
+            self.assertEqual(_hazard_kind(dimmed), "poison")
+        self.assertEqual(_hazard_kind(magenta_mortal_poison), "mortal_poison")
+        self.assertIsNone(_hazard_kind(flashing_dark))
+
+    def test_poison_and_mortal_poison_do_not_match_together(self):
+        board = ((Orb("poison"), Orb("mortal_poison"), Orb("poison"), 0, 0, 0),) + ((0,) * COLS,) * (ROWS - 1)
+
+        self.assertFalse(resolve_matches(board, cascade=False))
 
 
 
@@ -320,6 +345,73 @@ class VerifyAfterGestureToggleTests(unittest.TestCase):
         self.assertFalse(bridge.controller.verify_after_gesture)
         with self.assertRaises(ValueError):
             bridge.command({"action": "set_verify_after_gesture", "enabled": "yes"})
+
+
+
+class WorkspaceSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "workspace-settings.json"
+        self.bridge = BoardInspectionBridge(
+            controller=BoardInspectionController(),
+            settings_path=self.path,
+        )
+        self.addCleanup(self.bridge.close)
+        self.addCleanup(self.directory.cleanup)
+        self.bridge.drain_events()
+
+    @staticmethod
+    def settings():
+        return {
+            "version": 1,
+            "rule_profile": {
+                "conditions": [{"label": "4 顆消除", "color": "火"}],
+                "operator": "全部符合",
+                "hazard_policy": "避免危害珠",
+                "external": "無",
+            },
+            "search": {"attempts": 30, "max_steps": 80, "seed": 0, "cascade": True},
+            "board_size": "6x5",
+            "move_delay": 0.04,
+            "learning_enabled": False,
+            "verify_after_gesture": True,
+        }
+
+    def test_workspace_settings_round_trip_preserves_payloads(self):
+        settings = self.settings()
+        self.bridge.command({"action": "save_settings", "settings": settings})
+
+        self.assertEqual(json.loads(self.path.read_text()), settings)
+        self.assertEqual(
+            self.bridge.command({"action": "load_settings"}),
+            settings,
+        )
+
+    def test_corrupt_workspace_settings_falls_back_to_defaults(self):
+        self.path.write_text("{not-json")
+
+        self.assertEqual(self.bridge.command({"action": "load_settings"}), {})
+        events = self.bridge.drain_events()
+        self.assertEqual(events[-1]["level"], "info")
+
+    def test_workspace_settings_write_failure_does_not_block_execution(self):
+        settings = self.settings()
+        with self.bridge._lock:
+            self.bridge._execution_busy = True
+        self.addCleanup(self._clear_execution_busy)
+
+        with patch.object(Path, "replace", side_effect=OSError("read-only")):
+            snapshot = self.bridge.command({"action": "save_settings", "settings": settings})
+
+        self.assertTrue(snapshot["execution"]["busy"])
+        self.assertTrue(self.bridge.command({"action": "snapshot"})["execution"]["busy"])
+        events = self.bridge.drain_events()
+        self.assertEqual(events[-1]["level"], "warning")
+
+    def _clear_execution_busy(self):
+        with self.bridge._lock:
+            self.bridge._execution_busy = False
+
 
 
 class PrototypeStoreTests(unittest.TestCase):
@@ -2208,24 +2300,64 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertNotIn("://", html + style.read_text() + script.read_text())
         self.assertIn('id="board-grid"', html)
         self.assertIn('data-orb="fire"', html)
+        self.assertIn('id="condition-shape-options"', html)
+        self.assertIn('id="condition-combo-options"', html)
+        self.assertIn('id="global-condition-combo"', html)
+        self.assertEqual(html.count('data-condition-trigger="combo"'), 1)
+        self.assertEqual(html.count('data-condition-remove'), 2)
+        self.assertIn('aria-label="移除條件 2"', html)
+        self.assertIn('aria-label="移除條件 3"', html)
+        rows_start = html.index('<div class="condition-rows">')
+        global_start = html.index('<div id="global-condition-combo"', rows_start)
+        self.assertNotIn('data-condition-trigger="combo"', html[rows_start:global_start])
+        self.assertEqual(html.count('class="condition-option shape-option"'), 7)
+        for marker in (
+                'data-cols="4" data-mask="1111"',
+                'data-cols="3" data-mask="111111111"',
+                'data-cols="3" data-mask="010111010"',
+                'data-cols="3" data-mask="100100111"',
+                'data-cols="3" data-mask="111010010"',
+                'data-cols="5" data-mask="11111"',
+                'data-cols="6" data-mask="111111"',
+        ):
+            self.assertIn(marker, html)
+        self.assertNotIn('data-condition="', html)
+        self.assertGreaterEqual(html.count('data-tip="'), 20)
         self.assertIn('id="planning-controls"', html)
-        self.assertIn('<option selected>30</option>', html)
+        self.assertIn('id="condition-row-1"', html)
+        self.assertIn('id="condition-row-2"', html)
+        self.assertIn('id="condition-row-3"', html)
         self.assertIn('id="start-search"', html)
         self.assertIn('id="cancel-search"', html)
+        self.assertIn('id="recalc-route"', html)
         self.assertNotIn('id="approve-route"', html)
-        self.assertIn('id="action-rail"', html)
-        self.assertIn('id="execute-route"', html)
+        self.assertNotIn('id="action-rail"', html)
+        self.assertIn('id="execute-continuous"', html)
         self.assertIn('id="stop-execution"', html)
         self.assertIn('id="move-delay"', html)
-        self.assertIn('value="0.04"', html)
+        self.assertIn('data-values="0.02|0.04|0.06|0.10"', html)
         self.assertIn('id="learning-enabled"', html)
         self.assertIn('id="verify-after-gesture"', html)
+        settings_start = html.index('id="settings-row"')
+        settings_end = html.index('id="settings-expansion"', settings_start)
+        settings_markup = html[settings_start:settings_end]
+        self.assertNotIn("<select", settings_markup)
+        self.assertNotIn('type="checkbox"', settings_markup)
         self.assertIn('id="learning-status"', html)
-        self.assertIn('AI 模型學習', html)
-        rail_start = html.index('<div id="action-rail"')
-        rail = html[rail_start:html.index("</div>", rail_start)]
-        for control in ('id="capture"', 'id="execute-route"', 'id="stop-execution"', 'id="move-delay"'):
-            self.assertIn(control, rail)
+        self.assertIn('id="verify-status"', html)
+        self.assertIn('aria-label="步數 80，共 4 段"', html)
+        self.assertIn('aria-label="MOVE 間隔 .04 秒，共 4 段"', html)
+        self.assertIn('id="board-size"', html)
+        self.assertEqual(settings_markup.count('class="setting-control"'), 8)
+        self.assertIn('class="source-board-layout"', html)
+        self.assertIn('class="bottom-row"', html)
+        self.assertNotRegex(html, r'<details[^>]*id="planning-controls"')
+        self.assertIn('id="inference-actions"', html)
+        self.assertIn('id="settings-expansion"', html)
+        source_start = html.index('<section class="panel source-panel"')
+        source_markup = html[source_start:html.index('<aside class="workspace-sidebar"', source_start)]
+        self.assertNotIn("action-rail", source_markup)
+        self.assertNotIn("position: absolute", source_markup)
         for marker in (
                 'id="source-stage"', 'id="route-overlay"', 'id="route-preview"',
                 'id="route-preview-grid"', 'id="projected-combo"', 'id="route-preview-status"',
@@ -2237,7 +2369,29 @@ class WebviewAssetTests(unittest.TestCase):
         ):
             self.assertIn(marker, html)
         client = script.read_text()
+        self.assertIn("renderShapeMatrix", client)
+        self.assertIn("refreshShapeMatrices", client)
+        self.assertIn("populateConditionMenus", client)
+        self.assertIn("planningPayload", client)
+        self.assertIn("settingsPayload", client)
+        self.assertIn("scheduleSettingsSave", client)
+        self.assertIn('command("load_settings")', client)
+        self.assertIn('command("save_settings"', client)
+        self.assertIn("restoreSavedSettings", client)
+        self.assertIn("}, 300);", client)
+        self.assertIn('data-condition-trigger', client)
+        self.assertIn('data-condition-menu', client)
+        self.assertIn('data-condition-value', client)
+        self.assertIn("conditionCombo", client)
+        self.assertIn("syncConditionCombo", client)
+        self.assertIn("renumberConditionRows", client)
+        self.assertIn("if (row.hidden) return [];", client)
+        self.assertIn('conditions.push({ label: combo, color: "不指定" });', client)
         self.assertIn("ArrowRight", client)
+        self.assertIn("cycleSetting", client)
+        self.assertIn("attachSettingCycler", client)
+        self.assertIn("ArrowLeft", client)
+        self.assertIn("deltaY", client)
         self.assertIn("requestAnimationFrame", client)
         self.assertIn("pendingSnapshot", client)
         self.assertIn("setInterval(pollEvents, 200)", client)
@@ -2248,8 +2402,8 @@ class WebviewAssetTests(unittest.TestCase):
         self.assertIn('command("search_route"', client)
         self.assertIn('command("cancel_search"', client)
         self.assertNotIn('command("approve_route"', client)
-        self.assertIn('command("execute_route"', client)
-        self.assertIn('delay: moveDelay.valueAsNumber', client)
+        self.assertIn('command("execute_continuously"', client)
+        self.assertIn('delay: Number(settingValue(moveDelay))', client)
         self.assertIn('command("set_learning_enabled"', client)
         for phase in ("正在擷取畫面", "盤面辨識完成", "正在計算並搜尋路徑",
                       "正在執行手勢", "正在驗證結果"):
@@ -2269,34 +2423,59 @@ class WebviewAssetTests(unittest.TestCase):
         styles = style.read_text()
         self.assertIn("min-width: 960px", styles)
         self.assertIn("min-height: 640px", styles)
-        self.assertIn("min-height: 140px", styles)
-        self.assertIn("@media (max-width: 1100px)", styles)
-        self.assertIn("@media (max-height: 920px)", styles)
+        self.assertIn("grid-template-columns: minmax(0, 1fr) 600px", styles)
+        self.assertIn("grid-template-columns: minmax(0, 1fr) minmax(220px, .8fr)", styles)
+        self.assertIn("grid-template-columns: repeat(8, minmax(0, 1fr))", styles)
+        self.assertIn("--paper: #FBF7EE", styles)
+        self.assertIn("--ink: #0B0A0A", styles)
+        self.assertEqual(settings_markup.count("setting-face"), 8)
+        self.assertIn('class="condition-face"', html)
+        self.assertEqual(html.count('class="condition-face"'), 7)
+        self.assertIn(".topbar-status {\n  display: flex;", styles)
+        self.assertNotIn('.setting-orb[aria-pressed="true"] {', styles)
+        self.assertNotIn('.condition-orb[aria-pressed="true"] {', styles)
+        self.assertIn('<small>全部</small>', html)
+        self.assertIn('conditionOperator', client)
+        self.assertIn('settingCaption', client)
+        self.assertIn('height: auto;', styles)
+        self.assertIn('border: 0;', styles)
+        self.assertIn('3px 3px 0 var(--ink)', styles)
+        self.assertIn('font-size: 12px', styles)
+        self.assertIn("border: 3px solid var(--ink)", styles)
+        self.assertIn("box-shadow: 4px 4px 0 var(--ink)", styles)
+        self.assertIn("repeating-linear-gradient", styles)
+        self.assertIn('"IBM Plex Mono"', styles)
+        self.assertIn('"Noto Sans TC"', styles)
+        self.assertIn("@media (max-width: 1180px)", styles)
         self.assertIn("@media (max-height: 800px)", styles)
         self.assertIn("@media (max-height: 740px)", styles)
-        for marker in (".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
-                       ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid",
-                       ".route-preview", ".route-line", ".route-marker", ".combo-badge",
-                       ".move-delay-control"):
+        self.assertNotIn(".details-panel", styles)
+        for marker in (
+                ".board-cell.unknown", ".board-cell.selected", ".board-cell.protected",
+                ".cell-badge", ".cell-badge.locked", ".aux-controls", ".debug-grid",
+                ".route-preview", ".route-line", ".route-marker", ".combo-badge",
+                ".settings-orb-row", ".setting-value", ".inference-actions", ".condition-rows",
+                ".condition-orb", ".condition-menu", ".condition-option",
+                ".condition-global", ".condition-remove",
+                ".shape-matrix", ".shape-dot", "[data-tip]::after",
+                "[data-tip]:focus-visible::after", ".sr-only",
+        ):
             self.assertIn(marker, styles)
-        rail_style_start = styles.index(".action-rail {")
-        rail_style = styles[rail_style_start:styles.index("}", rail_style_start)]
-        for declaration in ("position: absolute", "left:", "top: 50%", "translateY(-50%)"):
-            self.assertIn(declaration, rail_style)
+        self.assertIn("flex: 0 0 auto", styles)
+        self.assertNotIn(".action-rail", styles)
 
     def test_learning_toggle_waits_for_confirmed_backend_snapshot(self):
         from pad_router_webview import ASSET_ROOT
 
         client = (ASSET_ROOT / "app.js").read_text(encoding="utf-8")
-        handler_start = client.index('learningEnabled.addEventListener("change"')
+        handler_start = client.index("async function toggleLearning()")
         handler_end = client.index('protect.addEventListener("click"', handler_start)
         handler = client[handler_start:handler_end]
 
-        self.assertIn('learningEnabled.addEventListener("change", async () => {', handler)
-        self.assertIn("learningEnabled.checked = confirmedLearningEnabled", handler)
+        self.assertIn("learningChangePending = true", handler)
         self.assertIn("learningEnabled.disabled = true", handler)
         self.assertIn('learningStatus.textContent = "AI 模型學習：更新中…"', handler)
-        self.assertIn('await command("set_learning_enabled"', handler)
+        self.assertIn('command("set_learning_enabled"', handler)
         self.assertIn("renderSnapshot(reply.snapshot || reply)", handler)
 
 
@@ -2500,6 +2679,41 @@ class ContinuousExecutionTests(unittest.TestCase):
         self.assertEqual(executions, [True])
         self.assertEqual(capture_calls, ["test-device", "test-device"])
         self.assertIn("新盤面沒有符合條件的路徑", status)
+
+    def test_bridge_command_loops_until_stop_execution(self):
+        stop_calls = []
+        routes = []
+
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                function(*args)
+                return object()
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        def executor(*args, on_verification, screen_size=None, verify=True):
+            routes.append(args[1])
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, expected, 0, True, "verified"))
+            if len(routes) == 2:
+                stop_calls.append(bridge.command({"action": "stop_execution"}))
+            return True
+
+        capture_calls = []
+        controller = self._controller(executor, capture_calls)
+        bridge = BoardInspectionBridge(controller=controller, executor=ImmediateExecutor())
+        self.addCleanup(bridge.close)
+
+        started = bridge.command({"action": "execute_continuously", "serial": "test-device"})
+
+        self.assertTrue(started["accepted"])
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(len(stop_calls), 1)
+        self.assertEqual(capture_calls, ["test-device", "test-device"])
+        self.assertEqual(started["snapshot"]["execution"]["status"], "stopped")
+        self.assertIn("使用者停止", started["snapshot"]["status"])
+        json.dumps(started["snapshot"])
 
 
 
