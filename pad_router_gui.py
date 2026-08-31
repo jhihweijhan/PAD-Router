@@ -979,10 +979,12 @@ class BoardInspectionController:
 
     def execute_route(self, serial: str,
                       delay: float = DEFAULT_MOVE_DELAY, hold_delay: float = 0.15,
-                      lift_threshold: float = 12.0, max_corrections: int = 2) -> bool:
+                      lift_threshold: float = 12.0, max_corrections: int = 2,
+                      require_eligible: bool = True) -> bool:
         result = self.state.route_evaluation
         if (result is None or self.state.confirmed_board is None
-                or not self.state.confirmed or not result.execution_eligible):
+                or not self.state.confirmed or not result.route
+                or (require_eligible and not result.execution_eligible)):
             raise ValueError("僅能執行已確認盤面上、符合條件的路徑")
         serial = serial.strip()
         if not serial:
@@ -1056,9 +1058,9 @@ class BoardInspectionController:
                 if stop_event.is_set():
                     return publish("連續執行已由使用者停止")
                 route = self.state.route_evaluation
-                if route is None or not route.execution_eligible:
-                    return publish("連續執行已停止：沒有可執行且符合條件的路徑")
-                if not self.execute_route(serial, delay=delay):
+                if route is None or not route.route:
+                    return publish("連續執行已停止：沒有可執行的路徑")
+                if not self.execute_route(serial, delay=delay, require_eligible=False):
                     return publish("連續執行已因執行或驗證失敗停止")
                 if on_state is not None:
                     on_state(self.state)
@@ -1068,8 +1070,8 @@ class BoardInspectionController:
                 if state.uncertain_cells:
                     return publish("連續執行已停止：新盤面辨識不確定")
                 route = state.route_evaluation
-                if route is None or not route.execution_eligible:
-                    return publish("連續執行已停止：新盤面沒有符合條件的路徑")
+                if route is None or not route.route:
+                    return publish("連續執行已停止：新盤面沒有可執行的路徑")
                 publish("連續執行中：已擷取新盤面並規劃下一條路徑")
         except Exception as exc:
             return publish(f"連續執行因錯誤停止：{exc}")
@@ -1893,7 +1895,8 @@ class BoardInspectionBridge:
                 raise ValueError("請先更新並選擇 Android 裝置")
             state = self.controller.state
             result = state.route_evaluation
-            if result is None or not state.confirmed or not result.execution_eligible:
+            if (result is None or not state.confirmed or not result.route
+                    or (not continuous and not result.execution_eligible)):
                 raise ValueError("僅能執行目前已確認且符合條件的路徑")
             serial = serial.strip()
             self._execution_busy = True

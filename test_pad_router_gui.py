@@ -2649,8 +2649,39 @@ class ContinuousExecutionTests(unittest.TestCase):
         self.assertEqual(executions, [True])
         self.assertEqual(capture_calls, ["test-device", "test-device"])
         self.assertIn("新盤面辨識不確定", status)
+    def test_rule_failure_does_not_stop_continuous_execution(self):
+        capture_calls = []
+        routes = []
+        stop = threading.Event()
+        blocked = RuleProfile("blocked", condition_groups=(ConditionGroup.all_of((
+            LeaderCondition.combo_minimum(99),
+        )),))
 
-    def test_noneligible_new_route_stops_without_second_execution(self):
+        def executor(*args, on_verification, screen_size=None, verify=True):
+            routes.append(args[1])
+            expected = expected_board_after_path(args[6], args[1])
+            on_verification(PlayVerification(expected, expected, 0, True, "verified"))
+            if len(routes) == 2:
+                stop.set()
+            return True
+
+        controller = self._controller(executor, capture_calls)
+        controller.set_rule_profile(blocked)
+        controller.confirm_board()
+        result = controller.evaluate_manual_route(((0, 1),))
+        self.assertFalse(result.execution_eligible)
+        self.assertTrue(result.route)
+
+        with patch("pad_router_gui.RouteSearchOptions", return_value=RouteSearchOptions(
+                attempts=1, min_steps=0, max_steps=0)):
+            status = controller.execute_continuously("test-device", stop)
+
+        self.assertEqual(len(routes), 2)
+        self.assertEqual(capture_calls, ["test-device", "test-device"])
+        self.assertEqual(status, "連續執行已由使用者停止")
+
+
+    def test_no_new_route_stops_without_second_execution(self):
         capture_calls = []
         executions = []
 
@@ -2672,13 +2703,13 @@ class ContinuousExecutionTests(unittest.TestCase):
             return original_capture(serial)
 
         controller._capture = capture
-        with patch("pad_router_gui.RouteSearchOptions", return_value=RouteSearchOptions(
-                attempts=1, min_steps=0, max_steps=0)):
+        with patch("pad_router_gui.search_qualifying_route",
+                   return_value=RouteSearchResult(None, None, 0, 0)):
             status = controller.execute_continuously("test-device", threading.Event())
 
         self.assertEqual(executions, [True])
         self.assertEqual(capture_calls, ["test-device", "test-device"])
-        self.assertIn("新盤面沒有符合條件的路徑", status)
+        self.assertIn("新盤面沒有可執行的路徑", status)
 
     def test_bridge_command_loops_until_stop_execution(self):
         stop_calls = []
