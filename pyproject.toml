@@ -9,3 +9,5 @@ dependencies = [
 
 [tool.uv]
 package = false
+# pywebview's GTK backend uses Ubuntu's system `gi` module.
+python-preference = "system"
