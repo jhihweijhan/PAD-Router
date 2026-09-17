@@ -1,0 +1,274 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 570" role="img" aria-labelledby="t d">
+<title id="t">轉珠路徑範例：拖曳 10 步，Combo 從 2 變 6</title>
+<desc id="d">三個 6 乘 5 盤面：左為原始盤面與拖曳路徑；中為放手後，白框是第一輪直接消除的 4 組；右為消除並落珠後，黃虛線框是第二輪 cascade 的 2 組。</desc>
+<rect width="1200" height="570" rx="16" fill="#0F172A"/>
+<g font-family="'Noto Sans CJK TC', 'PingFang TC', 'Microsoft JhengHei', Arial, sans-serif">
+<text x="40" y="52" font-size="26" fill="#F8FAFC" font-weight="700" text-anchor="start">範例：同一個盤面，拖曳 10 步後 Combo 從 2 變 6</text>
+<text x="40" y="84" font-size="15" fill="#B6C2D1" font-weight="400" text-anchor="start">資料來自 pad_router.py --board 111222345634456563123451234563 的實際輸出（CLI 預設：束寬 80、步數 5 到 25）</text>
+<text x="40" y="142" font-size="17" fill="#F8FAFC" font-weight="700" text-anchor="start">① 拖曳前：直接可消 2 組</text>
+<rect x="40" y="160" width="52" height="52" fill="#172033"/>
+<circle cx="66.0" cy="186.0" r="21" fill="#E45756"/>
+<text x="66.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="92" y="160" width="52" height="52" fill="#1E293B"/>
+<circle cx="118.0" cy="186.0" r="21" fill="#E45756"/>
+<text x="118.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="144" y="160" width="52" height="52" fill="#172033"/>
+<circle cx="170.0" cy="186.0" r="21" fill="#E45756"/>
+<text x="170.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="196" y="160" width="52" height="52" fill="#1E293B"/>
+<circle cx="222.0" cy="186.0" r="21" fill="#4D9DE0"/>
+<text x="222.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="248" y="160" width="52" height="52" fill="#172033"/>
+<circle cx="274.0" cy="186.0" r="21" fill="#4D9DE0"/>
+<text x="274.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="300" y="160" width="52" height="52" fill="#1E293B"/>
+<circle cx="326.0" cy="186.0" r="21" fill="#4D9DE0"/>
+<text x="326.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="40" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="66.0" cy="238.0" r="21" fill="#58B368"/>
+<text x="66.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="92" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="118.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="118.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="144" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="170.0" cy="238.0" r="21" fill="#9A70C8"/>
+<text x="170.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="196" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="222.0" cy="238.0" r="21" fill="#E98AB6"/>
+<text x="222.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="248" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="274.0" cy="238.0" r="21" fill="#58B368"/>
+<text x="274.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="300" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="326.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="326.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="40" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="66.0" cy="290.0" r="21" fill="#E5C454"/>
+<text x="66.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="92" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="118.0" cy="290.0" r="21" fill="#9A70C8"/>
+<text x="118.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="144" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="170.0" cy="290.0" r="21" fill="#E98AB6"/>
+<text x="170.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="196" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="222.0" cy="290.0" r="21" fill="#9A70C8"/>
+<text x="222.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="248" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="274.0" cy="290.0" r="21" fill="#E98AB6"/>
+<text x="274.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="300" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="326.0" cy="290.0" r="21" fill="#58B368"/>
+<text x="326.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="40" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="66.0" cy="342.0" r="21" fill="#E45756"/>
+<text x="66.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="92" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="118.0" cy="342.0" r="21" fill="#4D9DE0"/>
+<text x="118.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="144" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="170.0" cy="342.0" r="21" fill="#58B368"/>
+<text x="170.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="196" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="222.0" cy="342.0" r="21" fill="#E5C454"/>
+<text x="222.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="248" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="274.0" cy="342.0" r="21" fill="#9A70C8"/>
+<text x="274.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="300" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="326.0" cy="342.0" r="21" fill="#E45756"/>
+<text x="326.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="40" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="66.0" cy="394.0" r="21" fill="#4D9DE0"/>
+<text x="66.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="92" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="118.0" cy="394.0" r="21" fill="#58B368"/>
+<text x="118.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="144" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="170.0" cy="394.0" r="21" fill="#E5C454"/>
+<text x="170.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="196" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="222.0" cy="394.0" r="21" fill="#9A70C8"/>
+<text x="222.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="248" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="274.0" cy="394.0" r="21" fill="#E98AB6"/>
+<text x="274.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="300" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="326.0" cy="394.0" r="21" fill="#58B368"/>
+<text x="326.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<polyline points="118.0,342.0 170.0,342.0 222.0,342.0 222.0,290.0 222.0,238.0 170.0,238.0 118.0,238.0 66.0,238.0 66.0,290.0 118.0,290.0 118.0,238.0" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/>
+<polyline points="118.0,342.0 170.0,342.0 222.0,342.0 222.0,290.0 222.0,238.0 170.0,238.0 118.0,238.0 66.0,238.0 66.0,290.0 118.0,290.0 118.0,238.0" fill="none" stroke="#0F172A" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="118.0" cy="342.0" r="9" fill="#FFFFFF" stroke="#0F172A" stroke-width="3"/>
+<rect x="110.0" y="230.0" width="16" height="16" fill="#0F172A" stroke="#FFFFFF" stroke-width="3"/>
+<path d="M366 290 h 50" stroke="#B6C2D1" stroke-width="4" fill="none"/>
+<path d="M416 281 l 14 9 l -14 9 z" fill="#B6C2D1"/>
+<text x="440" y="142" font-size="17" fill="#F8FAFC" font-weight="700" text-anchor="start">② 放手：第 1 輪直接消 4 組</text>
+<rect x="440" y="160" width="52" height="52" fill="#172033"/>
+<circle cx="466.0" cy="186.0" r="21" fill="#E45756"/>
+<text x="466.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="492" y="160" width="52" height="52" fill="#1E293B"/>
+<circle cx="518.0" cy="186.0" r="21" fill="#E45756"/>
+<text x="518.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="544" y="160" width="52" height="52" fill="#172033"/>
+<circle cx="570.0" cy="186.0" r="21" fill="#E45756"/>
+<text x="570.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="596" y="160" width="52" height="52" fill="#1E293B"/>
+<circle cx="622.0" cy="186.0" r="21" fill="#4D9DE0"/>
+<text x="622.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="648" y="160" width="52" height="52" fill="#172033"/>
+<circle cx="674.0" cy="186.0" r="21" fill="#4D9DE0"/>
+<text x="674.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="700" y="160" width="52" height="52" fill="#1E293B"/>
+<circle cx="726.0" cy="186.0" r="21" fill="#4D9DE0"/>
+<text x="726.0" y="192.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="440" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="466.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="466.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="492" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="518.0" cy="238.0" r="21" fill="#4D9DE0"/>
+<text x="518.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="544" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="570.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="570.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="596" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="622.0" cy="238.0" r="21" fill="#9A70C8"/>
+<text x="622.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="648" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="674.0" cy="238.0" r="21" fill="#58B368"/>
+<text x="674.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="700" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="726.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="726.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="440" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="466.0" cy="290.0" r="21" fill="#9A70C8"/>
+<text x="466.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="492" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="518.0" cy="290.0" r="21" fill="#58B368"/>
+<text x="518.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="544" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="570.0" cy="290.0" r="21" fill="#E98AB6"/>
+<text x="570.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="596" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="622.0" cy="290.0" r="21" fill="#E98AB6"/>
+<text x="622.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="648" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="674.0" cy="290.0" r="21" fill="#E98AB6"/>
+<text x="674.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="700" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="726.0" cy="290.0" r="21" fill="#58B368"/>
+<text x="726.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="440" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="466.0" cy="342.0" r="21" fill="#E45756"/>
+<text x="466.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="492" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="518.0" cy="342.0" r="21" fill="#58B368"/>
+<text x="518.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="544" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="570.0" cy="342.0" r="21" fill="#E5C454"/>
+<text x="570.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="596" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="622.0" cy="342.0" r="21" fill="#9A70C8"/>
+<text x="622.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="648" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="674.0" cy="342.0" r="21" fill="#9A70C8"/>
+<text x="674.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="700" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="726.0" cy="342.0" r="21" fill="#E45756"/>
+<text x="726.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="440" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="466.0" cy="394.0" r="21" fill="#4D9DE0"/>
+<text x="466.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="492" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="518.0" cy="394.0" r="21" fill="#58B368"/>
+<text x="518.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="544" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="570.0" cy="394.0" r="21" fill="#E5C454"/>
+<text x="570.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="596" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="622.0" cy="394.0" r="21" fill="#9A70C8"/>
+<text x="622.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="648" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="674.0" cy="394.0" r="21" fill="#E98AB6"/>
+<text x="674.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="700" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="726.0" cy="394.0" r="21" fill="#58B368"/>
+<text x="726.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="443" y="163" width="150" height="46" rx="10" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+<rect x="599" y="163" width="150" height="46" rx="10" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+<rect x="495" y="267" width="46" height="150" rx="10" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+<rect x="547" y="267" width="150" height="46" rx="10" fill="none" stroke="#FFFFFF" stroke-width="4"/>
+<path d="M766 290 h 50" stroke="#B6C2D1" stroke-width="4" fill="none"/>
+<path d="M816 281 l 14 9 l -14 9 z" fill="#B6C2D1"/>
+<text x="840" y="142" font-size="17" fill="#F8FAFC" font-weight="700" text-anchor="start">③ 落珠：第 2 輪再消 2 組</text>
+<rect x="840" y="160" width="52" height="52" fill="#172033"/>
+<rect x="892" y="160" width="52" height="52" fill="#1E293B"/>
+<rect x="944" y="160" width="52" height="52" fill="#172033"/>
+<rect x="996" y="160" width="52" height="52" fill="#1E293B"/>
+<rect x="1048" y="160" width="52" height="52" fill="#172033"/>
+<rect x="1100" y="160" width="52" height="52" fill="#1E293B"/>
+<rect x="840" y="212" width="52" height="52" fill="#1E293B"/>
+<circle cx="866.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="866.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="892" y="212" width="52" height="52" fill="#172033"/>
+<rect x="944" y="212" width="52" height="52" fill="#1E293B"/>
+<rect x="996" y="212" width="52" height="52" fill="#172033"/>
+<rect x="1048" y="212" width="52" height="52" fill="#1E293B"/>
+<rect x="1100" y="212" width="52" height="52" fill="#172033"/>
+<circle cx="1126.0" cy="238.0" r="21" fill="#E5C454"/>
+<text x="1126.0" y="244.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="840" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="866.0" cy="290.0" r="21" fill="#9A70C8"/>
+<text x="866.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="892" y="264" width="52" height="52" fill="#1E293B"/>
+<rect x="944" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="970.0" cy="290.0" r="21" fill="#E5C454"/>
+<text x="970.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="996" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="1022.0" cy="290.0" r="21" fill="#9A70C8"/>
+<text x="1022.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="1048" y="264" width="52" height="52" fill="#172033"/>
+<circle cx="1074.0" cy="290.0" r="21" fill="#58B368"/>
+<text x="1074.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="1100" y="264" width="52" height="52" fill="#1E293B"/>
+<circle cx="1126.0" cy="290.0" r="21" fill="#58B368"/>
+<text x="1126.0" y="296.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="840" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="866.0" cy="342.0" r="21" fill="#E45756"/>
+<text x="866.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="892" y="316" width="52" height="52" fill="#172033"/>
+<rect x="944" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="970.0" cy="342.0" r="21" fill="#E5C454"/>
+<text x="970.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="996" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="1022.0" cy="342.0" r="21" fill="#9A70C8"/>
+<text x="1022.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="1048" y="316" width="52" height="52" fill="#1E293B"/>
+<circle cx="1074.0" cy="342.0" r="21" fill="#9A70C8"/>
+<text x="1074.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="1100" y="316" width="52" height="52" fill="#172033"/>
+<circle cx="1126.0" cy="342.0" r="21" fill="#E45756"/>
+<text x="1126.0" y="348.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">火</text>
+<rect x="840" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="866.0" cy="394.0" r="21" fill="#4D9DE0"/>
+<text x="866.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="892" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="918.0" cy="394.0" r="21" fill="#4D9DE0"/>
+<text x="918.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">水</text>
+<rect x="944" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="970.0" cy="394.0" r="21" fill="#E5C454"/>
+<text x="970.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">光</text>
+<rect x="996" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="1022.0" cy="394.0" r="21" fill="#9A70C8"/>
+<text x="1022.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">暗</text>
+<rect x="1048" y="368" width="52" height="52" fill="#172033"/>
+<circle cx="1074.0" cy="394.0" r="21" fill="#E98AB6"/>
+<text x="1074.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">心</text>
+<rect x="1100" y="368" width="52" height="52" fill="#1E293B"/>
+<circle cx="1126.0" cy="394.0" r="21" fill="#58B368"/>
+<text x="1126.0" y="400.0" font-size="16" fill="#0F172A" font-weight="700" text-anchor="middle">木</text>
+<rect x="947" y="267" width="46" height="150" rx="10" fill="none" stroke="#FACC15" stroke-width="4" stroke-dasharray="8 6"/>
+<rect x="999" y="267" width="46" height="150" rx="10" fill="none" stroke="#FACC15" stroke-width="4" stroke-dasharray="8 6"/>
+<text x="40" y="480" font-size="16" fill="#F8FAFC" font-weight="400" text-anchor="start">○ 起點（第 4 列第 2 行）　■ 放手點。手指經過的每一格都和手上的珠交換位置。</text>
+<text x="40" y="510" font-size="16" fill="#B6C2D1" font-weight="400" text-anchor="start">空格不補新珠：模擬只算盤面上已知的珠，遊戲實際天降的隨機珠不列入。</text>
+<text x="40" y="540" font-size="16" fill="#B6C2D1" font-weight="400" text-anchor="start">Combo = 2（拖曳前）→ 4 直接 + 2 cascade = 6（拖曳後）；此盤面的版型上限估計為 7。</text>
+</g></svg>
