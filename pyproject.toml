@@ -3,6 +3,8 @@ name = "pad-router"
 version = "0.1.0"
 description = "Desktop Puzzle & Dragons board inspector and route planner"
 requires-python = ">=3.10"
+license = "LicenseRef-KarlSideProjects-Noncommercial-Research-1.0"
+license-files = ["LICENSE", "LICENSING.md"]
 dependencies = [
     "pywebview==5.4",
 ]
